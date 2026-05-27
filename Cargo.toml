@@ -1,0 +1,85 @@
+[package]
+name = "steamroids"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.86"
+authors = ["mashen456"]
+description = "Steam on steroids — a Rust client for the Steam CM and CS2 Game Coordinator, built for high-concurrency automation."
+repository = "https://github.com/mashen456/steamroids"
+license = "MIT"
+keywords = ["steam", "valve", "cs2", "csgo", "websocket"]
+categories = ["network-programming", "asynchronous"]
+readme = "README.md"
+
+[features]
+default = []
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
+# TLS + WebSocket
+tokio-tungstenite = { version = "0.24", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki-roots = "0.26"
+rustls-pki-types = "1.10"
+
+# Proxy
+tokio-socks = "0.5"
+
+# Bytes / URL / encoding
+bytes = "1.7"
+url = "2.5"
+base64 = "0.22"
+
+# Crypto (Steam TOTP = HMAC-SHA1)
+hmac = "0.12"
+sha1 = "0.10"
+
+# Errors / logging / serde
+thiserror = "1.0"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["full", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic exceptions — too noisy for early stage
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[[example]]
+name = "01_totp"
+path = "examples/01_totp.rs"
+
+[[example]]
+name = "02_proxy_test"
+path = "examples/02_proxy_test.rs"
+
+[[example]]
+name = "03_ws_echo"
+path = "examples/03_ws_echo.rs"

@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned for reproducibility. Bump when new transitive deps require a newer
+# rustc — currently 1.86 (edition2024 + icu 2.x stable).
+channel = "1.86"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
