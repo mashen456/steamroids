@@ -46,6 +46,13 @@ pub enum Error {
     #[error("hmac: invalid key length")]
     HmacKey,
 
+    /// Network-layer failure talking to Steam's `WebAPI` (DNS, TCP,
+    /// TLS handshake, proxy CONNECT, timeout). Distinct from
+    /// [`Error::AuthRejected`] so callers can tell "Steam said no" from
+    /// "we never reached Steam".
+    #[error("network: {0}")]
+    Network(String),
+
     /// Steam reported a permanent auth failure (bad password, banned, etc.).
     #[error("auth rejected: {0}")]
     AuthRejected(String),

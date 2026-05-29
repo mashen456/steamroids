@@ -23,8 +23,9 @@ const BASE_URL: &str = "https://api.steampowered.com/IAuthenticationService/";
 
 /// Network operation budget (connect + transfer) for any one Steam `WebAPI` call.
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// TCP-level connect budget. Steam's edge is usually <1s; 30s is forgiving.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// TCP-level connect budget. Steam's edge is usually <1s — keep it tight so
+/// a dead proxy fails fast instead of stalling the whole auth flow.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Steam's `EResult` enum value, lifted from the `x-eresult` header.
 ///
@@ -157,20 +158,26 @@ impl WebApiClient {
         let response = request
             .send()
             .await
-            .map_err(|e| Error::AuthRejected(format!("http {method}: {e}")))?;
+            .map_err(|e| Error::Network(format!("{method}: {e}")))?;
 
-        let er_value = response
-            .headers()
-            .get("x-eresult")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(0);
+        // x-eresult is documented as always present on auth-service responses;
+        // its absence almost certainly means we hit a reverse-proxy / captive
+        // portal instead of Steam, so surface that loudly instead of
+        // pretending we got `EResult(0)`.
+        let er_header = response.headers().get("x-eresult").ok_or_else(|| {
+            Error::AuthRejected(format!("{method}: response missing x-eresult header"))
+        })?;
+        let er_value: i32 = er_header
+            .to_str()
+            .map_err(|_| Error::AuthRejected(format!("{method}: x-eresult not ascii")))?
+            .parse()
+            .map_err(|_| Error::AuthRejected(format!("{method}: x-eresult not an integer")))?;
         let er = EResult(er_value);
 
         let body = response
             .bytes()
             .await
-            .map_err(|e| Error::AuthRejected(format!("http {method} read body: {e}")))?;
+            .map_err(|e| Error::Network(format!("{method} read body: {e}")))?;
 
         debug!(
             target: "steamroids::auth::webapi",

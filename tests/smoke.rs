@@ -12,10 +12,10 @@ use steamroids::transport::proxy::ProxyConfig;
 #[test]
 fn credentials_constructors_work() {
     let pw = Credentials::password("bot01", "secret", Some("ABCD".into()));
-    matches!(pw, Credentials::Password(_));
+    assert!(matches!(pw, Credentials::Password(_)));
 
     let rt = Credentials::refresh_token("eyJ...");
-    matches!(rt, Credentials::RefreshToken(_));
+    assert!(matches!(rt, Credentials::RefreshToken(_)));
 }
 
 #[test]
