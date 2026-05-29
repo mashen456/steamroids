@@ -1,37 +1,65 @@
 # protos/
 
-Vendored `.proto` files from upstream Steam sources.
+Vendored `.proto` files from upstream Steam sources. Compiled by
+[`build.rs`](../build.rs) via [`prost-build`](https://crates.io/crates/prost-build);
+generated Rust lands in `$OUT_DIR` and is re-exported from
+[`steamroids::proto`](../src/proto.rs).
 
-**This directory is empty as of `0.0.1`** — we'll populate it for `0.1.0` once
-the login flow is in scope.
+## Upstream
 
-## What goes here
+- Source: <https://github.com/SteamTracking/Protobufs>
+- Pinned commit + vendor date: see [`COMMIT.txt`](COMMIT.txt)
 
-The files we'll need, copied from SteamKit2's `Resources/SteamKit2/Protobufs/`:
+`SteamTracking/Protobufs` is the upstream used by SteamKit (where it's pulled
+in as a git submodule under `Resources/Protobufs`). We vendor flat copies so
+the build has no submodule or network dependency.
 
-| File | Source | Used for |
-|---|---|---|
-| `steammessages_base.proto` | SteamKit2 | EMsg envelope, common types |
-| `steammessages_auth.steamclient.proto` | SteamKit2 | Login / refresh-token flow |
-| `steammessages_clientserver_login.proto` | SteamKit2 | `CMsgClientLogon` |
-| `gcsystemmsgs.proto` | SteamKit2 | GC envelope (`CMsgClientFromGC` / `…ToGC`) |
-| `cstrike15_gcmessages.proto` | SteamKit2 | CS2 profile request / response |
+## Currently vendored
 
-## How to vendor
+Minimal subset needed for `0.1.x` (login + heartbeat).
 
-Upstream: <https://github.com/SteamRE/SteamKit/tree/master/Resources/SteamKit2/Protobufs>
+| File | Used for |
+|---|---|
+| `steam/steammessages_base.proto` | `CMsgProtoBufHeader` (header on every EMsg) |
+| `steam/enums.proto` | `EResult`, `EUniverse`, etc. |
+| `steam/enums_clientserver.proto` | the `EMsg` enum |
+| `steam/steammessages_unified_base.steamclient.proto` | base for service-style messages |
+| `steam/steammessages_auth.steamclient.proto` | `BeginAuthSessionViaCredentials`, `Poll`, `GenerateAccessTokenForApp` |
+| `steam/steammessages_credentials.steamclient.proto` | credential exchange types |
+| `steam/steammessages_clientserver_login.proto` | `CMsgClientLogon`, `CMsgClientLogonResponse`, `CMsgClientHeartBeat` |
+| `google/protobuf/descriptor.proto` | resolved via include path so `extend google.protobuf.MessageOptions` parses; not compiled (prost ships `prost-types` for it) |
+
+For `0.2.x` (CS2 Game Coordinator) we'll add at least `csgo/gcsystemmsgs.proto`
+and `csgo/cstrike15_gcmessages.proto`.
+
+## Re-vendoring upstream changes
 
 ```bash
-# from this directory
-curl -O https://raw.githubusercontent.com/SteamRE/SteamKit/master/Resources/SteamKit2/Protobufs/steamclient/steammessages_base.proto
-# … repeat for each file above
+# Run from the repo root.
+BASE='https://raw.githubusercontent.com/SteamTracking/Protobufs/<NEW_SHA>'
+for f in \
+  steam/steammessages_base.proto \
+  steam/enums.proto \
+  steam/enums_clientserver.proto \
+  steam/steammessages_unified_base.steamclient.proto \
+  steam/steammessages_auth.steamclient.proto \
+  steam/steammessages_credentials.steamclient.proto \
+  steam/steammessages_clientserver_login.proto \
+  google/protobuf/descriptor.proto
+do
+  curl -sSf -o "protos/$f" "$BASE/$f"
+done
 ```
 
-When pulling in, record the upstream commit hash in this README so we can
-diff against newer Valve revisions cleanly.
+Then update `protos/COMMIT.txt` and re-run `cargo build`. If new transitive
+imports appear, `protoc` will fail with a clear "file not found" — fetch the
+missing files and add them above.
 
-## Generation
+## Conventions
 
-`build.rs` (added in `0.1.0`) will run `prost-build` over this directory at
-compile time. Generated Rust code goes into `OUT_DIR` and is included via
-`include!` macros in the relevant module — no checked-in generated code.
+- **No generated code committed.** Everything in this directory is source-of-truth
+  upstream; `build.rs` does the codegen at compile time.
+- **No edits to vendored files.** If we need to massage something, do it in
+  `build.rs` (prost-build config) or in a wrapper module — never in the `.proto`.
+- **Pin a specific commit**, never `master`. Steam protos change; we want
+  intentional bumps.

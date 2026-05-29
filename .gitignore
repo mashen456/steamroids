@@ -14,6 +14,10 @@ Thumbs.db
 .vscode/
 *.swp
 
+# AI agent scratchpad — local-only handover notes for Claude/Cursor sessions.
+# Never committed; see .claude/memory.md inside for current findings.
+.claude/
+
 # Coverage
 *.profraw
 tarpaulin-report.html
