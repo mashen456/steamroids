@@ -66,6 +66,15 @@ pub enum Error {
     /// An operation timed out before producing a result.
     #[error("timeout: {0}")]
     Timeout(&'static str),
+
+    /// A code path the public API exposes but the underlying implementation
+    /// is not landed yet. The string names the missing piece.
+    ///
+    /// This is a deliberate sentinel — examples and integration code can
+    /// surface a clear "wired but not finished" signal instead of panicking.
+    /// Remove the variant once 0.1.x is feature-complete.
+    #[error("not implemented yet: {0}")]
+    NotImplemented(&'static str),
 }
 
 impl From<tokio_socks::Error> for Error {

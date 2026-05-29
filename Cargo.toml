@@ -53,11 +53,31 @@ sha1 = "0.10"
 thiserror = "1.0"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+# Used at runtime to decode JWT payloads to recover the SteamID.
+serde_json = "1"
+
+# HTTP client for the Steam WebAPI auth flow.
+reqwest = { version = "0.12", default-features = false, features = [
+    "http2",
+    "rustls-tls-webpki-roots",
+    "socks",
+] }
+
+# RSA encryption of the password for BeginAuthSessionViaCredentials.
+rsa = { version = "0.9", default-features = false, features = ["std"] }
+
+# Protobuf runtime (generated code uses these).
+prost = "0.13"
+prost-types = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+# Bundles a protoc binary so users / CI don't need to install it system-wide.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -83,3 +103,11 @@ path = "examples/02_proxy_test.rs"
 [[example]]
 name = "03_ws_echo"
 path = "examples/03_ws_echo.rs"
+
+[[example]]
+name = "04_signin_credentials"
+path = "examples/04_signin_credentials.rs"
+
+[[example]]
+name = "05_signin_refresh_token"
+path = "examples/05_signin_refresh_token.rs"

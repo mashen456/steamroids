@@ -3,7 +3,9 @@
 //! Unit tests live alongside the modules they cover. This file is for tests
 //! that need more than one module to be useful.
 
+use prost::Message;
 use steamroids::auth::{totp::generate_auth_code, Credentials};
+use steamroids::proto;
 use steamroids::session::SessionState;
 use steamroids::transport::proxy::ProxyConfig;
 
@@ -34,4 +36,33 @@ fn totp_produces_steam_alphabet() {
     // 20-byte zero secret is small but valid HMAC-SHA1 key material.
     let code = generate_auth_code("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", Some(0)).unwrap();
     assert_eq!(code.len(), 5);
+}
+
+#[test]
+fn protobuf_header_round_trips() {
+    // Smoke-tests that the vendored .proto files compiled and the prost
+    // runtime is wired up. If this stops linking, the include! in proto.rs
+    // (or the build.rs paths) is wrong.
+    let header = proto::CMsgProtoBufHeader {
+        steamid: Some(76_561_198_000_000_000),
+        client_sessionid: Some(42),
+        ..Default::default()
+    };
+
+    let bytes = header.encode_to_vec();
+    let decoded = proto::CMsgProtoBufHeader::decode(&*bytes).unwrap();
+
+    assert_eq!(decoded.steamid, Some(76_561_198_000_000_000));
+    assert_eq!(decoded.client_sessionid, Some(42));
+}
+
+#[test]
+fn known_login_messages_exist() {
+    // Type-level smoke test — if these names disappear in a future re-vendor,
+    // we'll catch it here before the Session code starts to fail mysteriously.
+    let _: proto::CMsgClientLogon = proto::CMsgClientLogon::default();
+    let _: proto::CMsgClientLogonResponse = proto::CMsgClientLogonResponse::default();
+    let _: proto::CMsgClientHeartBeat = proto::CMsgClientHeartBeat::default();
+    let _: proto::CAuthenticationBeginAuthSessionViaCredentialsRequest =
+        proto::CAuthenticationBeginAuthSessionViaCredentialsRequest::default();
 }

@@ -29,6 +29,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod proto;
 pub mod session;
 pub mod transport;
 

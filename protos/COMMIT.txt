@@ -1,0 +1,5 @@
+upstream:  https://github.com/SteamTracking/Protobufs
+commit:    6d9868869cd3f3f7326dcd7f0fecff32d4a0a4d3
+date:      2026-05-11
+vendored:  2026-05-28
+referenced-by: SteamKit master @ 690a5cf106719cc80c12985e5b8312d4a2a525d5
