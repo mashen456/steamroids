@@ -8,6 +8,27 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ## [Unreleased]
 
+### Added
+
+- `auth::TokenStore` trait + `SignIn::execute_with_store` for transparent
+  refresh-token reuse and persistence (try a stored token, fall back to the
+  password flow, persist the issued token).
+- `https://` proxy support (TLS-to-proxy) for both the WebAPI auth flow and the
+  WebSocket transport, in addition to SOCKS5 and plain HTTP-CONNECT.
+- Opt-in live integration tests (`tests/live_auth.rs`) that authenticate against
+  real Steam, gated by environment variables / CI secrets.
+
+### Security
+
+- `Debug` for `PasswordCredentials`, `RefreshToken`, `ProxyCredentials`, and
+  `SignInOutcome` now redacts secrets (password, shared secret, refresh/access
+  tokens, proxy password) so they no longer leak into logs and traces.
+
+### Notes
+
+- Email Steam Guard is explicitly unsupported (`NeedsEmailGuardCode` cannot
+  complete sign-in); use mobile 2FA or a Steam-Guard-disabled account.
+
 ## [0.1.0] - 2026-06-04
 
 ### Added

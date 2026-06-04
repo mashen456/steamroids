@@ -198,14 +198,11 @@ impl WebApiClient {
 }
 
 fn build_proxy(cfg: &ProxyConfig) -> Result<Proxy> {
-    if cfg.tls_to_proxy {
-        return Err(Error::InvalidConfig(
-            "https:// proxies (TLS-to-proxy) not yet supported for WebAPI".into(),
-        ));
-    }
-
     let scheme = match cfg.kind {
         ProxyKind::Socks5 => "socks5h",
+        // reqwest TLS-connects to the proxy itself when the scheme is https,
+        // using our rustls backend — no manual handling needed here.
+        ProxyKind::HttpConnect if cfg.tls_to_proxy => "https",
         ProxyKind::HttpConnect => "http",
     };
     let url = format!("{scheme}://{}:{}", cfg.host, cfg.port);
@@ -312,9 +309,9 @@ mod tests {
     }
 
     #[test]
-    fn build_proxy_rejects_https_to_proxy() {
+    fn build_proxy_accepts_https_to_proxy() {
+        // reqwest handles TLS-to-proxy natively now; this must build.
         let cfg = ProxyConfig::parse("https://u:p@host:8443").unwrap();
-        let err = build_proxy(&cfg).unwrap_err();
-        assert!(matches!(err, Error::InvalidConfig(_)));
+        build_proxy(&cfg).unwrap();
     }
 }

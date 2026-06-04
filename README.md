@@ -29,7 +29,8 @@ Design priorities, in order:
 - ✅ RSA password encryption, Steam-Guard handling, `EResult` → outcome mapping
 - ✅ Vendored Steam protobufs + `prost-build` codegen (`crate::proto`)
 - ✅ Steam **TOTP** code generation (Steam's HMAC-SHA1 / base-26 variant)
-- ✅ Proxy connection layer — SOCKS5 with auth, HTTP-CONNECT with auth
+- ✅ Proxy connection layer — SOCKS5, HTTP-CONNECT, and `https://` (TLS-to-proxy),
+  all with auth
 - ✅ WebSocket+TLS transport (works through proxies)
 - ✅ Credential and session-state data types
 - ✅ CI: rustfmt, clippy, test, doc, audit

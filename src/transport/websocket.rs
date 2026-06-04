@@ -4,21 +4,18 @@
 //! [`AsyncStream`] so the proxy and direct paths share one signature. Callers
 //! don't have to thread generics through their session structs.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::ClientConfig;
 use rustls_pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
 use crate::error::Error;
 use crate::transport::proxy::{connect_via_proxy, ProxyConfig};
-use crate::transport::AsyncStream;
+use crate::transport::{tls_connector, AsyncStream};
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -66,7 +63,7 @@ pub async fn connect_ws(url: &str, proxy: Option<&ProxyConfig>) -> Result<SteamW
 
     // 2. TLS (if wss)
     let stream: Box<dyn AsyncStream> = if is_wss {
-        let connector = build_tls_connector();
+        let connector = tls_connector();
         let server_name = ServerName::try_from(host.clone())
             .map_err(|e| Error::Tls(format!("invalid sni: {e}")))?;
         let tls_stream = timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(server_name, tcp))
@@ -90,14 +87,4 @@ pub async fn connect_ws(url: &str, proxy: Option<&ProxyConfig>) -> Result<SteamW
     .map_err(|_| Error::Timeout("ws handshake"))??;
 
     Ok(ws)
-}
-
-fn build_tls_connector() -> TlsConnector {
-    let root_store = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    TlsConnector::from(Arc::new(config))
 }

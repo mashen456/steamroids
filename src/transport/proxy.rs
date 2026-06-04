@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use base64::Engine;
+use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -22,7 +23,7 @@ use tokio_socks::tcp::Socks5Stream;
 use tracing::trace;
 
 use crate::error::Error;
-use crate::transport::AsyncStream;
+use crate::transport::{tls_connector, AsyncStream};
 
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -71,8 +72,9 @@ pub struct ProxyConfig {
     /// Optional auth.
     pub credentials: Option<ProxyCredentials>,
     /// `true` if the URL scheme was `https://` — the TCP leg to the proxy
-    /// itself should be TLS-wrapped. We don't act on this yet (would require
-    /// TLS-to-proxy-then-TLS-to-upstream); reserved for a later release.
+    /// itself is TLS-wrapped before the HTTP `CONNECT` handshake. The upstream's
+    /// own TLS (e.g. `wss`) then layers on top. Only meaningful for
+    /// [`ProxyKind::HttpConnect`]; SOCKS5 ignores it.
     pub tls_to_proxy: bool,
 }
 
@@ -151,15 +153,6 @@ pub async fn connect_via_proxy(
         "starting proxy connect"
     );
 
-    if proxy.tls_to_proxy {
-        // Would need to TLS-wrap the TCP leg to the proxy itself before doing
-        // the proxy handshake. Out of scope for 0.0.x — most providers expose
-        // a plain TCP/SOCKS5 endpoint anyway.
-        return Err(Error::InvalidConfig(
-            "https:// proxies (TLS-to-proxy) not yet supported; use http:// or socks5://".into(),
-        ));
-    }
-
     match proxy.kind {
         ProxyKind::Socks5 => connect_socks5(proxy, target_host, target_port).await,
         ProxyKind::HttpConnect => connect_http(proxy, target_host, target_port).await,
@@ -200,9 +193,24 @@ async fn connect_http(
     target_port: u16,
 ) -> Result<Box<dyn AsyncStream>, Error> {
     let proxy_addr = format!("{}:{}", proxy.host, proxy.port);
-    let mut stream = timeout(PROXY_HANDSHAKE_TIMEOUT, TcpStream::connect(&proxy_addr))
+    let tcp = timeout(PROXY_HANDSHAKE_TIMEOUT, TcpStream::connect(&proxy_addr))
         .await
         .map_err(|_| Error::Timeout("http connect tcp"))??;
+
+    // For an https:// proxy, TLS-wrap the leg to the proxy itself before the
+    // CONNECT handshake. The upstream's own TLS (e.g. wss) layers on top later.
+    let mut stream: Box<dyn AsyncStream> = if proxy.tls_to_proxy {
+        let connector = tls_connector();
+        let sni = ServerName::try_from(proxy.host.clone())
+            .map_err(|e| Error::Tls(format!("invalid proxy sni: {e}")))?;
+        let tls = timeout(PROXY_HANDSHAKE_TIMEOUT, connector.connect(sni, tcp))
+            .await
+            .map_err(|_| Error::Timeout("proxy tls handshake"))?
+            .map_err(|e| Error::Tls(e.to_string()))?;
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
 
     let auth_header = proxy.credentials.as_ref().map(|c| {
         let blob = base64::engine::general_purpose::STANDARD
@@ -247,7 +255,7 @@ async fn connect_http(
         }
     }
 
-    Ok(Box::new(reader.into_inner()))
+    Ok(reader.into_inner())
 }
 
 fn is_ok_status(status_line: &str) -> bool {
@@ -313,6 +321,13 @@ mod tests {
         let cfg = ProxyConfig::parse("http://u:p@host:8080").unwrap();
         assert_eq!(cfg.kind, ProxyKind::HttpConnect);
         assert!(!cfg.tls_to_proxy);
+    }
+
+    #[test]
+    fn parses_https_connect_sets_tls_to_proxy() {
+        let cfg = ProxyConfig::parse("https://u:p@host:8443").unwrap();
+        assert_eq!(cfg.kind, ProxyKind::HttpConnect);
+        assert!(cfg.tls_to_proxy, "https:// scheme must flag TLS-to-proxy");
     }
 
     #[test]
