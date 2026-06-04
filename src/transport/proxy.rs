@@ -327,7 +327,10 @@ mod tests {
         // password must not appear anywhere in the printed config.
         let cfg = ProxyConfig::parse("socks5://user:supersecretpw@host:1080").unwrap();
         let dbg = format!("{cfg:?}");
-        assert!(!dbg.contains("supersecretpw"), "proxy password leaked: {dbg}");
+        assert!(
+            !dbg.contains("supersecretpw"),
+            "proxy password leaked: {dbg}"
+        );
         // Host and username are fine to show.
         assert!(dbg.contains("host"));
         assert!(dbg.contains("user"));

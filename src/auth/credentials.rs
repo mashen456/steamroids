@@ -109,8 +109,14 @@ mod tests {
             shared_secret: Some("base64SharedSecret==".into()),
         };
         let dbg = format!("{creds:?}");
-        assert!(!dbg.contains("hunter2-super-secret"), "password leaked: {dbg}");
-        assert!(!dbg.contains("base64SharedSecret"), "shared secret leaked: {dbg}");
+        assert!(
+            !dbg.contains("hunter2-super-secret"),
+            "password leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("base64SharedSecret"),
+            "shared secret leaked: {dbg}"
+        );
         // Non-secret context is still useful.
         assert!(dbg.contains("bot01"));
         assert!(dbg.contains(REDACTED));

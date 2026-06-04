@@ -112,7 +112,10 @@ async fn run_password_login(label: &str, acc: Account) {
             eprintln!("OK [{label}] login for steam_id {steam_id}");
         }
         SignInOutcome::NeedsMobileGuardCode => {
-            panic!("[{label}] account needs mobile 2FA — set STEAM_TEST_{}_SHARED_SECRET", label.to_uppercase());
+            panic!(
+                "[{label}] account needs mobile 2FA — set STEAM_TEST_{}_SHARED_SECRET",
+                label.to_uppercase()
+            );
         }
         SignInOutcome::NeedsEmailGuardCode { email_domain } => {
             eprintln!("SKIP [{label}]: account still has email Steam Guard (domain {email_domain}); disable Steam Guard for a real login test");
@@ -132,7 +135,9 @@ async fn run_password_login(label: &str, acc: Account) {
 #[ignore = "full password+2FA login; CI runs it via --include-ignored"]
 async fn login_account_with_2fa() {
     let Some(acc) = load_account("2FA") else {
-        eprintln!("SKIP login_account_with_2fa: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET");
+        eprintln!(
+            "SKIP login_account_with_2fa: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET"
+        );
         return;
     };
     assert!(

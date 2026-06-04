@@ -694,8 +694,14 @@ mod tests {
             access_token: Some("secret-access-jwt".into()),
         };
         let dbg = format!("{outcome:?}");
-        assert!(!dbg.contains("secret-refresh-jwt"), "refresh token leaked: {dbg}");
-        assert!(!dbg.contains("secret-access-jwt"), "access token leaked: {dbg}");
+        assert!(
+            !dbg.contains("secret-refresh-jwt"),
+            "refresh token leaked: {dbg}"
+        );
+        assert!(
+            !dbg.contains("secret-access-jwt"),
+            "access token leaked: {dbg}"
+        );
         // Non-secret context (the SteamID) and token presence stay visible.
         assert!(dbg.contains("76561198000000001"));
         assert!(dbg.contains("redacted"));
@@ -705,7 +711,10 @@ mod tests {
     fn signin_builder_debug_redacts_password() {
         // SignIn derives Debug; it must not leak via its embedded credentials.
         let dbg = format!("{:?}", SignIn::with_password("bot01", "leak-me"));
-        assert!(!dbg.contains("leak-me"), "password leaked through SignIn: {dbg}");
+        assert!(
+            !dbg.contains("leak-me"),
+            "password leaked through SignIn: {dbg}"
+        );
     }
 
     /// A store whose methods must never run — used to prove the refresh-token
