@@ -8,6 +8,7 @@
 
 pub mod credentials;
 pub mod signin;
+pub mod token_store;
 pub mod totp;
 
 // Crate-private implementation details for the WebAPI auth flow.
@@ -17,3 +18,4 @@ mod webapi;
 
 pub use credentials::{Credentials, PasswordCredentials, RefreshToken};
 pub use signin::{SignIn, SignInOutcome};
+pub use token_store::{TokenStore, TokenStoreError};

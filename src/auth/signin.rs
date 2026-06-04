@@ -49,6 +49,7 @@ use tracing::debug;
 
 use crate::auth::jwt::steam_id_from_refresh_token;
 use crate::auth::rsa_pw::encrypt_password;
+use crate::auth::token_store::TokenStore;
 use crate::auth::webapi::{map_non_ok_eresult, EResult, FlowKind, HttpMethod, WebApiClient};
 use crate::auth::{Credentials, RefreshToken};
 use crate::proto::{
@@ -222,6 +223,82 @@ impl SignIn {
             Credentials::Password(_) => self.execute_password_flow().await,
             Credentials::RefreshToken(_) => self.execute_refresh_token_flow().await,
         }
+    }
+
+    /// Execute while transparently reusing and persisting a refresh token via
+    /// `store`.
+    ///
+    /// This is the ergonomic entry point for long-running fleets: it avoids a
+    /// full password+2FA login (which Steam rate-limits) whenever a still-valid
+    /// refresh token is on hand. The flow for a password builder:
+    ///
+    /// 1. [`TokenStore::load`] the account's saved token. If present, try the
+    ///    refresh flow with it.
+    /// 2. On success, [`TokenStore::save`] whatever token came back (Steam may
+    ///    rotate it) and return.
+    /// 3. If the stored token was rejected (expired / revoked) or none existed,
+    ///    run the full password flow, then save the freshly issued token.
+    ///
+    /// A [`SignIn::with_refresh_token`] builder has no account key to persist
+    /// under, so it bypasses the store and behaves like [`Self::execute`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::execute`], plus [`Error::TokenStore`] if the store's
+    /// `load`/`save` fails.
+    pub async fn execute_with_store(
+        self,
+        store: &(impl TokenStore + Sync),
+    ) -> Result<SignInOutcome> {
+        // Only a password builder has an account name to key the store on.
+        let account = match &self.credentials {
+            Credentials::Password(c) => c.account_name.clone(),
+            Credentials::RefreshToken(_) => return self.execute().await,
+        };
+        let proxy = self.proxy.clone();
+
+        // 1. Reuse a stored token if there is one.
+        if let Some(token) = store
+            .load(&account)
+            .await
+            .map_err(|e| Error::TokenStore(e.to_string()))?
+        {
+            let mut attempt = SignIn::with_refresh_token(token);
+            if let Some(p) = proxy {
+                attempt = attempt.proxy(p);
+            }
+            match attempt.execute().await? {
+                SignInOutcome::Success {
+                    steam_id,
+                    refresh_token,
+                    access_token,
+                } => {
+                    store
+                        .save(&account, refresh_token.expose())
+                        .await
+                        .map_err(|e| Error::TokenStore(e.to_string()))?;
+                    return Ok(SignInOutcome::Success {
+                        steam_id,
+                        refresh_token,
+                        access_token,
+                    });
+                }
+                // Stored token is no good — fall through to the password flow.
+                SignInOutcome::TokenRejected => {}
+                // Anything transient (rate limit, …) is the caller's to handle.
+                other => return Ok(other),
+            }
+        }
+
+        // 2. Full password flow; persist the new token on success.
+        let outcome = self.execute().await?;
+        if let SignInOutcome::Success { refresh_token, .. } = &outcome {
+            store
+                .save(&account, refresh_token.expose())
+                .await
+                .map_err(|e| Error::TokenStore(e.to_string()))?;
+        }
+        Ok(outcome)
     }
 
     async fn execute_password_flow(self) -> Result<SignInOutcome> {
@@ -629,5 +706,36 @@ mod tests {
         // SignIn derives Debug; it must not leak via its embedded credentials.
         let dbg = format!("{:?}", SignIn::with_password("bot01", "leak-me"));
         assert!(!dbg.contains("leak-me"), "password leaked through SignIn: {dbg}");
+    }
+
+    /// A store whose methods must never run — used to prove the refresh-token
+    /// builder bypasses the store entirely.
+    struct PanicStore;
+
+    impl TokenStore for PanicStore {
+        async fn load(
+            &self,
+            _account: &str,
+        ) -> std::result::Result<Option<String>, crate::auth::TokenStoreError> {
+            panic!("store must not be loaded for a refresh-token builder");
+        }
+        async fn save(
+            &self,
+            _account: &str,
+            _token: &str,
+        ) -> std::result::Result<(), crate::auth::TokenStoreError> {
+            panic!("store must not be saved for a refresh-token builder");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_store_bypasses_store_for_refresh_builder() {
+        // The malformed JWT fails offline before any network work, and the
+        // store must not be touched — so PanicStore's methods never fire.
+        let err = SignIn::with_refresh_token("not.a.real.jwt")
+            .execute_with_store(&PanicStore)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::AuthRejected(_)));
     }
 }

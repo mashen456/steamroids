@@ -61,6 +61,11 @@ pub enum Error {
     #[error("auth rate-limited: {0}")]
     AuthRateLimited(String),
 
+    /// A caller-supplied [`TokenStore`](crate::auth::TokenStore) returned an
+    /// error while loading or saving a refresh token.
+    #[error("token store: {0}")]
+    TokenStore(String),
+
     /// An operation was attempted in the wrong session state.
     #[error("invalid session state: expected {expected}, was {actual}")]
     InvalidState {
