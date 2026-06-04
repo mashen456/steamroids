@@ -6,7 +6,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # Marvin Attack timing sidechannel in `rsa`. Not applicable: we only do
+    # public-key encryption (no private key to leak). See .cargo/audit.toml.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2
