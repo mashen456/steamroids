@@ -36,8 +36,11 @@
 //! - `STEAM_TEST_REFRESH_TOKEN` (optional)
 //! - `STEAM_TEST_PROXY_URL` (optional) — routes every call through a proxy
 
+use std::time::Duration;
+
 use steamroids::auth::{SignIn, SignInOutcome};
 use steamroids::transport::proxy::ProxyConfig;
+use steamroids::Error;
 
 /// Read an environment variable, loading `.env` first (best-effort). Returns
 /// `None` for missing *or* empty values — CI passes unset secrets through as
@@ -84,19 +87,40 @@ fn load_account(prefix: &str) -> Option<Account> {
     })
 }
 
+/// Execute a freshly-built `SignIn`, retrying on transient network errors.
+///
+/// Live tests run against real Steam through real (often rotating) proxies, so
+/// a `GetPasswordRSAPublicKey`-style "error sending request" is an expected
+/// blip, not a failure — exactly what a fleet client retries. `build` is called
+/// once per attempt because `execute` consumes the builder.
+async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOutcome {
+    const MAX_ATTEMPTS: u32 = 4;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match build().execute().await {
+            Ok(outcome) => return outcome,
+            Err(Error::Network(msg)) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "[{label}] transient network error (attempt {attempt}/{MAX_ATTEMPTS}): {msg}"
+                );
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Err(e) => panic!("[{label}] sign-in failed at the transport level: {e}"),
+        }
+    }
+    unreachable!("loop returns or panics on the final attempt");
+}
+
 /// Drive the password flow for `acc` and assert a clean login, treating
 /// transient / unsupported states as loud skips rather than failures.
 async fn run_password_login(label: &str, acc: Account) {
-    let mut signin = SignIn::with_password(acc.username, acc.password);
-    if let Some(secret) = acc.shared_secret {
-        signin = signin.shared_secret(secret);
-    }
-    signin = with_optional_proxy(signin);
-
-    let outcome = signin
-        .execute()
-        .await
-        .unwrap_or_else(|e| panic!("[{label}] sign-in failed at the transport level: {e}"));
+    let outcome = execute_with_retry(label, || {
+        let mut signin = SignIn::with_password(acc.username.clone(), acc.password.clone());
+        if let Some(secret) = &acc.shared_secret {
+            signin = signin.shared_secret(secret.clone());
+        }
+        with_optional_proxy(signin)
+    })
+    .await;
 
     match outcome {
         SignInOutcome::Success {
@@ -167,10 +191,10 @@ async fn refresh_token_flow_issues_access_token() {
         return;
     };
 
-    let outcome = with_optional_proxy(SignIn::with_refresh_token(token))
-        .execute()
-        .await
-        .expect("refresh-token sign-in failed at the transport level");
+    let outcome = execute_with_retry("refresh", || {
+        with_optional_proxy(SignIn::with_refresh_token(token.clone()))
+    })
+    .await;
 
     match outcome {
         SignInOutcome::Success {
