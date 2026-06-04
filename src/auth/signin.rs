@@ -41,6 +41,7 @@
 //! # Ok(()) }
 //! ```
 
+use std::fmt;
 use std::time::Duration;
 
 use tokio::time::sleep;
@@ -86,7 +87,11 @@ const POLL_MAX_ATTEMPTS: usize = 24;
 /// flow itself broke". Use a `match` to handle every variant explicitly —
 /// the enum is `#[non_exhaustive]` so additional cases can be added without
 /// a breaking change (e.g. CAPTCHA, device-confirmation prompts).
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand: the `Success` variant carries the refresh
+/// and access tokens, both of which are redacted so the outcome can be logged
+/// safely.
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum SignInOutcome {
     /// Steam accepted the credentials and issued tokens.
@@ -120,6 +125,36 @@ pub enum SignInOutcome {
         /// Steam's hint at when to retry, if it provided one.
         retry_hint: Option<std::time::Duration>,
     },
+}
+
+impl fmt::Debug for SignInOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Success {
+                steam_id,
+                access_token,
+                // `refresh_token`'s own Debug is already redacted, but we don't
+                // even reach for it here — redact uniformly.
+                refresh_token: _,
+            } => f
+                .debug_struct("Success")
+                .field("steam_id", steam_id)
+                .field("refresh_token", &"<redacted>")
+                .field("access_token", &access_token.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::NeedsMobileGuardCode => f.write_str("NeedsMobileGuardCode"),
+            Self::NeedsEmailGuardCode { email_domain } => f
+                .debug_struct("NeedsEmailGuardCode")
+                .field("email_domain", email_domain)
+                .finish(),
+            Self::InvalidCredentials => f.write_str("InvalidCredentials"),
+            Self::TokenRejected => f.write_str("TokenRejected"),
+            Self::RateLimited { retry_hint } => f
+                .debug_struct("RateLimited")
+                .field("retry_hint", retry_hint)
+                .finish(),
+        }
+    }
 }
 
 /// Builder for a single sign-in attempt.
@@ -572,5 +607,27 @@ mod tests {
         // Defend against a buggy / hostile response trying to make us sleep
         // for hours between polls.
         assert_eq!(compute_poll_interval(Some(9000.0)), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn success_outcome_debug_redacts_tokens() {
+        let outcome = SignInOutcome::Success {
+            steam_id: 76_561_198_000_000_001,
+            refresh_token: RefreshToken::new("secret-refresh-jwt"),
+            access_token: Some("secret-access-jwt".into()),
+        };
+        let dbg = format!("{outcome:?}");
+        assert!(!dbg.contains("secret-refresh-jwt"), "refresh token leaked: {dbg}");
+        assert!(!dbg.contains("secret-access-jwt"), "access token leaked: {dbg}");
+        // Non-secret context (the SteamID) and token presence stay visible.
+        assert!(dbg.contains("76561198000000001"));
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn signin_builder_debug_redacts_password() {
+        // SignIn derives Debug; it must not leak via its embedded credentials.
+        let dbg = format!("{:?}", SignIn::with_password("bot01", "leak-me"));
+        assert!(!dbg.contains("leak-me"), "password leaked through SignIn: {dbg}");
     }
 }

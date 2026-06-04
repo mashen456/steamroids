@@ -38,12 +38,25 @@ pub enum ProxyKind {
 }
 
 /// Username/password pair for proxy auth.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand so the password stays out of logs and traces
+/// (this type is embedded in [`ProxyConfig`], which several public types print
+/// in their own `Debug` output).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProxyCredentials {
     /// Proxy username.
     pub username: String,
     /// Proxy password.
     pub password: String,
+}
+
+impl std::fmt::Debug for ProxyCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Address and credentials for an upstream proxy.
@@ -306,5 +319,17 @@ mod tests {
     fn rejects_unknown_scheme() {
         let err = ProxyConfig::parse("ftp://host:21").unwrap_err();
         assert!(matches!(err, Error::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn debug_redacts_proxy_password() {
+        // The config's Debug delegates into ProxyCredentials' Debug, so the
+        // password must not appear anywhere in the printed config.
+        let cfg = ProxyConfig::parse("socks5://user:supersecretpw@host:1080").unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("supersecretpw"), "proxy password leaked: {dbg}");
+        // Host and username are fine to show.
+        assert!(dbg.contains("host"));
+        assert!(dbg.contains("user"));
     }
 }
