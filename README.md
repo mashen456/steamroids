@@ -33,6 +33,10 @@ Design priorities, in order:
 - ✅ WebSocket+TLS transport (works through proxies)
 - ✅ Credential and session-state data types
 - ✅ CI: rustfmt, clippy, test, doc, audit
+- ❌ **Email Steam Guard** — not supported. Accounts that prompt for an emailed
+  code return `SignInOutcome::NeedsEmailGuardCode` and cannot complete sign-in;
+  use the mobile authenticator (TOTP shared secret) or an account with Steam
+  Guard disabled.
 - ❌ Live CM session — `ClientLogon` over WSS + heartbeat (coming in 0.2.0)
 - ❌ Game Coordinator / CS2 layer (coming in 0.3.0+)
 
