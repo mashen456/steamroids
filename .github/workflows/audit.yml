@@ -13,6 +13,11 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # The repo pins rustc 1.86 (MSRV) via rust-toolchain.toml, but cargo-audit's
+    # own dependencies now require >= 1.88 to *build*. Override the toolchain for
+    # this job only so the audit tool compiles; it does not affect the crate MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2.0.0
