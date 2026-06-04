@@ -5,7 +5,7 @@
 [![CI](https://github.com/mashen456/steamroids/actions/workflows/ci.yml/badge.svg)](https://github.com/mashen456/steamroids/actions/workflows/ci.yml)
 [![Audit](https://github.com/mashen456/steamroids/actions/workflows/audit.yml/badge.svg)](https://github.com/mashen456/steamroids/actions/workflows/audit.yml)
 
-**Status:** `0.0.1` — pre-alpha, API will change weekly. Do not depend on this for production yet.
+**Status:** `0.1.0` — pre-alpha, API will change weekly. Do not depend on this for production yet.
 
 ## What this is
 
@@ -22,15 +22,19 @@ Design priorities, in order:
 3. **Small dependency surface** — no Steam-specific dependencies, only foundational crates (tokio, rustls, prost).
 4. **Embedded-friendly API** — clean re-exports, no leaked protobuf types, idiomatic Rust at the boundary.
 
-## What's in 0.0.1
+## What's in 0.1.0
 
+- ✅ **WebAPI sign-in** — password + mobile 2FA (TOTP) or stored refresh token,
+  via the `SignIn` builder; returns access + refresh tokens
+- ✅ RSA password encryption, Steam-Guard handling, `EResult` → outcome mapping
+- ✅ Vendored Steam protobufs + `prost-build` codegen (`crate::proto`)
 - ✅ Steam **TOTP** code generation (Steam's HMAC-SHA1 / base-26 variant)
 - ✅ Proxy connection layer — SOCKS5 with auth, HTTP-CONNECT with auth
 - ✅ WebSocket+TLS transport (works through proxies)
 - ✅ Credential and session-state data types
 - ✅ CI: rustfmt, clippy, test, doc, audit
-- ❌ Actual login flow — needs vendored protobuf definitions (coming in 0.1.0)
-- ❌ Game Coordinator layer (coming in 0.2.0+)
+- ❌ Live CM session — `ClientLogon` over WSS + heartbeat (coming in 0.2.0)
+- ❌ Game Coordinator / CS2 layer (coming in 0.3.0+)
 
 See [ROADMAP.md](./ROADMAP.md) for the full plan.
 
@@ -45,6 +49,13 @@ PROXY_URL="socks5://user:pass@host:1080" cargo run --example 02_proxy_test
 
 # Connect a WebSocket through a proxy to a public echo server
 PROXY_URL="socks5://user:pass@host:1080" cargo run --example 03_ws_echo
+
+# Sign in with password (+ optional 2FA) and print the refresh token
+STEAM_ACCOUNT="bot01" STEAM_PASSWORD="hunter2" SHARED_SECRET="<base64>" \
+  cargo run --example 04_signin_credentials
+
+# Sign in again from a stored refresh token (skips 2FA)
+REFRESH_TOKEN="eyJ..." cargo run --example 05_signin_refresh_token
 ```
 
 ## Using as a dependency
@@ -53,7 +64,7 @@ While this is in pre-alpha, pin to a specific commit:
 
 ```toml
 [dependencies]
-steamroids = { git = "ssh://git@github.com/mashen456/steamroids.git", tag = "v0.0.1" }
+steamroids = { git = "ssh://git@github.com/mashen456/steamroids.git", tag = "v0.1.0" }
 ```
 
 ## Layout
@@ -62,9 +73,10 @@ steamroids = { git = "ssh://git@github.com/mashen456/steamroids.git", tag = "v0.
 src/
 ├── lib.rs               — crate root, re-exports
 ├── error.rs             — Error enum
+├── proto.rs             — generated protobuf types (built from protos/)
 ├── transport/           — WebSocket + TLS + Proxy
-├── auth/                — Credentials, TOTP
-└── session/             — State machine, top-level client
+├── auth/                — Credentials, TOTP, RSA, JWT, WebAPI sign-in flow
+└── session/             — session state (typestate FSM in 0.2.x)
 ```
 
 ## License

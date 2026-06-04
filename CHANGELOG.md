@@ -8,6 +8,30 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-04
+
+### Added
+
+- `auth::SignIn` — high-level sign-in builder, the public entry point for
+  authenticating an account. Two modes: password (+ optional mobile 2FA shared
+  secret) and refresh token.
+- `auth::SignInOutcome` — `#[non_exhaustive]` result enum distinguishing
+  Steam-side rejections (`InvalidCredentials`, `TokenRejected`,
+  `NeedsMobileGuardCode`, `NeedsEmailGuardCode`, `RateLimited`) from success.
+- WebAPI auth flow against `IAuthenticationService`: `GetPasswordRSAPublicKey`
+  → RSA (PKCS#1 v1.5) password encryption → `BeginAuthSessionViaCredentials` →
+  `UpdateAuthSessionWithSteamGuardCode` (mobile TOTP) → `PollAuthSessionStatus`,
+  plus the refresh-token flow via `GenerateAccessTokenForApp`.
+- Vendored Steam `.proto` files (SteamTracking pin in `protos/COMMIT.txt`) and
+  `prost-build` integration in `build.rs`; generated types re-exported from
+  `crate::proto`.
+- `Error::Network` / `Error::AuthRejected` / `Error::AuthRateLimited` to
+  separate "never reached Steam" from "Steam said no".
+
+### Changed
+
+- Crate metadata, docs, and README now reflect that authentication works.
+
 ## [0.0.1] - 2026-05-27
 
 ### Added
@@ -22,5 +46,6 @@ While in `0.x.y`, **any minor version may break the API**.
 - GitHub Actions: fmt, clippy, test, doc, weekly audit.
 - Examples: TOTP generation, proxy connectivity test, WebSocket echo through proxy.
 
-[Unreleased]: https://github.com/mashen456/steamroids/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/mashen456/steamroids/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/mashen456/steamroids/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/mashen456/steamroids/releases/tag/v0.0.1

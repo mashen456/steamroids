@@ -114,7 +114,7 @@ impl WebApiClient {
         let mut builder = Client::builder()
             .timeout(TOTAL_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent("steamroids/0.0.1");
+            .user_agent("steamroids/0.1.0");
 
         if let Some(p) = proxy {
             builder = builder.proxy(build_proxy(p)?);

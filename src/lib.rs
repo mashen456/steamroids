@@ -5,9 +5,12 @@
 //!
 //! ## Scope of this version
 //!
-//! `0.0.x` ships the **transport and crypto foundation**. The actual Steam
-//! protocol exchange (login, app-launch, GC) lands in `0.1.x` once the protobuf
-//! vendoring is in place. See [ROADMAP](https://github.com/mashen456/steamroids/blob/main/ROADMAP.md).
+//! `0.1.x` ships the **transport, crypto, and `WebAPI` authentication** layers:
+//! you can log an account in (password + mobile 2FA, or a stored refresh token)
+//! and obtain access / refresh tokens — see [`auth::SignIn`]. The live Steam
+//! Connection Manager session (`ClientLogon` over WSS, heartbeat) lands in
+//! `0.2.x`, and the CS2 Game Coordinator in `0.3.x`. See
+//! [ROADMAP](https://github.com/mashen456/steamroids/blob/main/ROADMAP.md).
 //!
 //! ## Quick tour
 //!
@@ -22,10 +25,10 @@
 //! ## Module layout
 //!
 //! - [`transport`] — WebSocket + TLS + proxy plumbing
-//! - [`auth`] — credentials, TOTP, (later) the Steam auth flow
+//! - [`auth`] — credentials, TOTP, and the `WebAPI` sign-in flow ([`auth::SignIn`])
 //! - [`session`] — session state types and (later) the typestate FSM
 
-#![doc(html_root_url = "https://docs.rs/steamroids/0.0.1")]
+#![doc(html_root_url = "https://docs.rs/steamroids/0.1.0")]
 
 pub mod auth;
 pub mod error;

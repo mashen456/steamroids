@@ -21,3 +21,8 @@ Thumbs.db
 # Coverage
 *.profraw
 tarpaulin-report.html
+
+# Local Windows-MSVC linker workaround — machine-specific absolute SDK path,
+# not portable. See the file's header comment. The real fix is repairing the
+# 10.0.26100 SDK in the VS Installer.
+.cargo/config.toml
