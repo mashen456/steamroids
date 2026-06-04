@@ -50,3 +50,27 @@ jobs:
       - env:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features
+
+  # Live auth tests against real Steam. Runs only on push (not pull_request) so
+  # secrets are never exposed to fork PRs. `--include-ignored` opts in to the
+  # two full password logins (2FA + plain). Any account whose secrets are unset
+  # soft-skips, so the job stays green until you configure the secrets under
+  # Settings > Secrets and variables > Actions.
+  live:
+    name: live auth
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: live logins
+        env:
+          STEAM_TEST_2FA_ACCOUNT: ${{ secrets.STEAM_TEST_2FA_ACCOUNT }}
+          STEAM_TEST_2FA_PASSWORD: ${{ secrets.STEAM_TEST_2FA_PASSWORD }}
+          STEAM_TEST_2FA_SHARED_SECRET: ${{ secrets.STEAM_TEST_2FA_SHARED_SECRET }}
+          STEAM_TEST_PLAIN_ACCOUNT: ${{ secrets.STEAM_TEST_PLAIN_ACCOUNT }}
+          STEAM_TEST_PLAIN_PASSWORD: ${{ secrets.STEAM_TEST_PLAIN_PASSWORD }}
+          STEAM_TEST_REFRESH_TOKEN: ${{ secrets.STEAM_TEST_REFRESH_TOKEN }}
+          STEAM_TEST_PROXY_URL: ${{ secrets.STEAM_TEST_PROXY_URL }}
+        run: cargo test --test live_auth -- --include-ignored --nocapture

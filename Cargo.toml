@@ -78,6 +78,9 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 tokio = { version = "1.40", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Loads a git-ignored .env for the opt-in live integration tests. Dev-only —
+# never compiled into the published crate.
+dotenvy = "0.15"
 
 [lints.rust]
 unsafe_code = "forbid"
