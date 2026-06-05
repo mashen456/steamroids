@@ -74,3 +74,49 @@ jobs:
           STEAM_TEST_REFRESH_TOKEN: ${{ secrets.STEAM_TEST_REFRESH_TOKEN }}
           STEAM_TEST_PROXY_URL: ${{ secrets.STEAM_TEST_PROXY_URL }}
         run: cargo test --test live_auth -- --include-ignored --nocapture
+
+  # Post the overall CI result to Discord. Push-only (so fork PRs never see the
+  # webhook secret); always() so failures are reported too. Skips quietly if the
+  # DISCORD_WEBHOOK secret is unset.
+  notify:
+    name: discord notification
+    needs: [fmt, clippy, test, doc, live]
+    if: ${{ always() && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post result to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          OVERALL: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 'failure' || 'success' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "DISCORD_WEBHOOK not set; skipping notification."
+            exit 0
+          fi
+          if [ "$OVERALL" = "success" ]; then
+            title="✅ CI passed"; color=3066993
+          else
+            title="❌ CI failed"; color=15158332
+          fi
+          payload=$(jq -n \
+            --arg title "$title" \
+            --arg url "$RUN_URL" \
+            --argjson color "$color" \
+            --arg repo "$REPO" \
+            --arg ref "$REF" \
+            --arg actor "$ACTOR" \
+            --arg commit "${SHA:0:7} ${MSG:0:280}" \
+            '{embeds:[{title:$title, url:$url, color:$color, fields:[
+               {name:"Repo",   value:$repo,   inline:true},
+               {name:"Branch", value:$ref,    inline:true},
+               {name:"By",     value:$actor,  inline:true},
+               {name:"Commit", value:$commit, inline:false}
+            ]}]}')
+          curl -sS -H "Content-Type: application/json" -X POST -d "$payload" "$WEBHOOK"
