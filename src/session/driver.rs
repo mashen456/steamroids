@@ -1,12 +1,14 @@
 //! Background session driver and handle.
 //!
-//! [`spawn_session`] takes a logged-on [`CmConnection`] and moves it onto its
-//! own task. The task owns the socket: it heartbeats, reads incoming messages,
-//! and routes them — replies to in-flight requests by job id, everything else
-//! to subscribers. Callers interact through the cloneable [`SessionHandle`].
+//! [`spawn_session`] takes a [`SessionConfig`] (account + refresh token + proxy),
+//! establishes a logged-on CM connection, and moves it onto its own task. The
+//! task owns the socket: it heartbeats, reads incoming messages, routes replies
+//! to in-flight requests by job id, broadcasts the rest, and — on a transport
+//! failure — **reconnects automatically** with exponential backoff. Callers
+//! interact through the cloneable [`SessionHandle`].
 //!
-//! This is the concurrency model for fleets: many sessions, each a cheap task,
-//! with `request`/`notify`/`subscribe` usable from anywhere a handle is cloned.
+//! This is the concurrency model for fleets: many self-healing sessions, each a
+//! cheap task, with `request`/`notify`/`subscribe` usable from any handle clone.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -19,11 +21,13 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::auth::RefreshToken;
 use crate::codec::{self, SteamMessage};
 use crate::proto::CMsgProtoBufHeader;
 use crate::session::connection::{
     read_message, write_frame, CmConnection, EMSG_CLIENT_HEARTBEAT, EMSG_CLIENT_LOGGED_OFF,
 };
+use crate::transport::proxy::ProxyConfig;
 use crate::transport::websocket::SteamWebSocket;
 use crate::{Error, Result};
 
@@ -31,6 +35,21 @@ use crate::{Error, Result};
 const COMMAND_CAPACITY: usize = 64;
 /// Buffered unsolicited messages per subscriber before lag.
 const EVENT_CAPACITY: usize = 256;
+/// Backoff before the first reconnect attempt.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound on reconnect backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Everything the driver needs to establish — and re-establish — a session.
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    /// Steam account name.
+    pub account_name: String,
+    /// Refresh token from the [`auth`](crate::auth) flow (a `SteamClient` token).
+    pub refresh_token: RefreshToken,
+    /// Optional proxy for discovery and the CM connection.
+    pub proxy: Option<ProxyConfig>,
+}
 
 /// A request/notification queued from a [`SessionHandle`] to the driver.
 enum Command {
@@ -44,10 +63,21 @@ enum Command {
     Notify { emsg: u32, body: Vec<u8> },
 }
 
-/// A cloneable handle to a running CM session.
+/// Why the connected loop ended.
+enum LoopExit {
+    /// All handles dropped — stop for good.
+    Shutdown,
+    /// Steam logged us off — stop for good.
+    LoggedOff,
+    /// Transport failure — reconnect.
+    Disconnected,
+}
+
+/// A cloneable handle to a running, self-healing CM session.
 ///
 /// Cloning is cheap; every clone talks to the same background task. The session
-/// stays alive until **all** handles are dropped (or Steam logs it off).
+/// stays alive (reconnecting as needed) until **all** handles are dropped, Steam
+/// logs it off, or the refresh token is rejected.
 #[derive(Clone)]
 pub struct SessionHandle {
     commands: mpsc::Sender<Command>,
@@ -56,7 +86,7 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
-    /// The logged-on account's 64-bit `SteamID`.
+    /// The logged-on account's 64-bit `SteamID` (stable across reconnects).
     pub fn steam_id(&self) -> u64 {
         self.steam_id
     }
@@ -66,8 +96,8 @@ impl SessionHandle {
     ///
     /// # Errors
     ///
-    /// [`Error::WebSocket`] if the driver has stopped, plus any transport /
-    /// decode error.
+    /// [`Error::WebSocket`] if the driver stopped or the session dropped the
+    /// request mid-reconnect, plus any transport / decode error.
     pub async fn request<Req, Resp>(&self, emsg: u32, req: &Req) -> Result<Resp>
     where
         Req: prost::Message,
@@ -110,18 +140,29 @@ impl SessionHandle {
     }
 }
 
-/// Move `conn` (already logged on) onto a background task and return a handle
-/// plus the task's [`JoinHandle`]. `heartbeat` is
-/// [`LoggedOn::heartbeat_interval`](crate::session::LoggedOn::heartbeat_interval).
+/// Establish a session from `config` and move it onto a background task.
 ///
-/// The task ends — `JoinHandle` resolves to `Ok(())` — when every
-/// [`SessionHandle`] is dropped or Steam logs the session off; it resolves to
-/// `Err` on a transport failure.
-pub fn spawn_session(
-    conn: CmConnection,
-    heartbeat: Duration,
-) -> (SessionHandle, JoinHandle<Result<()>>) {
-    let (ws, steam_id, session_id, inbox) = conn.into_parts();
+/// The initial connect + logon happens here, so credential / connectivity
+/// errors surface immediately. After that the driver keeps the session alive,
+/// reconnecting with backoff on transport drops. The returned [`JoinHandle`]
+/// resolves to `Ok(())` when all handles drop or Steam logs off, or `Err` if the
+/// refresh token is rejected on reconnect.
+///
+/// # Errors
+///
+/// Whatever [`CmConnection::establish`] returns for the initial attempt.
+pub async fn spawn_session(
+    config: SessionConfig,
+) -> Result<(SessionHandle, JoinHandle<Result<()>>)> {
+    let (conn, logged) = CmConnection::establish(
+        &config.account_name,
+        config.refresh_token.expose(),
+        config.proxy.as_ref(),
+    )
+    .await?;
+
+    let steam_id = logged.steam_id;
+    let (ws, _steam_id, session_id, inbox) = conn.into_parts();
     let (write, read) = ws.split();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (evt_tx, _evt_rx) = broadcast::channel(EVENT_CAPACITY);
@@ -132,22 +173,23 @@ pub fn spawn_session(
         inbox,
         steam_id,
         session_id,
-        heartbeat,
+        heartbeat: logged.heartbeat_interval,
         next_jobid: 1,
         pending: HashMap::new(),
         commands: cmd_rx,
         events: evt_tx.clone(),
+        config,
     };
     let join = tokio::spawn(driver.run());
 
-    (
+    Ok((
         SessionHandle {
             commands: cmd_tx,
             events: evt_tx,
             steam_id,
         },
         join,
-    )
+    ))
 }
 
 /// Owns the socket on the background task.
@@ -162,10 +204,25 @@ struct SessionDriver {
     pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>>,
     commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<SteamMessage>,
+    config: SessionConfig,
 }
 
 impl SessionDriver {
     async fn run(mut self) -> Result<()> {
+        loop {
+            match self.run_connected().await {
+                LoopExit::Shutdown | LoopExit::LoggedOff => return Ok(()),
+                LoopExit::Disconnected => {
+                    // In-flight requests can't be answered on a dead socket.
+                    self.fail_all_pending();
+                    self.reconnect().await?;
+                }
+            }
+        }
+    }
+
+    /// Drive one connected session until it ends.
+    async fn run_connected(&mut self) -> LoopExit {
         let mut next_heartbeat = Instant::now() + self.heartbeat;
         loop {
             let wait = next_heartbeat.saturating_duration_since(Instant::now());
@@ -173,35 +230,75 @@ impl SessionDriver {
             tokio::select! {
                 command = self.commands.recv() => {
                     match command {
-                        // All handles dropped — nothing left to drive.
-                        None => return Ok(()),
+                        None => return LoopExit::Shutdown,
                         Some(Command::Notify { emsg, body }) => {
-                            send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, &body).await?;
+                            if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, &body).await.is_err() {
+                                return LoopExit::Disconnected;
+                            }
                         }
                         Some(Command::Request { emsg, body, reply }) => {
                             let jobid = self.next_jobid;
                             self.next_jobid = self.next_jobid.checked_add(1).unwrap_or(1);
-                            self.pending.insert(jobid, reply);
-                            if let Err(e) = send_frame(&mut self.write, self.steam_id, self.session_id, emsg, Some(jobid), &body).await {
-                                if let Some(tx) = self.pending.remove(&jobid) {
-                                    let _ = tx.send(Err(e));
-                                }
+                            if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, Some(jobid), &body).await.is_err() {
+                                let _ = reply.send(Err(Error::WebSocket("session reconnecting".into())));
+                                return LoopExit::Disconnected;
                             }
+                            self.pending.insert(jobid, reply);
                         }
                     }
                 }
                 received = read_message(&mut self.read, &mut self.inbox) => {
-                    let msg = received?;
-                    if msg.emsg == EMSG_CLIENT_LOGGED_OFF {
-                        return Ok(());
+                    match received {
+                        Ok(msg) if msg.emsg == EMSG_CLIENT_LOGGED_OFF => return LoopExit::LoggedOff,
+                        Ok(msg) => dispatch(&mut self.pending, &self.events, msg),
+                        Err(_) => return LoopExit::Disconnected,
                     }
-                    dispatch(&mut self.pending, &self.events, msg);
                 }
                 () = tokio::time::sleep(wait) => {
-                    send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, &[]).await?;
+                    if send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, &[]).await.is_err() {
+                        return LoopExit::Disconnected;
+                    }
                     next_heartbeat = Instant::now() + self.heartbeat;
                 }
             }
+        }
+    }
+
+    /// Re-establish the connection with exponential backoff. Returns once
+    /// reconnected, or `Err` if the token is rejected (retrying won't help).
+    async fn reconnect(&mut self) -> Result<()> {
+        let mut backoff = INITIAL_BACKOFF;
+        loop {
+            tokio::time::sleep(backoff).await;
+            match CmConnection::establish(
+                &self.config.account_name,
+                self.config.refresh_token.expose(),
+                self.config.proxy.as_ref(),
+            )
+            .await
+            {
+                Ok((conn, logged)) => {
+                    let (ws, steam_id, session_id, inbox) = conn.into_parts();
+                    let (write, read) = ws.split();
+                    self.write = write;
+                    self.read = read;
+                    self.inbox = inbox;
+                    self.steam_id = steam_id;
+                    self.session_id = session_id;
+                    self.heartbeat = logged.heartbeat_interval;
+                    return Ok(());
+                }
+                // A rejected token won't fix itself — give up.
+                Err(e @ Error::AuthRejected(_)) => return Err(e),
+                Err(_transient) => backoff = (backoff * 2).min(MAX_BACKOFF),
+            }
+        }
+    }
+
+    /// Fail every in-flight request (used when the socket drops).
+    fn fail_all_pending(&mut self) {
+        for (_jobid, reply) in self.pending.drain() {
+            let _ = reply.send(Err(Error::WebSocket("session reconnecting".into())));
         }
     }
 }
@@ -276,7 +373,6 @@ mod tests {
         let mut pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>> = HashMap::new();
         let (events, mut rx) = broadcast::channel(8);
 
-        // No jobid_target → goes to subscribers.
         dispatch(&mut pending, &events, msg(5, None, vec![1, 2]));
 
         let got = rx.try_recv().expect("event broadcast");
@@ -288,7 +384,6 @@ mod tests {
         let mut pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>> = HashMap::new();
         let (events, mut rx) = broadcast::channel(8);
 
-        // jobid_target set but nothing pending → fall back to broadcast.
         dispatch(&mut pending, &events, msg(751, Some(7), vec![3]));
 
         assert_eq!(rx.try_recv().expect("event broadcast").body, vec![3]);

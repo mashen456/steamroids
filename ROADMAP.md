@@ -114,7 +114,11 @@ roadmap folded this into 0.1.x; it's really its own milestone.
       heartbeats, routes replies to in-flight requests by job id, broadcasts the
       rest. Cloneable `SessionHandle` with `request`/`notify`/`subscribe`.
       Verified live (events, heartbeat survival, clean shutdown). ✅
-- [ ] **Reconnect & backoff** — survive CM eviction / network blips.
+- [x] **Reconnect & backoff** — the driver re-establishes (discover → connect →
+      logon) with exponential backoff on transport drops, failing in-flight
+      requests so callers retry; gives up only if the token is rejected. Session
+      now created from a `SessionConfig` (account + refresh token + proxy) via
+      `CmConnection::establish`. ✅
 - [ ] **Typestate `Session<Disconnected | LoggingOn | LoggedOn | LoggedOff>`** —
       compile-time prevention of "request before logged on"; the observability
       `SessionState` enum becomes its projection.

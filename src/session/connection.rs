@@ -45,6 +45,9 @@ const ERESULT_OK: i32 = 1;
 /// Fallback heartbeat interval if Steam doesn't specify one.
 const DEFAULT_HEARTBEAT_SECS: i32 = 9;
 
+/// How many discovered CM servers to try before giving up a connect attempt.
+const MAX_CONNECT_ATTEMPTS: usize = 5;
+
 /// Base `SteamID` for the *initial* logon header: universe Public, type
 /// Individual, instance Desktop, account id 0. Steam replaces it with the real
 /// `SteamID` in the logon response header.
@@ -73,6 +76,36 @@ pub struct CmConnection {
 }
 
 impl CmConnection {
+    /// Discover a CM, connect (trying servers in turn), and log on with a
+    /// refresh token — the whole "get me a live, logged-on session" flow.
+    ///
+    /// Transport failures fall through to the next server; an auth rejection
+    /// (bad / expired token) stops immediately since retrying won't help.
+    ///
+    /// # Errors
+    ///
+    /// The last connect error if every server fails, [`Error::AuthRejected`] on
+    /// a rejected token, or a discovery error.
+    pub async fn establish(
+        account_name: &str,
+        refresh_token: &str,
+        proxy: Option<&ProxyConfig>,
+    ) -> Result<(Self, LoggedOn)> {
+        let servers = crate::session::discover_cm_servers(proxy).await?;
+        let mut last_err = None;
+        for server in servers.iter().take(MAX_CONNECT_ATTEMPTS) {
+            match Self::connect(&server.ws_url(), proxy).await {
+                Ok(mut conn) => match conn.logon(account_name, refresh_token).await {
+                    Ok(logged) => return Ok((conn, logged)),
+                    Err(e @ Error::AuthRejected(_)) => return Err(e),
+                    Err(e) => last_err = Some(e),
+                },
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Network("no CM servers to connect to".into())))
+    }
+
     /// Open a CM connection to `ws_url` (from
     /// [`CmServer::ws_url`](crate::session::CmServer::ws_url)), optionally
     /// through a proxy.

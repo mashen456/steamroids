@@ -214,7 +214,7 @@ async fn discover_cm_servers_lists_endpoints() {
 #[tokio::test]
 #[ignore = "full CM logon against real Steam; CI runs it via --include-ignored"]
 async fn cm_logon_over_wss() {
-    use steamroids::session::{discover_cm_servers, spawn_session, CmConnection};
+    use steamroids::session::{spawn_session, SessionConfig};
 
     let Some(acc) = load_account("2FA") else {
         eprintln!(
@@ -246,63 +246,37 @@ async fn cm_logon_over_wss() {
         }
     };
 
-    // 2. Discover CM servers.
-    let servers = discover_cm_servers(proxy.as_ref())
+    // 2. Establish a self-healing session — discover -> connect -> logon all
+    //    happen inside spawn_session — and run the background driver.
+    let config = SessionConfig {
+        account_name: acc.username.clone(),
+        refresh_token: refresh,
+        proxy: proxy.clone(),
+    };
+    let (handle, join) = spawn_session(config).await.expect("establish CM session");
+    assert!(handle.steam_id() > 0, "expected a real SteamID");
+    eprintln!("OK CM session: steamid={}", handle.steam_id());
+
+    // 3. Receive an unsolicited event, stay alive across heartbeat intervals,
+    //    then shut down cleanly when all handles drop.
+    let mut events = handle.subscribe();
+    let first = tokio::time::timeout(Duration::from_secs(10), events.recv())
         .await
-        .expect("CM discovery failed");
+        .expect("expected an unsolicited event within 10s")
+        .expect("event channel stayed open");
+    eprintln!("OK driver: first event emsg={}", first.emsg);
 
-    // 3. Connect + logon, trying a few servers in case one is unreachable.
-    let mut last_err = None;
-    for server in servers.iter().take(5) {
-        match CmConnection::connect(&server.ws_url(), proxy.as_ref()).await {
-            Ok(mut conn) => match conn.logon(&acc.username, refresh.expose()).await {
-                Ok(logged) => {
-                    assert!(logged.steam_id > 0, "expected a real SteamID");
-                    assert!(logged.session_id != 0, "expected a session id");
-                    eprintln!(
-                        "OK CM logon via {}: steamid={} session={} heartbeat={:?}",
-                        server.ws_url(),
-                        logged.steam_id,
-                        logged.session_id,
-                        logged.heartbeat_interval
-                    );
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    assert!(!join.is_finished(), "driver should still be running");
 
-                    // 4. Hand the connection to the background driver and
-                    //    exercise it: receive an event, stay alive across
-                    //    heartbeat intervals, then shut down cleanly.
-                    let (handle, join) = spawn_session(conn, logged.heartbeat_interval);
-                    let mut events = handle.subscribe();
-
-                    let first = tokio::time::timeout(Duration::from_secs(10), events.recv())
-                        .await
-                        .expect("expected an unsolicited event within 10s")
-                        .expect("event channel stayed open");
-                    eprintln!("OK driver: first event emsg={}", first.emsg);
-
-                    // Survive a couple heartbeat intervals.
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-                    assert!(!join.is_finished(), "driver should still be running");
-
-                    // Drop every handle → driver stops cleanly.
-                    drop(events);
-                    drop(handle);
-                    tokio::time::timeout(Duration::from_secs(5), join)
-                        .await
-                        .expect("driver task ends after handles drop")
-                        .expect("driver task did not panic")
-                        .expect("clean driver shutdown");
-                    eprintln!("OK driver: clean shutdown after handles dropped");
-                    return;
-                }
-                Err(e) => panic!("CM logon rejected: {e}"),
-            },
-            Err(e) => {
-                eprintln!("connect to {} failed, trying next: {e}", server.ws_url());
-                last_err = Some(e);
-            }
-        }
-    }
-    panic!("could not connect to any CM server: {last_err:?}");
+    drop(events);
+    drop(handle);
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("driver task ends after handles drop")
+        .expect("driver task did not panic")
+        .expect("clean driver shutdown");
+    eprintln!("OK driver: clean shutdown after handles dropped");
 }
 
 /// The refresh-token round-trip: a single `GenerateAccessTokenForApp` call.

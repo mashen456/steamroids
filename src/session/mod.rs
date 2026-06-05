@@ -12,5 +12,5 @@ pub mod state;
 
 pub use connection::{CmConnection, LoggedOn};
 pub use discovery::{discover_cm_servers, CmServer};
-pub use driver::{spawn_session, SessionHandle};
+pub use driver::{spawn_session, SessionConfig, SessionHandle};
 pub use state::SessionState;
