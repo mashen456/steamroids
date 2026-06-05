@@ -50,15 +50,20 @@ pub struct SteamMessage {
 /// `emsg` is the bare [`EMsg`](crate::proto::EMsg) value; the protobuf flag is
 /// applied here. Any extra high bits in `emsg` are masked off.
 pub fn encode<M: Message>(emsg: u32, header: &CMsgProtoBufHeader, body: &M) -> Vec<u8> {
+    encode_raw(emsg, header, &body.encode_to_vec())
+}
+
+/// Like [`encode`], but takes an already-serialized protobuf `body`. Useful when
+/// the body bytes were produced elsewhere (e.g. queued for a background driver).
+pub fn encode_raw(emsg: u32, header: &CMsgProtoBufHeader, body: &[u8]) -> Vec<u8> {
     let header_bytes = header.encode_to_vec();
-    let body_bytes = body.encode_to_vec();
-    let mut out = Vec::with_capacity(PREFIX_LEN + header_bytes.len() + body_bytes.len());
+    let mut out = Vec::with_capacity(PREFIX_LEN + header_bytes.len() + body.len());
     out.extend_from_slice(&((emsg & EMSG_MASK) | PROTO_MASK).to_le_bytes());
     // A real Steam header is far smaller than u32::MAX; the cast cannot wrap.
     #[allow(clippy::cast_possible_truncation)]
     out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&header_bytes);
-    out.extend_from_slice(&body_bytes);
+    out.extend_from_slice(body);
     out
 }
 

@@ -214,7 +214,7 @@ async fn discover_cm_servers_lists_endpoints() {
 #[tokio::test]
 #[ignore = "full CM logon against real Steam; CI runs it via --include-ignored"]
 async fn cm_logon_over_wss() {
-    use steamroids::session::{discover_cm_servers, CmConnection};
+    use steamroids::session::{discover_cm_servers, spawn_session, CmConnection};
 
     let Some(acc) = load_account("2FA") else {
         eprintln!(
@@ -267,17 +267,31 @@ async fn cm_logon_over_wss() {
                         logged.heartbeat_interval
                     );
 
-                    // 4. Heartbeat: keep the session alive past several
-                    //    intervals. Surviving the timeout = success.
-                    let mut msgs = 0u32;
-                    let run = conn.run(logged.heartbeat_interval, |_m| msgs += 1);
-                    match tokio::time::timeout(Duration::from_secs(25), run).await {
-                        Err(_elapsed) => {
-                            eprintln!("OK heartbeat: session alive 25s, {msgs} msgs received");
-                        }
-                        Ok(Ok(())) => panic!("session logged off during heartbeat window"),
-                        Ok(Err(e)) => panic!("heartbeat loop failed (session dropped): {e}"),
-                    }
+                    // 4. Hand the connection to the background driver and
+                    //    exercise it: receive an event, stay alive across
+                    //    heartbeat intervals, then shut down cleanly.
+                    let (handle, join) = spawn_session(conn, logged.heartbeat_interval);
+                    let mut events = handle.subscribe();
+
+                    let first = tokio::time::timeout(Duration::from_secs(10), events.recv())
+                        .await
+                        .expect("expected an unsolicited event within 10s")
+                        .expect("event channel stayed open");
+                    eprintln!("OK driver: first event emsg={}", first.emsg);
+
+                    // Survive a couple heartbeat intervals.
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    assert!(!join.is_finished(), "driver should still be running");
+
+                    // Drop every handle → driver stops cleanly.
+                    drop(events);
+                    drop(handle);
+                    tokio::time::timeout(Duration::from_secs(5), join)
+                        .await
+                        .expect("driver task ends after handles drop")
+                        .expect("driver task did not panic")
+                        .expect("clean driver shutdown");
+                    eprintln!("OK driver: clean shutdown after handles dropped");
                     return;
                 }
                 Err(e) => panic!("CM logon rejected: {e}"),

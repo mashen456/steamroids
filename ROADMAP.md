@@ -109,8 +109,11 @@ roadmap folded this into 0.1.x; it's really its own milestone.
       `run(interval, on_message)`, which heartbeats on a deadline and dispatches
       incoming messages (cancel-safe recv). Verified live (session alive across
       several intervals). ✅
-- [ ] **Multiplexed request/response** — match responses to in-flight requests
-      by job ID; concurrent message handling.
+- [x] **Multiplexed request/response** — background session driver
+      ([`crate::session::spawn_session`]) owns the socket on its own task:
+      heartbeats, routes replies to in-flight requests by job id, broadcasts the
+      rest. Cloneable `SessionHandle` with `request`/`notify`/`subscribe`.
+      Verified live (events, heartbeat survival, clean shutdown). ✅
 - [ ] **Reconnect & backoff** — survive CM eviction / network blips.
 - [ ] **Typestate `Session<Disconnected | LoggingOn | LoggedOn | LoggedOff>`** —
       compile-time prevention of "request before logged on"; the observability

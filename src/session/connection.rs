@@ -14,9 +14,10 @@ use std::io::Read;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use prost::Message as _;
 use tokio::time::{timeout, Instant};
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::codec::{self, SteamMessage};
@@ -30,10 +31,10 @@ use crate::{Error, Result};
 
 // EMsg values, from protos/steam/enums_clientserver.proto.
 const EMSG_MULTI: u32 = 1;
-const EMSG_CLIENT_HEARTBEAT: u32 = 703;
+pub(crate) const EMSG_CLIENT_HEARTBEAT: u32 = 703;
 const EMSG_CLIENT_LOGON: u32 = 5514;
 const EMSG_CLIENT_LOGON_RESPONSE: u32 = 751;
-const EMSG_CLIENT_LOGGED_OFF: u32 = 757;
+pub(crate) const EMSG_CLIENT_LOGGED_OFF: u32 = 757;
 
 // Logon parameters mirroring an official client closely enough to be accepted.
 const PROTOCOL_VERSION: u32 = 65580;
@@ -100,26 +101,24 @@ impl CmConnection {
             ..Default::default()
         };
         let frame = codec::encode(emsg, &header, body);
-        self.ws.send(WsMessage::Binary(frame)).await?;
-        Ok(())
+        write_frame(&mut self.ws, frame).await
     }
 
     /// Receive the next Steam message, transparently unpacking `Multi` batches.
     pub async fn recv(&mut self) -> Result<SteamMessage> {
-        loop {
-            if let Some(msg) = self.inbox.pop_front() {
-                return Ok(msg);
-            }
-            let frame = self.next_binary().await?;
-            match codec::try_decode(&frame)? {
-                Some(msg) if msg.emsg == EMSG_MULTI => {
-                    self.inbox.extend(decode_multi(&msg.body)?);
-                }
-                Some(msg) => return Ok(msg),
-                // Legacy non-protobuf message (e.g. guest-pass list); skip it.
-                None => {}
-            }
-        }
+        read_message(&mut self.ws, &mut self.inbox).await
+    }
+
+    /// The session id Steam assigned at logon (0 before logon).
+    pub fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
+    /// Consume the connection into the pieces a background driver needs: the
+    /// WebSocket stream, the logged-on `SteamID` / session id, and any messages
+    /// already buffered from a `Multi`.
+    pub(crate) fn into_parts(self) -> (SteamWebSocket, u64, i32, VecDeque<SteamMessage>) {
+        (self.ws, self.steam_id, self.session_id, self.inbox)
     }
 
     /// Log in over the CM using `refresh_token` (the token from the
@@ -219,28 +218,63 @@ impl CmConnection {
             }
         }
     }
+}
 
-    /// Read the next binary WebSocket frame, skipping control frames.
-    async fn next_binary(&mut self) -> Result<Vec<u8>> {
-        loop {
-            let ws_msg = self
-                .ws
-                .next()
-                .await
-                .ok_or_else(|| Error::WebSocket("connection closed".into()))??;
-            match ws_msg {
-                WsMessage::Binary(data) => return Ok(data),
-                WsMessage::Close(_) => {
-                    return Err(Error::WebSocket("server closed the connection".into()))
-                }
-                // tungstenite answers pings itself; ignore control/empty frames.
-                WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
-                WsMessage::Text(_) => {
-                    return Err(Error::WebSocket("unexpected text frame from CM".into()))
-                }
+/// Read the next binary WebSocket frame from `read`, skipping control frames.
+/// Generic over the stream so both [`CmConnection`] (full socket) and the
+/// background driver (a split read half) can use it.
+pub(crate) async fn read_frame<S>(read: &mut S) -> Result<Vec<u8>>
+where
+    S: Stream<Item = std::result::Result<WsMessage, WsError>> + Unpin,
+{
+    loop {
+        let ws_msg = read
+            .next()
+            .await
+            .ok_or_else(|| Error::WebSocket("connection closed".into()))??;
+        match ws_msg {
+            WsMessage::Binary(data) => return Ok(data),
+            WsMessage::Close(_) => {
+                return Err(Error::WebSocket("server closed the connection".into()))
+            }
+            // tungstenite answers pings itself; ignore control/empty frames.
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => {}
+            WsMessage::Text(_) => {
+                return Err(Error::WebSocket("unexpected text frame from CM".into()))
             }
         }
     }
+}
+
+/// Read the next decoded Steam message, draining `inbox` first and unpacking
+/// `Multi` batches into it. Skips legacy non-protobuf messages.
+pub(crate) async fn read_message<S>(
+    read: &mut S,
+    inbox: &mut VecDeque<SteamMessage>,
+) -> Result<SteamMessage>
+where
+    S: Stream<Item = std::result::Result<WsMessage, WsError>> + Unpin,
+{
+    loop {
+        if let Some(msg) = inbox.pop_front() {
+            return Ok(msg);
+        }
+        let frame = read_frame(read).await?;
+        match codec::try_decode(&frame)? {
+            Some(msg) if msg.emsg == EMSG_MULTI => inbox.extend(decode_multi(&msg.body)?),
+            Some(msg) => return Ok(msg),
+            None => {}
+        }
+    }
+}
+
+/// Write one already-encoded frame to `write`.
+pub(crate) async fn write_frame<Si>(write: &mut Si, frame: Vec<u8>) -> Result<()>
+where
+    Si: Sink<WsMessage, Error = WsError> + Unpin,
+{
+    write.send(WsMessage::Binary(frame)).await?;
+    Ok(())
 }
 
 /// Split a `CMsgMulti` body into its embedded messages. Each is a u32-LE

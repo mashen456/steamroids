@@ -7,8 +7,10 @@
 
 pub mod connection;
 pub mod discovery;
+pub mod driver;
 pub mod state;
 
 pub use connection::{CmConnection, LoggedOn};
 pub use discovery::{discover_cm_servers, CmServer};
+pub use driver::{spawn_session, SessionHandle};
 pub use state::SessionState;
