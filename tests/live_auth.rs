@@ -18,8 +18,9 @@
 //! - **Refresh token** (`STEAM_TEST_REFRESH_TOKEN`, optional) — exercises the
 //!   token-reuse path.
 //!
-//! The two password logins are `#[ignore]`d so a stray `cargo test` never fires
-//! real logins; CI opts in with `-- --include-ignored`.
+//! The real-login tests are `#[ignore]`d so a stray `cargo test` never fires
+//! live logins; CI opts in with `-- --include-ignored`. Each account is logged
+//! in at most once per run (the 2FA login happens only inside `cm_logon_over_wss`).
 //!
 //! # Running locally
 //!
@@ -154,22 +155,10 @@ async fn run_password_login(label: &str, acc: Account) {
     }
 }
 
-/// Password + mobile 2FA. `#[ignore]`d so it only runs on explicit opt-in.
-#[tokio::test]
-#[ignore = "full password+2FA login; CI runs it via --include-ignored"]
-async fn login_account_with_2fa() {
-    let Some(acc) = load_account("2FA") else {
-        eprintln!(
-            "SKIP login_account_with_2fa: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET"
-        );
-        return;
-    };
-    assert!(
-        acc.shared_secret.is_some(),
-        "the 2FA account needs STEAM_TEST_2FA_SHARED_SECRET set"
-    );
-    run_password_login("2fa", acc).await;
-}
+// NB: the 2FA account's password login is exercised as step 1 of
+// `cm_logon_over_wss`; there is no separate `login_account_with_2fa` test, so
+// that account is never logged in twice in one run (concurrent logins reuse the
+// same TOTP code within a 30s window and Steam rejects the duplicate).
 
 /// Password only, no 2FA. `#[ignore]`d so it only runs on explicit opt-in.
 #[tokio::test]
