@@ -266,6 +266,18 @@ async fn cm_logon_over_wss() {
                         logged.session_id,
                         logged.heartbeat_interval
                     );
+
+                    // 4. Heartbeat: keep the session alive past several
+                    //    intervals. Surviving the timeout = success.
+                    let mut msgs = 0u32;
+                    let run = conn.run(logged.heartbeat_interval, |_m| msgs += 1);
+                    match tokio::time::timeout(Duration::from_secs(25), run).await {
+                        Err(_elapsed) => {
+                            eprintln!("OK heartbeat: session alive 25s, {msgs} msgs received");
+                        }
+                        Ok(Ok(())) => panic!("session logged off during heartbeat window"),
+                        Ok(Err(e)) => panic!("heartbeat loop failed (session dropped): {e}"),
+                    }
                     return;
                 }
                 Err(e) => panic!("CM logon rejected: {e}"),

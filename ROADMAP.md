@@ -105,7 +105,10 @@ roadmap folded this into 0.1.x; it's really its own milestone.
       the refresh token, handles `Multi` (incl. gzip) + legacy non-proto
       messages, and returns `LoggedOn` (SteamID, session, heartbeat). Required
       switching the auth flow to `SteamClient` platform tokens. Verified live. ✅
-- [ ] **`CMsgClientHeartBeat` loop** — keep the session alive.
+- [x] **`CMsgClientHeartBeat` loop** — `CmConnection::send_heartbeat` +
+      `run(interval, on_message)`, which heartbeats on a deadline and dispatches
+      incoming messages (cancel-safe recv). Verified live (session alive across
+      several intervals). ✅
 - [ ] **Multiplexed request/response** — match responses to in-flight requests
       by job ID; concurrent message handling.
 - [ ] **Reconnect & backoff** — survive CM eviction / network blips.

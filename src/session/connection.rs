@@ -16,10 +16,13 @@ use std::time::Duration;
 use flate2::read::GzDecoder;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
+use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::codec::{self, SteamMessage};
-use crate::proto::{CMsgClientLogon, CMsgClientLogonResponse, CMsgMulti, CMsgProtoBufHeader};
+use crate::proto::{
+    CMsgClientHeartBeat, CMsgClientLogon, CMsgClientLogonResponse, CMsgMulti, CMsgProtoBufHeader,
+};
 use crate::transport::connect_ws;
 use crate::transport::proxy::ProxyConfig;
 use crate::transport::websocket::SteamWebSocket;
@@ -27,6 +30,7 @@ use crate::{Error, Result};
 
 // EMsg values, from protos/steam/enums_clientserver.proto.
 const EMSG_MULTI: u32 = 1;
+const EMSG_CLIENT_HEARTBEAT: u32 = 703;
 const EMSG_CLIENT_LOGON: u32 = 5514;
 const EMSG_CLIENT_LOGON_RESPONSE: u32 = 751;
 const EMSG_CLIENT_LOGGED_OFF: u32 = 757;
@@ -173,6 +177,45 @@ impl CmConnection {
                 }
                 // Ignore anything else (server lists, etc.) until the response.
                 _ => {}
+            }
+        }
+    }
+
+    /// Send a single `CMsgClientHeartBeat`. Steam drops the session if these
+    /// stop arriving (interval from [`LoggedOn::heartbeat_interval`]).
+    pub async fn send_heartbeat(&mut self) -> Result<()> {
+        self.send(EMSG_CLIENT_HEARTBEAT, &CMsgClientHeartBeat::default())
+            .await
+    }
+
+    /// Keep the session alive: send a heartbeat every `interval` and hand every
+    /// received message to `on_message`. Runs until Steam logs us off (returns
+    /// `Ok(())`) or the connection / transport fails (returns `Err`).
+    ///
+    /// `recv` is cancel-safe, so the heartbeat deadline interrupts a pending
+    /// read without losing data. Spawn this on its own task if the caller needs
+    /// to do other work concurrently.
+    pub async fn run<F>(&mut self, interval: Duration, mut on_message: F) -> Result<()>
+    where
+        F: FnMut(&SteamMessage),
+    {
+        let mut next_heartbeat = Instant::now() + interval;
+        loop {
+            if Instant::now() >= next_heartbeat {
+                self.send_heartbeat().await?;
+                next_heartbeat = Instant::now() + interval;
+            }
+            let wait = next_heartbeat.saturating_duration_since(Instant::now());
+            match timeout(wait, self.recv()).await {
+                Ok(result) => {
+                    let msg = result?;
+                    if msg.emsg == EMSG_CLIENT_LOGGED_OFF {
+                        return Ok(());
+                    }
+                    on_message(&msg);
+                }
+                // Deadline hit with no message — loop and send the heartbeat.
+                Err(_elapsed) => {}
             }
         }
     }
