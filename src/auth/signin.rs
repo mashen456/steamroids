@@ -70,8 +70,12 @@ const GUARD_TYPE_NONE: i32 = 1;
 const GUARD_TYPE_EMAIL_CODE: i32 = 2;
 const GUARD_TYPE_DEVICE_CODE: i32 = 3;
 
-// EAuthTokenPlatformType_WebBrowser
-const PLATFORM_WEB_BROWSER: i32 = 2;
+// EAuthTokenPlatformType_SteamClient. The refresh token must be issued for the
+// Steam *client* platform, otherwise the CM `ClientLogon` rejects it with
+// eresult 5 (a WebBrowser token only works for website / WebAPI use).
+const PLATFORM_STEAM_CLIENT: i32 = 1;
+// EOSType for Windows 10 — sent in the device details for the client session.
+const OS_TYPE_WINDOWS_10: i32 = 16;
 // ESessionPersistence_Persistent
 const SESSION_PERSISTENT: i32 = 1;
 // ETokenRenewalType_None
@@ -453,12 +457,13 @@ async fn begin_session(
         encrypted_password: Some(encrypted_password_b64),
         encryption_timestamp: Some(encryption_timestamp),
         remember_login: Some(true),
-        platform_type: Some(PLATFORM_WEB_BROWSER),
+        platform_type: Some(PLATFORM_STEAM_CLIENT),
         persistence: Some(SESSION_PERSISTENT),
-        website_id: Some("Community".into()),
+        // No `website_id` — that's a WebBrowser-platform concept.
         device_details: Some(CAuthenticationDeviceDetails {
             device_friendly_name: Some("steamroids".into()),
-            platform_type: Some(PLATFORM_WEB_BROWSER),
+            platform_type: Some(PLATFORM_STEAM_CLIENT),
+            os_type: Some(OS_TYPE_WINDOWS_10),
             ..Default::default()
         }),
         ..Default::default()

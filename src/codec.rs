@@ -62,6 +62,26 @@ pub fn encode<M: Message>(emsg: u32, header: &CMsgProtoBufHeader, body: &M) -> V
     out
 }
 
+/// Like [`decode`], but returns `Ok(None)` for a legacy non-protobuf (packed
+/// struct) message instead of an error. Steam still sends a few of these
+/// (e.g. `ClientUpdateGuestPassesList`); callers that only speak protobuf can
+/// skip them.
+///
+/// # Errors
+///
+/// As [`decode`], except a non-protobuf message is `Ok(None)` rather than an
+/// error.
+pub fn try_decode(frame: &[u8]) -> Result<Option<SteamMessage>> {
+    if frame.len() < PREFIX_LEN {
+        return Err(Error::Codec("frame shorter than 8-byte prefix".into()));
+    }
+    let raw_msg = u32::from_le_bytes(frame[..4].try_into().unwrap());
+    if raw_msg & PROTO_MASK == 0 {
+        return Ok(None);
+    }
+    decode(frame).map(Some)
+}
+
 /// Decode one CM frame into its `EMsg`, header, and raw body.
 ///
 /// # Errors
@@ -152,6 +172,26 @@ mod tests {
         );
         let raw = u32::from_le_bytes(frame[..4].try_into().unwrap());
         assert_eq!(raw & EMSG_MASK, EMSG_CLIENT_LOGON);
+    }
+
+    #[test]
+    fn try_decode_skips_non_protobuf() {
+        // Proto bit clear → a legacy message; try_decode returns None.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&798u32.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        assert!(try_decode(&frame).unwrap().is_none());
+    }
+
+    #[test]
+    fn try_decode_returns_protobuf_message() {
+        let frame = encode(
+            EMSG_CLIENT_LOGON,
+            &CMsgProtoBufHeader::default(),
+            &CMsgProtoBufHeader::default(),
+        );
+        let msg = try_decode(&frame).unwrap().expect("protobuf message");
+        assert_eq!(msg.emsg, EMSG_CLIENT_LOGON);
     }
 
     #[test]

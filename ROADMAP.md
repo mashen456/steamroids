@@ -59,21 +59,19 @@ and `Cargo.toml` version all agree; no doc claims a feature the code lacks.
 Make the existing WebAPI auth production-grade before building the CM layer on
 top of it. This is where fleet operators actually get burned.
 
-- [ ] **Refresh-token persistence hook** — caller-supplied trait
-      (`TokenStore`: load/save by account) so `SignIn` can transparently reuse
-      and refresh tokens. The roadmap's original 0.1.x promise, still open.
-- [ ] **https:// proxy support** (TLS-to-proxy) — currently rejected in both
-      `transport::proxy` and `auth::webapi`. Many commercial proxy providers
-      only expose an `https://` frontend; blocking it blocks real fleets.
-- [ ] **Real integration tests** — opt-in (env-gated) tests that hit Steam with
-      a throwaway account through a proxy. Today every auth test is offline.
-- [ ] **Email-Guard completion** — `NeedsEmailGuardCode` is surfaced but there's
-      no `UpdateAuthSessionWithSteamGuardCode` path for an email code; add a way
-      to feed the code back in (resume a pending session).
+- [x] **Refresh-token persistence hook** — `auth::TokenStore` +
+      `SignIn::execute_with_store`. ✅
+- [x] **https:// proxy support** (TLS-to-proxy) — both the WebAPI flow (reqwest)
+      and the WebSocket transport. ✅
+- [x] **Real integration tests** — opt-in, env-gated `tests/live_auth.rs`
+      against real Steam through a proxy; runs in CI's `live` job. ✅
+- [x] **Secret hygiene** — `Debug` redaction for credentials, tokens, and proxy
+      password. ✅
+- [~] **Email-Guard** — intentionally **unsupported**: `NeedsEmailGuardCode` is
+      surfaced but can't complete; use mobile 2FA or a Guard-disabled account.
+      Documented in the README.
 - [ ] **Poll-loop review** — `POLL_MAX_ATTEMPTS`/interval interplay; confirm the
       120s budget message matches actual worst-case timing.
-- [ ] **Secret hygiene** — `Debug` redaction for `PasswordCredentials` /
-      `RefreshToken` (they currently derive `Debug` and print secrets).
 - [ ] **Replace hand-rolled `percent_decode`** in `proxy.rs` with a vetted path,
       or document why the minimal version is sufficient.
 - [ ] `tracing` spans on every WebAPI call boundary with structured fields.
@@ -102,8 +100,11 @@ roadmap folded this into 0.1.x; it's really its own milestone.
 - [x] **CM server discovery** — `ISteamDirectory/GetCMListForConnect` over the
       shared HTTP client (proxy-aware), parsed into `CmServer`s that yield
       `wss://…/cmsocket/` URLs. In [`crate::session::discover_cm_servers`]. ✅ landed
-- [ ] **`CMsgClientLogon` / `CMsgClientLogonResponse`** — log in over the CM WSS
-      connection using the access token from the auth layer.
+- [x] **`CMsgClientLogon` / `CMsgClientLogonResponse`** — `CmConnection` in
+      [`crate::session::connection`] connects over WSS, sends `ClientLogon` with
+      the refresh token, handles `Multi` (incl. gzip) + legacy non-proto
+      messages, and returns `LoggedOn` (SteamID, session, heartbeat). Required
+      switching the auth flow to `SteamClient` platform tokens. Verified live. ✅
 - [ ] **`CMsgClientHeartBeat` loop** — keep the session alive.
 - [ ] **Multiplexed request/response** — match responses to in-flight requests
       by job ID; concurrent message handling.

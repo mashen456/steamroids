@@ -219,6 +219,77 @@ async fn discover_cm_servers_lists_endpoints() {
     panic!("CM discovery still failing: {last_err:?}");
 }
 
+/// Full CM logon: WebAPI sign-in (2FA account) -> refresh token -> CM
+/// discovery -> connect over WSS -> `CMsgClientLogon`. The first end-to-end
+/// "logged into Steam at the CM level" path. `#[ignore]`d (heavy, real login).
+#[tokio::test]
+#[ignore = "full CM logon against real Steam; CI runs it via --include-ignored"]
+async fn cm_logon_over_wss() {
+    use steamroids::session::{discover_cm_servers, CmConnection};
+
+    let Some(acc) = load_account("2FA") else {
+        eprintln!(
+            "SKIP cm_logon_over_wss: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET"
+        );
+        return;
+    };
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    // 1. WebAPI sign-in for a fresh refresh token (with retry on proxy blips).
+    let refresh = {
+        let acc = &acc;
+        let proxy = &proxy;
+        let outcome = execute_with_retry("cm-signin", || {
+            let mut s = SignIn::with_password(acc.username.clone(), acc.password.clone());
+            if let Some(secret) = &acc.shared_secret {
+                s = s.shared_secret(secret.clone());
+            }
+            if let Some(p) = proxy {
+                s = s.proxy(p.clone());
+            }
+            s
+        })
+        .await;
+        match outcome {
+            SignInOutcome::Success { refresh_token, .. } => refresh_token,
+            other => panic!("expected sign-in success, got {other:?}"),
+        }
+    };
+
+    // 2. Discover CM servers.
+    let servers = discover_cm_servers(proxy.as_ref())
+        .await
+        .expect("CM discovery failed");
+
+    // 3. Connect + logon, trying a few servers in case one is unreachable.
+    let mut last_err = None;
+    for server in servers.iter().take(5) {
+        match CmConnection::connect(&server.ws_url(), proxy.as_ref()).await {
+            Ok(mut conn) => match conn.logon(&acc.username, refresh.expose()).await {
+                Ok(logged) => {
+                    assert!(logged.steam_id > 0, "expected a real SteamID");
+                    assert!(logged.session_id != 0, "expected a session id");
+                    eprintln!(
+                        "OK CM logon via {}: steamid={} session={} heartbeat={:?}",
+                        server.ws_url(),
+                        logged.steam_id,
+                        logged.session_id,
+                        logged.heartbeat_interval
+                    );
+                    return;
+                }
+                Err(e) => panic!("CM logon rejected: {e}"),
+            },
+            Err(e) => {
+                eprintln!("connect to {} failed, trying next: {e}", server.ws_url());
+                last_err = Some(e);
+            }
+        }
+    }
+    panic!("could not connect to any CM server: {last_err:?}");
+}
+
 /// The refresh-token round-trip: a single `GenerateAccessTokenForApp` call.
 /// Cheap and low-risk, so this one is *not* ignored.
 #[tokio::test]

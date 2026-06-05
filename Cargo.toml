@@ -45,6 +45,10 @@ bytes = "1.7"
 url = "2.5"
 base64 = "0.22"
 
+# Steam gzip-compresses coalesced CM message batches (`Multi`). Pure-Rust
+# backend (miniz_oxide) to avoid a C/zlib dependency.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # Crypto (Steam TOTP = HMAC-SHA1)
 hmac = "0.12"
 sha1 = "0.10"
