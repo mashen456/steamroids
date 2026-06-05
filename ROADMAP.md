@@ -88,12 +88,20 @@ The first version that holds a live Steam connection. This is the **largest
 remaining block** and the prerequisite for any Game Coordinator work. The old
 roadmap folded this into 0.1.x; it's really its own milestone.
 
+> **Note (from surveying [SteamHelper-rs](https://github.com/saskenuba/SteamHelper-rs)):**
+> because we connect over **WSS**, TLS already encrypts the link, so we **skip**
+> the classic `ChannelEncryptRequest/Response/Result` + AES session-key
+> handshake and the `VT01` packet magic entirely — those only apply to the raw
+> TCP CM path. Each WS binary frame is exactly one message. That removes the
+> hardest crypto chunk of this milestone. We also already vendor the `EMsg`
+> enum (`enums_clientserver.proto`), so no SteamLanguage codegen is needed.
+
+- [x] **EMsg-tagged frame codec** — envelope (`EMsg` | proto-bit + `hdr_len` +
+      `CMsgProtoBufHeader` + body), encode/decode, in [`crate::codec`]. This is
+      the piece that wires `transport` to `proto`. ✅ landed
 - [ ] **CM server discovery** — fetch the Connection Manager WSS endpoint list
       (`ISteamDirectory/GetCMListForConnect` or equivalent) with proxy support
       and a fallback. Nothing today knows where to connect.
-- [ ] **EMsg-tagged frame codec** — envelope (`EMsg` + `CMsgProtoBufHeader`) +
-      protobuf payload, encode/decode, over the existing `connect_ws` stream.
-      This is the piece that finally wires `transport` to `proto`.
 - [ ] **`CMsgClientLogon` / `CMsgClientLogonResponse`** — log in over the CM WSS
       connection using the access token from the auth layer.
 - [ ] **`CMsgClientHeartBeat` loop** — keep the session alive.

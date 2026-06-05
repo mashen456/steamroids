@@ -26,11 +26,13 @@
 //!
 //! - [`transport`] — WebSocket + TLS + proxy plumbing
 //! - [`auth`] — credentials, TOTP, and the `WebAPI` sign-in flow ([`auth::SignIn`])
+//! - [`codec`] — Steam `EMsg` + protobuf message framing for the CM transport
 //! - [`session`] — session state types and (later) the typestate FSM
 
 #![doc(html_root_url = "https://docs.rs/steamroids/0.1.0")]
 
 pub mod auth;
+pub mod codec;
 pub mod error;
 pub mod proto;
 pub mod session;

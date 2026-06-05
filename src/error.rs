@@ -38,6 +38,11 @@ pub enum Error {
     #[error("websocket: {0}")]
     WebSocket(String),
 
+    /// A Steam message frame was malformed (bad length prefix, non-protobuf
+    /// payload, or an undecodable header). See [`crate::codec`].
+    #[error("codec: {0}")]
+    Codec(String),
+
     /// Base64 decoding failed for a secret or token.
     #[error("base64: {0}")]
     Base64(#[from] base64::DecodeError),

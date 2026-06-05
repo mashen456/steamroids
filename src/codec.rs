@@ -1,0 +1,182 @@
+//! Steam message framing for the Connection Manager WebSocket transport.
+//!
+//! Each binary WebSocket frame carries exactly one Steam message. Modern Steam
+//! messages are protobuf-encoded and laid out little-endian as:
+//!
+//! ```text
+//! ┌─────────────────┬───────────────┬────────────────────┬───────────┐
+//! │ msg:  u32 LE    │ hdr_len: u32  │ CMsgProtoBufHeader  │ body      │
+//! │ (EMsg | proto)  │ LE            │ (protobuf)          │ (protobuf)│
+//! └─────────────────┴───────────────┴────────────────────┴───────────┘
+//! ```
+//!
+//! The top bit of `msg` ([`PROTO_MASK`]) flags protobuf encoding; the remaining
+//! bits are the [`EMsg`](crate::proto::EMsg) value. Over WSS there is **no**
+//! `VT01` packet magic and **no** channel-encryption handshake — TLS already
+//! secures the link, so the framing reduces to this envelope.
+
+use bytes::Buf;
+use prost::Message;
+
+use crate::proto::CMsgProtoBufHeader;
+use crate::{Error, Result};
+
+/// Top bit of the message-type word: set when the payload is protobuf-encoded.
+/// Every modern Steam message sets it.
+pub const PROTO_MASK: u32 = 0x8000_0000;
+
+/// Mask for the [`EMsg`](crate::proto::EMsg) value — every bit except the
+/// protobuf flag.
+pub const EMSG_MASK: u32 = !PROTO_MASK;
+
+/// Minimum frame size: the two u32 length/type words.
+const PREFIX_LEN: usize = 8;
+
+/// A decoded Steam protobuf message: its `EMsg` type, routing header, and the
+/// still-encoded body. Decode [`Self::body`] to the concrete `proto` type that
+/// corresponds to [`Self::emsg`].
+#[derive(Debug, Clone)]
+pub struct SteamMessage {
+    /// The `EMsg` type, with the protobuf flag stripped.
+    pub emsg: u32,
+    /// Routing / session header (`steamid`, `client_sessionid`, job ids, …).
+    pub header: CMsgProtoBufHeader,
+    /// Raw protobuf body for this `EMsg`.
+    pub body: Vec<u8>,
+}
+
+/// Encode a protobuf Steam message into a single CM frame.
+///
+/// `emsg` is the bare [`EMsg`](crate::proto::EMsg) value; the protobuf flag is
+/// applied here. Any extra high bits in `emsg` are masked off.
+pub fn encode<M: Message>(emsg: u32, header: &CMsgProtoBufHeader, body: &M) -> Vec<u8> {
+    let header_bytes = header.encode_to_vec();
+    let body_bytes = body.encode_to_vec();
+    let mut out = Vec::with_capacity(PREFIX_LEN + header_bytes.len() + body_bytes.len());
+    out.extend_from_slice(&((emsg & EMSG_MASK) | PROTO_MASK).to_le_bytes());
+    // A real Steam header is far smaller than u32::MAX; the cast cannot wrap.
+    #[allow(clippy::cast_possible_truncation)]
+    out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(&body_bytes);
+    out
+}
+
+/// Decode one CM frame into its `EMsg`, header, and raw body.
+///
+/// # Errors
+///
+/// Returns [`Error::Codec`] if the frame is shorter than the prefix, declares a
+/// header longer than the frame, is not protobuf-encoded, or the header fails
+/// to decode.
+pub fn decode(frame: &[u8]) -> Result<SteamMessage> {
+    if frame.len() < PREFIX_LEN {
+        return Err(Error::Codec("frame shorter than 8-byte prefix".into()));
+    }
+
+    let mut cur = frame;
+    let raw_msg = cur.get_u32_le();
+    if raw_msg & PROTO_MASK == 0 {
+        return Err(Error::Codec(format!(
+            "non-protobuf message (raw type {raw_msg:#010x}) not supported"
+        )));
+    }
+    let emsg = raw_msg & EMSG_MASK;
+
+    let header_len = cur.get_u32_le() as usize;
+    if cur.remaining() < header_len {
+        return Err(Error::Codec(format!(
+            "header length {header_len} exceeds {} remaining bytes",
+            cur.remaining()
+        )));
+    }
+
+    let header = CMsgProtoBufHeader::decode(&cur[..header_len])
+        .map_err(|e| Error::Codec(format!("decode header: {e}")))?;
+    let body = cur[header_len..].to_vec();
+
+    Ok(SteamMessage { emsg, header, body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // k_EMsgClientLogon, from protos/steam/enums_clientserver.proto.
+    const EMSG_CLIENT_LOGON: u32 = 5514;
+
+    #[test]
+    fn round_trips_emsg_header_and_body() {
+        let header = CMsgProtoBufHeader {
+            steamid: Some(76_561_198_000_000_000),
+            client_sessionid: Some(42),
+            ..Default::default()
+        };
+        // Any protobuf Message is a valid body; reuse the header type so the
+        // test is self-contained and proves a non-empty body survives.
+        let body = CMsgProtoBufHeader {
+            jobid_source: Some(7),
+            ..Default::default()
+        };
+
+        let frame = encode(EMSG_CLIENT_LOGON, &header, &body);
+        let msg = decode(&frame).unwrap();
+
+        assert_eq!(msg.emsg, EMSG_CLIENT_LOGON);
+        assert_eq!(msg.header.steamid, Some(76_561_198_000_000_000));
+        assert_eq!(msg.header.client_sessionid, Some(42));
+
+        let body_back = CMsgProtoBufHeader::decode(msg.body.as_slice()).unwrap();
+        assert_eq!(body_back.jobid_source, Some(7));
+    }
+
+    #[test]
+    fn encode_sets_proto_bit_and_masks_emsg() {
+        let frame = encode(
+            EMSG_CLIENT_LOGON,
+            &CMsgProtoBufHeader::default(),
+            &CMsgProtoBufHeader::default(),
+        );
+        let raw = u32::from_le_bytes(frame[..4].try_into().unwrap());
+        assert_ne!(raw & PROTO_MASK, 0, "proto flag must be set");
+        assert_eq!(raw & EMSG_MASK, EMSG_CLIENT_LOGON);
+    }
+
+    #[test]
+    fn encode_strips_stray_high_bits_from_emsg() {
+        // Passing an EMsg that already has the proto bit set must not corrupt it.
+        let frame = encode(
+            EMSG_CLIENT_LOGON | PROTO_MASK,
+            &CMsgProtoBufHeader::default(),
+            &CMsgProtoBufHeader::default(),
+        );
+        let raw = u32::from_le_bytes(frame[..4].try_into().unwrap());
+        assert_eq!(raw & EMSG_MASK, EMSG_CLIENT_LOGON);
+    }
+
+    #[test]
+    fn decode_rejects_short_frame() {
+        let err = decode(&[0u8; 4]).unwrap_err();
+        assert!(matches!(err, Error::Codec(_)));
+    }
+
+    #[test]
+    fn decode_rejects_non_protobuf_frame() {
+        // Proto bit clear → unsupported.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&EMSG_CLIENT_LOGON.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        let err = decode(&frame).unwrap_err();
+        assert!(matches!(err, Error::Codec(_)));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_header_length() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(EMSG_CLIENT_LOGON | PROTO_MASK).to_le_bytes());
+        frame.extend_from_slice(&9999u32.to_le_bytes()); // claims a huge header
+        frame.extend_from_slice(&[0u8; 4]);
+        let err = decode(&frame).unwrap_err();
+        assert!(matches!(err, Error::Codec(_)));
+    }
+}
