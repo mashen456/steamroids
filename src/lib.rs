@@ -38,6 +38,10 @@ pub mod proto;
 pub mod session;
 pub mod transport;
 
+// Crate-private: shared reqwest client setup for the WebAPI auth flow and CM
+// server discovery.
+mod http;
+
 pub use error::Error;
 
 /// Convenience `Result` alias.

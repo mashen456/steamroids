@@ -99,9 +99,9 @@ roadmap folded this into 0.1.x; it's really its own milestone.
 - [x] **EMsg-tagged frame codec** — envelope (`EMsg` | proto-bit + `hdr_len` +
       `CMsgProtoBufHeader` + body), encode/decode, in [`crate::codec`]. This is
       the piece that wires `transport` to `proto`. ✅ landed
-- [ ] **CM server discovery** — fetch the Connection Manager WSS endpoint list
-      (`ISteamDirectory/GetCMListForConnect` or equivalent) with proxy support
-      and a fallback. Nothing today knows where to connect.
+- [x] **CM server discovery** — `ISteamDirectory/GetCMListForConnect` over the
+      shared HTTP client (proxy-aware), parsed into `CmServer`s that yield
+      `wss://…/cmsocket/` URLs. In [`crate::session::discover_cm_servers`]. ✅ landed
 - [ ] **`CMsgClientLogon` / `CMsgClientLogonResponse`** — log in over the CM WSS
       connection using the access token from the auth layer.
 - [ ] **`CMsgClientHeartBeat` loop** — keep the session alive.

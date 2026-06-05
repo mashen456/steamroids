@@ -5,6 +5,8 @@
 //! `Disconnected | LoggingOn | LoggedOn | LoggedOff` — lands with the actual
 //! login flow in `0.1.x`.
 
+pub mod discovery;
 pub mod state;
 
+pub use discovery::{discover_cm_servers, CmServer};
 pub use state::SessionState;

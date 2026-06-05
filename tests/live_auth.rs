@@ -182,6 +182,43 @@ async fn login_account_without_2fa() {
     run_password_login("plain", acc).await;
 }
 
+/// CM server discovery against the public Steam directory (no credentials).
+/// `#[ignore]`d so it stays out of the offline `test` job and only runs in the
+/// live CI job; routed through the proxy for parity with the rest of the suite.
+#[tokio::test]
+#[ignore = "hits the public Steam directory; CI runs it via --include-ignored"]
+async fn discover_cm_servers_lists_endpoints() {
+    use steamroids::session::discover_cm_servers;
+
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    let mut last_err = None;
+    for attempt in 1..=4u32 {
+        match discover_cm_servers(proxy.as_ref()).await {
+            Ok(servers) => {
+                assert!(!servers.is_empty(), "expected at least one CM server");
+                let first = &servers[0];
+                assert!(first.endpoint.contains(':'), "endpoint should be host:port");
+                assert!(first.ws_url().starts_with("wss://"));
+                eprintln!(
+                    "OK discovery: {} CM servers, first = {}",
+                    servers.len(),
+                    first.ws_url()
+                );
+                return;
+            }
+            Err(Error::Network(msg)) if attempt < 4 => {
+                eprintln!("discovery transient error (attempt {attempt}/4): {msg}");
+                last_err = Some(msg);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Err(e) => panic!("CM discovery failed: {e}"),
+        }
+    }
+    panic!("CM discovery still failing: {last_err:?}");
+}
+
 /// The refresh-token round-trip: a single `GenerateAccessTokenForApp` call.
 /// Cheap and low-risk, so this one is *not* ignored.
 #[tokio::test]

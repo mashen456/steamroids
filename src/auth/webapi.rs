@@ -11,21 +11,15 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use prost::Message;
-use reqwest::{Client, Proxy};
+use reqwest::Client;
 use tracing::debug;
 use url::Url;
 
 use crate::auth::signin::SignInOutcome;
-use crate::transport::proxy::{ProxyConfig, ProxyCredentials, ProxyKind};
+use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
 const BASE_URL: &str = "https://api.steampowered.com/IAuthenticationService/";
-
-/// Network operation budget (connect + transfer) for any one Steam `WebAPI` call.
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// TCP-level connect budget. Steam's edge is usually <1s — keep it tight so
-/// a dead proxy fails fast instead of stalling the whole auth flow.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Steam's `EResult` enum value, lifted from the `x-eresult` header.
 ///
@@ -111,19 +105,9 @@ pub(crate) struct WebApiClient {
 impl WebApiClient {
     /// Construct a fresh client, optionally routed through `proxy`.
     pub(crate) fn new(proxy: Option<&ProxyConfig>) -> Result<Self> {
-        let mut builder = Client::builder()
-            .timeout(TOTAL_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent("steamroids/0.1.0");
-
-        if let Some(p) = proxy {
-            builder = builder.proxy(build_proxy(p)?);
-        }
-
-        let http = builder
-            .build()
-            .map_err(|e| Error::InvalidConfig(format!("reqwest client: {e}")))?;
-        Ok(Self { http })
+        Ok(Self {
+            http: crate::http::client(proxy)?,
+        })
     }
 
     /// Dispatch one auth call. Encodes `req` to base64, sends it, parses the
@@ -195,23 +179,6 @@ impl WebApiClient {
 
         Ok((er, resp))
     }
-}
-
-fn build_proxy(cfg: &ProxyConfig) -> Result<Proxy> {
-    let scheme = match cfg.kind {
-        ProxyKind::Socks5 => "socks5h",
-        // reqwest TLS-connects to the proxy itself when the scheme is https,
-        // using our rustls backend — no manual handling needed here.
-        ProxyKind::HttpConnect if cfg.tls_to_proxy => "https",
-        ProxyKind::HttpConnect => "http",
-    };
-    let url = format!("{scheme}://{}:{}", cfg.host, cfg.port);
-
-    let mut proxy = Proxy::all(&url).map_err(|e| Error::InvalidConfig(format!("proxy: {e}")))?;
-    if let Some(ProxyCredentials { username, password }) = cfg.credentials.as_ref() {
-        proxy = proxy.basic_auth(username, password);
-    }
-    Ok(proxy)
 }
 
 #[cfg(test)]
@@ -293,25 +260,5 @@ mod tests {
     fn unknown_eresult_does_not_map() {
         // The caller is expected to convert this into Error::AuthRejected.
         assert!(map_non_ok_eresult(EResult(42), FlowKind::Password).is_none());
-    }
-
-    #[test]
-    fn build_proxy_handles_socks5() {
-        let cfg = ProxyConfig::parse("socks5://u:p@host:1080").unwrap();
-        // Just assert it builds — reqwest::Proxy has no public fields to compare.
-        build_proxy(&cfg).unwrap();
-    }
-
-    #[test]
-    fn build_proxy_handles_http() {
-        let cfg = ProxyConfig::parse("http://u:p@host:8080").unwrap();
-        build_proxy(&cfg).unwrap();
-    }
-
-    #[test]
-    fn build_proxy_accepts_https_to_proxy() {
-        // reqwest handles TLS-to-proxy natively now; this must build.
-        let cfg = ProxyConfig::parse("https://u:p@host:8443").unwrap();
-        build_proxy(&cfg).unwrap();
     }
 }
