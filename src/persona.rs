@@ -1,6 +1,6 @@
 //! Player profile details over a logged-in CM session — no `WebAPI` key needed.
 //!
-//! Two routes, both ridden on a [`SessionHandle`](crate::session::SessionHandle):
+//! Two routes, both ridden on a [`SessionHandle`]:
 //!
 //! - [`request_player_summary`] — persona name, avatar, online state, and the
 //!   game the player is in, via `CMsgClientRequestFriendData` →
