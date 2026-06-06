@@ -18,6 +18,11 @@ use crate::{Error, Result};
 const EMSG_CLIENT_GAMES_PLAYED: u32 = 742;
 /// Buffered GC messages per subscriber before lag.
 const GC_EVENT_CAPACITY: usize = 64;
+/// How often to re-send `ClientHello` until the GC welcomes us.
+const HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Cap on hello retries per (re)launch — ~`MAX × INTERVAL` before giving up, so a
+/// license-less account doesn't poke the GC indefinitely.
+const MAX_HELLO_ATTEMPTS: u32 = 20;
 
 /// A handle to one app's Game Coordinator, riding on a CM session.
 ///
@@ -39,15 +44,21 @@ pub struct GameCoordinator {
 impl GameCoordinator {
     /// Attach to `appid`'s Game Coordinator over `session`.
     ///
-    /// Tells Steam we're playing the app and sends a `ClientHello` to prompt the
-    /// GC welcome, then spawns the pump. Returns immediately — use
+    /// Tells Steam we're playing the app and sends a `ClientHello` (carrying
+    /// `hello_version`, the app's GC protocol version) to prompt the welcome,
+    /// then spawns the pump. Returns immediately — use
     /// [`wait_ready`](Self::wait_ready) to await the welcome before issuing
-    /// requests.
+    /// requests. Most callers want the per-app wrapper (e.g.
+    /// [`cs2::attach`](crate::cs2::attach)) which supplies the right version.
+    ///
+    /// `hello_version` matters: CS2's GC rejects a version-less hello with a
+    /// fatal logon error, so pass the current app GC version (`0` only for GCs
+    /// that don't check it).
     ///
     /// # Errors
     ///
     /// Propagates the initial launch send if the session has already stopped.
-    pub async fn attach(session: SessionHandle, appid: u32) -> Result<Self> {
+    pub async fn attach(session: SessionHandle, appid: u32, hello_version: u32) -> Result<Self> {
         // Subscribe *before* launching so the welcome can't race ahead of us.
         let events_in = session.subscribe();
         let state_in = session.watch_state();
@@ -56,6 +67,7 @@ impl GameCoordinator {
 
         tokio::spawn(pump(
             appid,
+            hello_version,
             session.clone(),
             events_in,
             state_in,
@@ -64,7 +76,7 @@ impl GameCoordinator {
         ));
 
         // Kick the first launch eagerly so callers don't wait a state cycle.
-        launch(&session, appid).await?;
+        launch(&session, appid, hello_version).await?;
 
         Ok(Self {
             session,
@@ -187,9 +199,9 @@ impl GameCoordinator {
     }
 }
 
-/// Announce the app to Steam and poke the GC for a welcome.
-async fn launch(session: &SessionHandle, appid: u32) -> Result<()> {
-    // "Playing" the app makes Steam route this app's GC traffic to our session.
+/// Announce the app to Steam (so it routes this app's GC traffic to us) and send
+/// the first `ClientHello`.
+async fn launch(session: &SessionHandle, appid: u32, hello_version: u32) -> Result<()> {
     let games_played = CMsgClientGamesPlayed {
         games_played: vec![GamePlayed {
             // For a plain app the CGameID is just the app id in the low 32 bits.
@@ -201,13 +213,28 @@ async fn launch(session: &SessionHandle, appid: u32) -> Result<()> {
     session
         .notify(EMSG_CLIENT_GAMES_PLAYED, &games_played)
         .await?;
+    send_hello(session, appid, hello_version).await
+}
 
-    // A ClientHello prompts the GC to send us a ClientWelcome.
+/// Send a single `ClientHello` to prompt the GC's `ClientWelcome`.
+///
+/// The GC often ignores the first hello (it isn't ready the instant we announce
+/// the game), so the pump re-sends this on a timer until the welcome arrives —
+/// mirroring how the official client behaves. `hello_version` is the app's GC
+/// protocol version; CS2 rejects a `0`/absent version with a fatal logon error.
+async fn send_hello(session: &SessionHandle, appid: u32, hello_version: u32) -> Result<()> {
+    let body = CMsgClientHello {
+        version: Some(hello_version),
+        client_session_need: Some(0),
+        client_launcher: Some(0),
+        steam_launcher: Some(0),
+        ..Default::default()
+    };
     let hello = envelope::wrap(
         appid,
         GC_CLIENT_HELLO,
         &GcHeader::default(),
-        &CMsgClientHello::default().encode_to_vec(),
+        &body.encode_to_vec(),
     );
     session.notify(EMSG_CLIENT_TO_GC, &hello).await
 }
@@ -217,12 +244,22 @@ async fn launch(session: &SessionHandle, appid: u32) -> Result<()> {
 /// session does.
 async fn pump(
     appid: u32,
+    hello_version: u32,
     session: SessionHandle,
     mut events_in: broadcast::Receiver<crate::codec::SteamMessage>,
     mut state_in: watch::Receiver<SessionState>,
     events_out: broadcast::Sender<GcMessage>,
     ready_tx: watch::Sender<bool>,
 ) {
+    let mut ready = false;
+    // Re-poke the GC with a hello until it welcomes us. The first tick fires one
+    // interval in (launch already sent the initial hello).
+    let mut hello = tokio::time::interval_at(
+        tokio::time::Instant::now() + HELLO_RETRY_INTERVAL,
+        HELLO_RETRY_INTERVAL,
+    );
+    let mut hello_attempts: u32 = 0;
+
     loop {
         tokio::select! {
             // React to session lifecycle: a reconnect resets GC state and needs
@@ -232,9 +269,19 @@ async fn pump(
                     break; // session gone for good
                 }
                 let ready_again = state_in.borrow().is_ready();
+                ready = false;
                 let _ = ready_tx.send(false);
                 if ready_again {
-                    let _ = launch(&session, appid).await;
+                    hello_attempts = 0;
+                    let _ = launch(&session, appid, hello_version).await;
+                }
+            }
+            // Retry the hello until welcomed (bounded, so a license-less account
+            // doesn't poke Steam forever).
+            _ = hello.tick() => {
+                if !ready && hello_attempts < MAX_HELLO_ATTEMPTS {
+                    hello_attempts += 1;
+                    let _ = send_hello(&session, appid, hello_version).await;
                 }
             }
             received = events_in.recv() => {
@@ -246,6 +293,7 @@ async fn pump(
                         match envelope::unwrap(&steam_msg) {
                             Ok(Some(gc_msg)) if gc_msg.appid == appid => {
                                 if gc_msg.msgtype == GC_CLIENT_WELCOME {
+                                    ready = true;
                                     let _ = ready_tx.send(true);
                                 }
                                 // Ignored if there are no subscribers.

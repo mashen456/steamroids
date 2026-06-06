@@ -8,6 +8,29 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ## [Unreleased]
 
+### Fixed
+
+- **CS2 GC logon** — the GC `ClientHello` now carries the app's protocol version.
+  CS2's Game Coordinator rejected a version-less hello with a fatal logon error
+  (`ClientLogonFatalError`), so the welcome never arrived; `cs2::attach` supplies
+  `cs2::GC_HELLO_VERSION`. The pump also re-sends the hello until welcomed (the
+  GC ignores the first one right after launch).
+
+### Changed
+
+- **Proxy resilience / self-heal** — built for flaky *rotating* proxies where
+  exits vary in performance:
+  - `CmConnection::establish` now bounds each server attempt
+    (`CONNECT_ATTEMPT_TIMEOUT`), so a slow/silent exit is abandoned and the next
+    attempt routes through a fresh exit instead of stalling.
+  - `spawn_session` retries the initial connect with backoff (several fresh
+    exits) before giving up.
+  - Transient server-side logoffs (`TryAnotherCM`, `ServiceUnavailable`,
+    `NoConnection`) now trigger a reconnect instead of ending the session; the
+    logoff `EResult` is surfaced in `SessionState::LoggedOff`.
+- `GameCoordinator::attach` takes a `hello_version` argument; CS2 callers should
+  use `cs2::attach`.
+
 ### Added
 
 - **Friends (`friends`)** — `friends::request_friends_list` captures the

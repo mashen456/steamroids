@@ -19,9 +19,9 @@ use std::env;
 use std::time::Duration;
 
 use steamroids::auth::{SignIn, SignInOutcome};
+use steamroids::cs2;
 use steamroids::session::{spawn_session, SessionConfig};
 use steamroids::transport::proxy::ProxyConfig;
-use steamroids::{cs2, gc::GameCoordinator};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ CM session up (steam_id {})", handle.steam_id());
 
     // 3. Attach to the CS2 Game Coordinator and wait for its welcome.
-    let gc = GameCoordinator::attach(handle.clone(), cs2::APP_ID).await?;
+    let gc = cs2::attach(handle.clone()).await?;
     gc.wait_ready(Duration::from_secs(20)).await?;
     println!("✓ CS2 Game Coordinator ready");
 

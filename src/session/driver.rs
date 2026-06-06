@@ -21,11 +21,14 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use prost::Message as _;
+
 use crate::auth::RefreshToken;
 use crate::codec::{self, SteamMessage};
-use crate::proto::CMsgProtoBufHeader;
+use crate::proto::{CMsgClientLoggedOff, CMsgProtoBufHeader};
 use crate::session::connection::{
-    read_message, write_frame, CmConnection, EMSG_CLIENT_HEARTBEAT, EMSG_CLIENT_LOGGED_OFF,
+    read_message, write_frame, CmConnection, LoggedOn, EMSG_CLIENT_HEARTBEAT,
+    EMSG_CLIENT_LOGGED_OFF,
 };
 use crate::session::state::SessionState;
 use crate::transport::proxy::ProxyConfig;
@@ -40,8 +43,19 @@ const EVENT_CAPACITY: usize = 256;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Upper bound on reconnect backoff.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Attempts for the *initial* connect before [`spawn_session`] gives up. Each
+/// attempt rediscovers and reconnects, so a flaky rotating proxy gets several
+/// fresh exits to land a good one rather than failing the caller on one bad exit.
+const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
 // k_EMsgClientLogOff, from protos/steam/enums_clientserver.proto.
 const EMSG_CLIENT_LOGOFF: u32 = 706;
+
+// `EResult` values (from `steammessages_base.proto`) that make a server-side
+// logoff *transient*: the session is gone, but reconnecting — through a rotating
+// proxy, onto a fresh exit / CM — recovers it. Anything else is terminal.
+const ERESULT_NO_CONNECTION: i32 = 3;
+const ERESULT_SERVICE_UNAVAILABLE: i32 = 20;
+const ERESULT_TRY_ANOTHER_CM: i32 = 42;
 
 /// Everything the driver needs to establish — and re-establish — a session.
 #[derive(Debug, Clone)]
@@ -72,9 +86,11 @@ enum Command {
 enum LoopExit {
     /// All handles dropped — stop for good.
     Shutdown,
-    /// Steam logged us off — stop for good.
-    LoggedOff,
-    /// Transport failure — reconnect.
+    /// Steam logged us off for a terminal reason — stop for good. Carries a
+    /// human-readable reason (the `EResult`).
+    LoggedOff(String),
+    /// Transport failure, or a *transient* server-side logoff — reconnect
+    /// (which, through a rotating proxy, lands on a fresh exit / CM).
     Disconnected,
 }
 
@@ -186,16 +202,12 @@ impl SessionHandle {
 ///
 /// # Errors
 ///
-/// Whatever [`CmConnection::establish`] returns for the initial attempt.
+/// [`Error::AuthRejected`] if the token is rejected, otherwise the last connect
+/// error after several attempts (each rediscovering through a fresh proxy exit).
 pub async fn spawn_session(
     config: SessionConfig,
 ) -> Result<(SessionHandle, JoinHandle<Result<()>>)> {
-    let (conn, logged) = CmConnection::establish(
-        &config.account_name,
-        config.refresh_token.expose(),
-        config.proxy.as_ref(),
-    )
-    .await?;
+    let (conn, logged) = establish_resilient(&config).await?;
 
     let steam_id = logged.steam_id;
     let (ws, _steam_id, session_id, inbox) = conn.into_parts();
@@ -231,6 +243,36 @@ pub async fn spawn_session(
     ))
 }
 
+/// Establish the initial connection, retrying transient failures with backoff.
+///
+/// Each attempt rediscovers CMs and opens fresh connections, so on a rotating
+/// proxy every retry routes through a new exit — the heal for "this exit is bad,
+/// try the next." A rejected token stops immediately (retrying won't help).
+async fn establish_resilient(config: &SessionConfig) -> Result<(CmConnection, LoggedOn)> {
+    let mut backoff = INITIAL_BACKOFF;
+    let mut last_err = Error::Network("no connect attempt ran".into());
+    for attempt in 1..=INITIAL_CONNECT_ATTEMPTS {
+        match CmConnection::establish(
+            &config.account_name,
+            config.refresh_token.expose(),
+            config.proxy.as_ref(),
+        )
+        .await
+        {
+            Ok(ok) => return Ok(ok),
+            Err(e @ Error::AuthRejected(_)) => return Err(e),
+            Err(e) => {
+                last_err = e;
+                if attempt < INITIAL_CONNECT_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// Owns the socket on the background task.
 struct SessionDriver {
     write: SplitSink<SteamWebSocket, WsMessage>,
@@ -252,10 +294,10 @@ impl SessionDriver {
         let result = loop {
             match self.run_connected().await {
                 LoopExit::Shutdown => {
-                    break Ok("session closed");
+                    break Ok("session closed".to_string());
                 }
-                LoopExit::LoggedOff => {
-                    break Ok("logged off by Steam");
+                LoopExit::LoggedOff(reason) => {
+                    break Ok(reason);
                 }
                 LoopExit::Disconnected => {
                     // In-flight requests can't be answered on a dead socket.
@@ -278,9 +320,7 @@ impl SessionDriver {
         let _ = self.write.close().await;
         match result {
             Ok(reason) => {
-                let _ = self.state.send(SessionState::LoggedOff {
-                    reason: reason.to_owned(),
-                });
+                let _ = self.state.send(SessionState::LoggedOff { reason });
                 Ok(())
             }
             Err(e) => {
@@ -326,7 +366,7 @@ impl SessionDriver {
                 }
                 received = read_message(&mut self.read, &mut self.inbox) => {
                     match received {
-                        Ok(msg) if msg.emsg == EMSG_CLIENT_LOGGED_OFF => return LoopExit::LoggedOff,
+                        Ok(msg) if msg.emsg == EMSG_CLIENT_LOGGED_OFF => return classify_logoff(&msg),
                         Ok(msg) => dispatch(&mut self.pending, &self.events, msg),
                         Err(_) => return LoopExit::Disconnected,
                     }
@@ -396,6 +436,23 @@ async fn send_frame(
         ..Default::default()
     };
     write_frame(write, codec::encode_raw(emsg, &header, body)).await
+}
+
+/// Decide whether a `CMsgClientLoggedOff` is transient (heal by reconnecting) or
+/// terminal (give up). Steam frequently evicts sessions with `TryAnotherCM` /
+/// `ServiceUnavailable` under load — especially over flaky proxies — and the
+/// right response is to re-establish, not to die.
+fn classify_logoff(msg: &SteamMessage) -> LoopExit {
+    let eresult = CMsgClientLoggedOff::decode(msg.body.as_slice())
+        .ok()
+        .and_then(|m| m.eresult)
+        .unwrap_or(0);
+    match eresult {
+        ERESULT_NO_CONNECTION | ERESULT_SERVICE_UNAVAILABLE | ERESULT_TRY_ANOTHER_CM => {
+            LoopExit::Disconnected
+        }
+        other => LoopExit::LoggedOff(format!("logged off by Steam (eresult {other})")),
+    }
 }
 
 /// Route an incoming message: to the waiting request if its `jobid_target`

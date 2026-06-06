@@ -8,9 +8,9 @@
 //! ```no_run
 //! # async fn demo(session: steamroids::session::SessionHandle) -> steamroids::Result<()> {
 //! use std::time::Duration;
-//! use steamroids::{cs2, gc::GameCoordinator};
+//! use steamroids::cs2;
 //!
-//! let gc = GameCoordinator::attach(session, cs2::APP_ID).await?;
+//! let gc = cs2::attach(session).await?;
 //! gc.wait_ready(Duration::from_secs(10)).await?;
 //!
 //! let account_id = cs2::account_id_from_steam_id(76_561_198_000_000_000);
@@ -26,10 +26,29 @@ use crate::gc::GameCoordinator;
 use crate::proto::gc::{
     CMsgGccStrike15V2ClientRequestPlayersProfile, CMsgGccStrike15V2PlayersProfile,
 };
+use crate::session::SessionHandle;
 use crate::{Error, Result};
 
 /// CS2's Steam app id.
 pub const APP_ID: u32 = 730;
+
+/// CS2 GC protocol version sent in the `ClientHello`. CS2's GC rejects a
+/// version-less hello with a fatal logon error, so this must be a current value.
+/// Bump it if Steam starts rejecting logons after a CS2 update.
+pub const GC_HELLO_VERSION: u32 = 2_000_244;
+
+/// Attach to the CS2 Game Coordinator over `session`.
+///
+/// Thin wrapper over [`GameCoordinator::attach`] that supplies [`APP_ID`] and
+/// [`GC_HELLO_VERSION`]. Follow with [`GameCoordinator::wait_ready`] before
+/// requesting profiles.
+///
+/// # Errors
+///
+/// Propagates the initial launch send if the session has already stopped.
+pub async fn attach(session: SessionHandle) -> Result<GameCoordinator> {
+    GameCoordinator::attach(session, APP_ID, GC_HELLO_VERSION).await
+}
 
 // CS2 GC message types (ECsgoGCMsg), from `protos/csgo/cstrike15_gcmessages.proto`.
 const GC_CLIENT_REQUEST_PLAYERS_PROFILE: u32 = 9127;

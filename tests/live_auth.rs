@@ -190,7 +190,6 @@ async fn sign_in_for_session(
 #[tokio::test]
 #[ignore = "full CS2 GC scan against real Steam; CI runs it via --include-ignored"]
 async fn cs2_profile_scan() {
-    use steamroids::gc::GameCoordinator;
     use steamroids::session::{spawn_session, SessionConfig};
     use steamroids::{cs2, Error};
 
@@ -222,11 +221,15 @@ async fn cs2_profile_scan() {
     eprintln!("OK cs2: CM session up for steam_id {steam_id}");
 
     // 2. Attach the CS2 GC and wait for its welcome.
-    let gc = GameCoordinator::attach(handle.clone(), cs2::APP_ID)
-        .await
-        .expect("attach GC");
+    let gc = cs2::attach(handle.clone()).await.expect("attach GC");
     if let Err(e) = gc.wait_ready(Duration::from_secs(25)).await {
-        eprintln!("SKIP cs2_profile_scan: CS2 GC never became ready ({e}); account may lack a CS2 license");
+        // Report the session state too: a `logged_off (eresult 6)` here means the
+        // account is logged in elsewhere, not that it lacks a CS2 license.
+        eprintln!(
+            "SKIP cs2_profile_scan: CS2 GC never became ready ({e}); session state = {:?}. \
+             Causes: account lacks a CS2 license, or it's logged in elsewhere (eresult 6).",
+            handle.state()
+        );
         handle.logoff().await.ok();
         let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
         return;

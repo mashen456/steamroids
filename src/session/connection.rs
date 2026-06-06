@@ -48,6 +48,12 @@ const DEFAULT_HEARTBEAT_SECS: i32 = 9;
 /// How many discovered CM servers to try before giving up a connect attempt.
 const MAX_CONNECT_ATTEMPTS: usize = 5;
 
+/// Per-server budget for the connect + logon handshake. A rotating proxy can
+/// hand us a slow or silent exit; this bounds the wait so we abandon it and try
+/// the next server (which opens a fresh connection — a new exit) instead of
+/// stalling. Covers the full TCP/TLS/WS connect *and* the logon round-trip.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Base `SteamID` for the *initial* logon header: universe Public, type
 /// Individual, instance Desktop, account id 0. Steam replaces it with the real
 /// `SteamID` in the logon response header.
@@ -94,13 +100,20 @@ impl CmConnection {
         let servers = crate::session::discover_cm_servers(proxy).await?;
         let mut last_err = None;
         for server in servers.iter().take(MAX_CONNECT_ATTEMPTS) {
-            match Self::connect(&server.ws_url(), proxy).await {
-                Ok(mut conn) => match conn.logon(account_name, refresh_token).await {
-                    Ok(logged) => return Ok((conn, logged)),
-                    Err(e @ Error::AuthRejected(_)) => return Err(e),
-                    Err(e) => last_err = Some(e),
-                },
-                Err(e) => last_err = Some(e),
+            // Bound each server attempt so a slow/silent proxy exit is skipped
+            // rather than stalling the whole connect. Each attempt opens a fresh
+            // connection, so the next one routes through a new rotating exit.
+            let attempt = async {
+                let mut conn = Self::connect(&server.ws_url(), proxy).await?;
+                let logged = conn.logon(account_name, refresh_token).await?;
+                Ok::<_, Error>((conn, logged))
+            };
+            match timeout(CONNECT_ATTEMPT_TIMEOUT, attempt).await {
+                Ok(Ok(ok)) => return Ok(ok),
+                // A rejected token won't improve on another server — stop now.
+                Ok(Err(e @ Error::AuthRejected(_))) => return Err(e),
+                Ok(Err(e)) => last_err = Some(e),
+                Err(_) => last_err = Some(Error::Timeout("cm connect attempt")),
             }
         }
         Err(last_err.unwrap_or_else(|| Error::Network("no CM servers to connect to".into())))
