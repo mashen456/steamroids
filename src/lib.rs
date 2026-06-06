@@ -14,7 +14,10 @@
 //!   job-id-multiplexed `request` / `notify` / `subscribe`).
 //! - **Persona / profile** — [`persona::request_player_summary`] pulls a
 //!   player's name, avatar, status, and current game over the session (no
-//!   `WebAPI` key); [`persona::request_profile_info`] adds the public fields.
+//!   `WebAPI` key); [`persona::request_profile_info`] adds the public fields,
+//!   and [`persona::resolve_vanity_url`] maps a custom URL back to a `SteamID`.
+//! - **Friends** — [`friends::request_friends_list`], [`friends::add_friend`],
+//!   and [`friends::remove_friend`] manage the account's friends over the session.
 //! - **Game Coordinator** — [`gc::GameCoordinator`] talks to an app's GC on top
 //!   of a session; [`cs2`] is the first consumer (CS2 player profiles).
 //!
@@ -46,6 +49,7 @@ pub mod auth;
 pub mod codec;
 pub mod cs2;
 pub mod error;
+pub mod friends;
 pub mod gc;
 pub mod persona;
 pub mod proto;

@@ -62,6 +62,12 @@ pub enum Error {
     #[error("auth rejected: {0}")]
     AuthRejected(String),
 
+    /// Steam processed a request but returned a non-OK `EResult` (e.g. an
+    /// `AddFriend` that was rejected, a GC request that failed). The string
+    /// carries the operation and result for diagnostics.
+    #[error("steam request failed: {0}")]
+    Remote(String),
+
     /// Steam reported a transient auth failure (rate-limited, retry later).
     #[error("auth rate-limited: {0}")]
     AuthRateLimited(String),

@@ -32,6 +32,7 @@ use crate::proto::{
     CMsgClientFriendProfileInfo, CMsgClientPersonaState, CMsgClientRequestFriendData,
 };
 use crate::session::SessionHandle;
+use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
 // EMsg values, from `protos/steam/enums_clientserver.proto`.
@@ -145,10 +146,48 @@ pub struct ProfileInfo {
     pub created_at: Option<u32>,
 }
 
-/// Build the community profile URL for a `SteamID`.
+/// Build the canonical community profile URL for a `SteamID`.
+///
+/// This `/profiles/{id}` form **always works**, even when the account has a
+/// custom (vanity) URL — Steam redirects it to `/id/{name}`. Getting the pretty
+/// vanity form for a `SteamID` isn't available keyless; it needs the `WebAPI`
+/// `GetPlayerSummaries`. The reverse — a vanity name back to a `SteamID` — *is*
+/// keyless: see [`resolve_vanity_url`].
 #[must_use]
 pub fn profile_url(steam_id: u64) -> String {
     format!("https://steamcommunity.com/profiles/{steam_id}")
+}
+
+/// Resolve a custom (vanity) profile URL name to a `SteamID` — keyless.
+///
+/// Steam's community site echoes the `SteamID` in the XML view of a vanity
+/// profile (`https://steamcommunity.com/id/{name}?xml=1`), so no `WebAPI` key is
+/// needed. `name` is the bare vanity (the part after `/id/`), e.g.
+/// `"gabelogannewell"`. Returns `Ok(None)` if no such vanity exists. The request
+/// goes through `proxy` when given.
+///
+/// # Errors
+///
+/// [`Error::Network`] if the community site is unreachable, plus client-build
+/// errors.
+pub async fn resolve_vanity_url(name: &str, proxy: Option<&ProxyConfig>) -> Result<Option<u64>> {
+    let url = format!("https://steamcommunity.com/id/{name}?xml=1");
+    let body = crate::http::client(proxy)?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| Error::Network(format!("vanity lookup: {e}")))?
+        .text()
+        .await
+        .map_err(|e| Error::Network(format!("vanity lookup body: {e}")))?;
+    Ok(extract_steam_id64(&body))
+}
+
+/// Pull the `<steamID64>…</steamID64>` value out of a community XML document.
+fn extract_steam_id64(xml: &str) -> Option<u64> {
+    let start = xml.find("<steamID64>")? + "<steamID64>".len();
+    let end = xml[start..].find("</steamID64>")? + start;
+    xml[start..end].trim().parse().ok()
 }
 
 /// Build the full-size avatar URL from a raw avatar hash.
@@ -397,6 +436,20 @@ mod tests {
         let game = summary.current_game.expect("in a game");
         assert_eq!(game.app_id, 730);
         assert_eq!(game.name, "Counter-Strike 2");
+    }
+
+    #[test]
+    fn extract_steam_id64_parses_community_xml() {
+        let xml = r"<?xml version='1.0'?><profile><steamID64>76561197960287930</steamID64><steamID><![CDATA[Rabscuttle]]></steamID></profile>";
+        assert_eq!(extract_steam_id64(xml), Some(76_561_197_960_287_930));
+    }
+
+    #[test]
+    fn extract_steam_id64_none_when_absent() {
+        assert_eq!(
+            extract_steam_id64("<response><error>No match</error></response>"),
+            None
+        );
     }
 
     #[test]

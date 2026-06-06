@@ -10,6 +10,15 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
+- **Friends (`friends`)** — `friends::request_friends_list` captures the
+  post-login `CMsgClientFriendsList` (with `FriendRelationship`),
+  `friends::add_friend` / `add_friend_by_name` send requests (job-correlated
+  `CMsgClientAddFriend`), and `friends::remove_friend` removes / declines.
+  Example `09_friends`.
+- **Vanity URL resolution** — `persona::resolve_vanity_url` maps a custom URL
+  name back to a `SteamID` keyless via the community XML view. `persona::profile_url`
+  is documented as the always-valid canonical form (Steam redirects it to the
+  vanity); the reverse pretty form needs the `WebAPI` `GetPlayerSummaries`.
 - **Profile details (`persona`)** — `persona::request_player_summary` pulls a
   player's persona name, avatar URL, online status, and current game over the CM
   session (no `WebAPI` key) via `CMsgClientRequestFriendData` →
