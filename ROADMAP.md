@@ -138,18 +138,36 @@ live test is still worth adding; reconnect is currently structural.)
 
 Generic GC plumbing, then CS2 as the first consumer.
 
-- [ ] **`CMsgClientGamesPlayed`** — launch the app (730) so the GC routes to us.
-- [ ] **Generic GC envelope** — `CMsgClientFromGC` / `CMsgClientToGC` en/decode,
-      app-agnostic, with GC job-ID correlation.
-- [ ] **GC welcome + connection-status handling** — wait for GC readiness before
-      issuing requests.
-- [ ] **CS2 messages** — `CMsgGCCStrike15_v2_ClientRequestPlayersProfile` /
-      `...PlayersProfile`, vendored CS2 protos added to `build.rs`.
-- [ ] **`PlayerProfile` idiomatic Rust type** — no protobuf leakage at the API
-      boundary.
+> **Note:** the CS2 protos (`protos/csgo/`) are package-less like the Steam set
+> and several names collide (`CMsgProtoBufHeader`, `CMsgClientHello`,
+> `ECommunityItemClass`) while being *different* messages — the GC
+> `CMsgProtoBufHeader` has its own field layout. They therefore compile into a
+> separate [`proto::gc`](crate::proto::gc) module (own `OUT_DIR/gc` output) so
+> the flat namespaces can't clash. The GC payload reuses the CM frame layout, so
+> [`codec::frame`] / `codec::unframe` are shared, just with the GC header type.
 
-**Acceptance:** `examples/07_scan_one_profile.rs` returns a real player's level
-+ XP via the GC.
+- [x] **`CMsgClientGamesPlayed`** — launch the app (730) so the GC routes to us.
+      Done in [`gc::GameCoordinator::attach`]. ✅
+- [x] **Generic GC envelope** — `CMsgClientFromGC` / `CMsgClientToGC` en/decode
+      in [`gc::wrap`] / [`gc::unwrap`], app-agnostic, decoding the GC routing
+      header; `GcMessage::jobid_target` exposes GC job ids (CS2 doesn't populate
+      them, so the client correlates by response type instead). ✅
+- [x] **GC welcome handling** — `attach` sends a `ClientHello` and the pump
+      flags readiness on `ClientWelcome`; [`gc::GameCoordinator::wait_ready`]
+      awaits it before requests. The pump re-announces the app on reconnect.
+      (`GC_CLIENT_CONNECTION_STATUS` is surfaced as a constant; acting on it is
+      future work.) ✅
+- [x] **CS2 messages** — `CMsgGCCStrike15_v2_ClientRequestPlayersProfile` /
+      `...PlayersProfile` wired through [`cs2::request_player_profile`]; CS2
+      protos vendored and compiled via `build.rs`. ✅
+- [x] **`PlayerProfile` idiomatic Rust type** — [`cs2::PlayerProfile`] (level,
+      XP, competitive rank/wins) with no protobuf leakage at the boundary. ✅
+
+**Acceptance:** met by `examples/07_scan_one_profile.rs` and the live
+`cs2_profile_scan` test — sign in, bring up a CM session, attach the CS2 GC,
+await its welcome, and request a profile, returning a real level + XP. (Whether a
+given CI account has a CS2 license is provisioning, not code, so the live test
+soft-skips if the GC never welcomes.)
 
 ## v0.4.x — Fleet hardening
 

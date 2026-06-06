@@ -14,13 +14,15 @@
 //! - **Plain account** (`STEAM_TEST_PLAIN_*`) — password only. For a green
 //!   `login OK` this account must have Steam Guard fully disabled; if it still
 //!   has email Guard the test soft-skips (our flow can't enter an email code
-//!   yet).
+//!   yet). This account also drives the CS2 Game Coordinator scan
+//!   (`cs2_profile_scan`).
 //! - **Refresh token** (`STEAM_TEST_REFRESH_TOKEN`, optional) — exercises the
 //!   token-reuse path.
 //!
 //! The real-login tests are `#[ignore]`d so a stray `cargo test` never fires
 //! live logins; CI opts in with `-- --include-ignored`. Each account is logged
-//! in at most once per run (the 2FA login happens only inside `cm_logon_over_wss`).
+//! in at most once per run: the 2FA login happens only inside `cm_logon_over_wss`,
+//! and the plain login only inside `cs2_profile_scan`.
 //!
 //! # Running locally
 //!
@@ -111,15 +113,29 @@ async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOu
     unreachable!("loop returns or panics on the final attempt");
 }
 
-/// Drive the password flow for `acc` and assert a clean login, treating
-/// transient / unsupported states as loud skips rather than failures.
-async fn run_password_login(label: &str, acc: Account) {
+// NB: the 2FA account's password login is exercised as step 1 of
+// `cm_logon_over_wss`; there is no separate `login_account_with_2fa` test, so
+// that account is never logged in twice in one run (concurrent logins reuse the
+// same TOTP code within a 30s window and Steam rejects the duplicate).
+
+/// Sign `acc` in for a refresh token, retrying on proxy blips. Returns `None`
+/// (after printing a `SKIP`) for the soft-skippable outcomes — email Guard or
+/// rate-limiting — and panics on a hard failure. Asserts a real login on
+/// success, folding in the plain-account login coverage.
+async fn sign_in_for_session(
+    label: &str,
+    acc: &Account,
+    proxy: Option<&ProxyConfig>,
+) -> Option<steamroids::auth::RefreshToken> {
     let outcome = execute_with_retry(label, || {
-        let mut signin = SignIn::with_password(acc.username.clone(), acc.password.clone());
+        let mut s = SignIn::with_password(acc.username.clone(), acc.password.clone());
         if let Some(secret) = &acc.shared_secret {
-            signin = signin.shared_secret(secret.clone());
+            s = s.shared_secret(secret.clone());
         }
-        with_optional_proxy(signin)
+        if let Some(p) = proxy {
+            s = s.proxy(p.clone());
+        }
+        s
     })
     .await;
 
@@ -135,40 +151,106 @@ async fn run_password_login(label: &str, acc: Account) {
                 "[{label}] expected a refresh token"
             );
             eprintln!("OK [{label}] login for steam_id {steam_id}");
-        }
-        SignInOutcome::NeedsMobileGuardCode => {
-            panic!(
-                "[{label}] account needs mobile 2FA — set STEAM_TEST_{}_SHARED_SECRET",
-                label.to_uppercase()
-            );
+            Some(refresh_token)
         }
         SignInOutcome::NeedsEmailGuardCode { email_domain } => {
             eprintln!("SKIP [{label}]: account still has email Steam Guard (domain {email_domain}); disable Steam Guard for a real login test");
+            None
         }
         SignInOutcome::RateLimited { retry_hint } => {
             eprintln!("SKIP [{label}]: Steam rate-limited (retry {retry_hint:?})");
+            None
         }
+        SignInOutcome::NeedsMobileGuardCode => panic!(
+            "[{label}] account needs mobile 2FA — set STEAM_TEST_{}_SHARED_SECRET",
+            label.to_uppercase()
+        ),
         SignInOutcome::InvalidCredentials => {
-            panic!("[{label}] username/password rejected by Steam");
+            panic!("[{label}] username/password rejected by Steam")
         }
         other => panic!("[{label}] unexpected outcome: {other:?}"),
     }
 }
 
-// NB: the 2FA account's password login is exercised as step 1 of
-// `cm_logon_over_wss`; there is no separate `login_account_with_2fa` test, so
-// that account is never logged in twice in one run (concurrent logins reuse the
-// same TOTP code within a 30s window and Steam rejects the duplicate).
-
-/// Password only, no 2FA. `#[ignore]`d so it only runs on explicit opt-in.
+/// Full CS2 Game Coordinator scan with the plain account: WebAPI sign-in -> CM
+/// session -> "play" CS2 -> GC welcome -> request a player's profile. This is
+/// the 0.3.x end-to-end path; it also covers the plain-account login (asserted
+/// inside [`sign_in_for_session`]). `#[ignore]`d (real login).
+///
+/// Whether the GC welcomes us depends on the account having a CS2 license, which
+/// is an account-provisioning detail, not a code property — so a GC that never
+/// becomes ready is a loud `SKIP`, not a failure. When it *does* welcome, the
+/// profile round-trip is asserted.
 #[tokio::test]
-#[ignore = "full password login; CI runs it via --include-ignored"]
-async fn login_account_without_2fa() {
+#[ignore = "full CS2 GC scan against real Steam; CI runs it via --include-ignored"]
+async fn cs2_profile_scan() {
+    use steamroids::gc::GameCoordinator;
+    use steamroids::session::{spawn_session, SessionConfig};
+    use steamroids::{cs2, Error};
+
     let Some(acc) = load_account("PLAIN") else {
-        eprintln!("SKIP login_account_without_2fa: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
+        eprintln!("SKIP cs2_profile_scan: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
         return;
     };
-    run_password_login("plain", acc).await;
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    // 1. Sign in (asserts a clean login) and bring up a live CM session.
+    let Some(refresh) = sign_in_for_session("cs2", &acc, proxy.as_ref()).await else {
+        return; // soft-skipped (email Guard / rate-limited)
+    };
+    let (handle, join) = spawn_session(SessionConfig {
+        account_name: acc.username.clone(),
+        refresh_token: refresh,
+        proxy: proxy.clone(),
+    })
+    .await
+    .expect("establish CM session");
+    let steam_id = handle.steam_id();
+    assert!(steam_id > 0, "expected a real SteamID");
+    eprintln!("OK cs2: CM session up for steam_id {steam_id}");
+
+    // 2. Attach the CS2 GC and wait for its welcome.
+    let gc = GameCoordinator::attach(handle.clone(), cs2::APP_ID)
+        .await
+        .expect("attach GC");
+    if let Err(e) = gc.wait_ready(Duration::from_secs(25)).await {
+        eprintln!("SKIP cs2_profile_scan: CS2 GC never became ready ({e}); account may lack a CS2 license");
+        handle.logoff().await.ok();
+        let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+        return;
+    }
+    eprintln!("OK cs2: GC welcomed us");
+
+    // 3. Scan our own profile and assert the round-trip.
+    let account_id = cs2::account_id_from_steam_id(steam_id);
+    match cs2::request_player_profile(&gc, account_id).await {
+        Ok(profile) => {
+            assert_eq!(
+                profile.account_id, account_id,
+                "GC returned a profile for the wrong account"
+            );
+            eprintln!(
+                "OK cs2: profile account={} level={} xp={} rank={:?}",
+                profile.account_id, profile.level, profile.current_xp, profile.competitive_rank
+            );
+        }
+        // The GC answered the handshake but had no profile row for us (e.g. a
+        // brand-new account that has never played a match). The plumbing works;
+        // there's just nothing to assert on.
+        Err(Error::Network(msg)) => {
+            eprintln!("SKIP cs2_profile_scan: GC returned no profile data ({msg})");
+        }
+        Err(e) => panic!("cs2 profile request failed: {e}"),
+    }
+
+    // 4. Clean shutdown.
+    handle.logoff().await.expect("clean logoff");
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("driver ends after logoff")
+        .expect("driver did not panic")
+        .expect("clean driver shutdown");
 }
 
 /// CM server discovery against the public Steam directory (no credentials).

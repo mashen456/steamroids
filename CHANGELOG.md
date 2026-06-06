@@ -10,6 +10,24 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
+- **Game Coordinator layer (`gc`)** — app-agnostic GC plumbing: `gc::wrap` /
+  `gc::unwrap` frame messages into the `CMsgClientToGC` / `…FromGC` relay (using
+  the GC's own `CMsgProtoBufHeader`), and `gc::GameCoordinator` rides on a
+  `SessionHandle` to announce the app (`CMsgClientGamesPlayed`), do the
+  `ClientHello` → `ClientWelcome` handshake, and correlate replies. Re-announces
+  the app automatically when the session reconnects.
+- **CS2 helpers (`cs2`)** — `cs2::request_player_profile` returns an idiomatic
+  `cs2::PlayerProfile` (account id, level, current XP, competitive rank/wins)
+  with no protobuf types at the boundary, plus `cs2::APP_ID` and
+  `cs2::account_id_from_steam_id`. Example `07_scan_one_profile` and the live
+  `cs2_profile_scan` test pull a real level + XP through the GC.
+- **CM session lifecycle (`session`)** — `session::spawn_session` establishes a
+  logged-on CM connection over WSS (`CMsgClientLogon` + refresh token), then runs
+  a background driver that heartbeats, multiplexes `request` / `notify` /
+  `subscribe` by job id, reconnects with exponential backoff on transport drops,
+  and logs off cleanly. State is observable via `SessionHandle::state` /
+  `watch_state`. Includes the `codec` frame en/decoder and
+  `session::discover_cm_servers`.
 - `auth::TokenStore` trait + `SignIn::execute_with_store` for transparent
   refresh-token reuse and persistence (try a stored token, fall back to the
   password flow, persist the issued token).
@@ -17,6 +35,9 @@ While in `0.x.y`, **any minor version may break the API**.
   WebSocket transport, in addition to SOCKS5 and plain HTTP-CONNECT.
 - Opt-in live integration tests (`tests/live_auth.rs`) that authenticate against
   real Steam, gated by environment variables / CI secrets.
+- Vendored CS2 Game Coordinator protos (`protos/csgo/`) compiled into a separate
+  `proto::gc` module to avoid the package-less name clashes with the Steam set
+  (`CMsgProtoBufHeader`, `CMsgClientHello`).
 
 ### Security
 

@@ -15,7 +15,6 @@
 //! `VT01` packet magic and **no** channel-encryption handshake — TLS already
 //! secures the link, so the framing reduces to this envelope.
 
-use bytes::Buf;
 use prost::Message;
 
 use crate::proto::CMsgProtoBufHeader;
@@ -56,15 +55,65 @@ pub fn encode<M: Message>(emsg: u32, header: &CMsgProtoBufHeader, body: &M) -> V
 /// Like [`encode`], but takes an already-serialized protobuf `body`. Useful when
 /// the body bytes were produced elsewhere (e.g. queued for a background driver).
 pub fn encode_raw(emsg: u32, header: &CMsgProtoBufHeader, body: &[u8]) -> Vec<u8> {
-    let header_bytes = header.encode_to_vec();
+    frame(emsg, &header.encode_to_vec(), body)
+}
+
+/// Build a frame from an already-serialized header and body — the framing core
+/// shared by the CM codec and the [`gc`](crate::gc) envelope, which only differ
+/// in their header type. The protobuf flag is applied to `msg_type`; any stray
+/// high bits are masked off.
+pub(crate) fn frame(msg_type: u32, header_bytes: &[u8], body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREFIX_LEN + header_bytes.len() + body.len());
-    out.extend_from_slice(&((emsg & EMSG_MASK) | PROTO_MASK).to_le_bytes());
-    // A real Steam header is far smaller than u32::MAX; the cast cannot wrap.
+    out.extend_from_slice(&((msg_type & EMSG_MASK) | PROTO_MASK).to_le_bytes());
+    // A real header is far smaller than u32::MAX; the cast cannot wrap.
     #[allow(clippy::cast_possible_truncation)]
     out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(header_bytes);
     out.extend_from_slice(body);
     out
+}
+
+/// The borrowed parts of a frame after splitting off the prefix: the bare
+/// message type and the still-encoded header and body slices. Returned by
+/// [`unframe`].
+pub(crate) struct FrameParts<'a> {
+    /// Message type with the protobuf flag stripped.
+    pub msg_type: u32,
+    /// Still-encoded protobuf header bytes.
+    pub header: &'a [u8],
+    /// Still-encoded protobuf body bytes.
+    pub body: &'a [u8],
+}
+
+/// Split a frame into its [`FrameParts`] with the protobuf flag stripped from
+/// the message type. Returns `Ok(None)` for a legacy non-protobuf frame. The
+/// byte-level counterpart to [`frame`].
+///
+/// # Errors
+///
+/// [`Error::Codec`] if the frame is shorter than the prefix or declares a header
+/// longer than the frame.
+pub(crate) fn unframe(bytes: &[u8]) -> Result<Option<FrameParts<'_>>> {
+    if bytes.len() < PREFIX_LEN {
+        return Err(Error::Codec("frame shorter than 8-byte prefix".into()));
+    }
+    let raw_msg = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    if raw_msg & PROTO_MASK == 0 {
+        return Ok(None);
+    }
+    let header_len = u32::from_le_bytes(bytes[4..PREFIX_LEN].try_into().unwrap()) as usize;
+    let rest = &bytes[PREFIX_LEN..];
+    if rest.len() < header_len {
+        return Err(Error::Codec(format!(
+            "header length {header_len} exceeds {} remaining bytes",
+            rest.len()
+        )));
+    }
+    Ok(Some(FrameParts {
+        msg_type: raw_msg & EMSG_MASK,
+        header: &rest[..header_len],
+        body: &rest[header_len..],
+    }))
 }
 
 /// Like [`decode`], but returns `Ok(None)` for a legacy non-protobuf (packed
@@ -76,15 +125,19 @@ pub fn encode_raw(emsg: u32, header: &CMsgProtoBufHeader, body: &[u8]) -> Vec<u8
 ///
 /// As [`decode`], except a non-protobuf message is `Ok(None)` rather than an
 /// error.
-pub fn try_decode(frame: &[u8]) -> Result<Option<SteamMessage>> {
-    if frame.len() < PREFIX_LEN {
-        return Err(Error::Codec("frame shorter than 8-byte prefix".into()));
+pub fn try_decode(bytes: &[u8]) -> Result<Option<SteamMessage>> {
+    match unframe(bytes)? {
+        None => Ok(None),
+        Some(parts) => {
+            let header = CMsgProtoBufHeader::decode(parts.header)
+                .map_err(|e| Error::Codec(format!("decode header: {e}")))?;
+            Ok(Some(SteamMessage {
+                emsg: parts.msg_type,
+                header,
+                body: parts.body.to_vec(),
+            }))
+        }
     }
-    let raw_msg = u32::from_le_bytes(frame[..4].try_into().unwrap());
-    if raw_msg & PROTO_MASK == 0 {
-        return Ok(None);
-    }
-    decode(frame).map(Some)
 }
 
 /// Decode one CM frame into its `EMsg`, header, and raw body.
@@ -94,33 +147,15 @@ pub fn try_decode(frame: &[u8]) -> Result<Option<SteamMessage>> {
 /// Returns [`Error::Codec`] if the frame is shorter than the prefix, declares a
 /// header longer than the frame, is not protobuf-encoded, or the header fails
 /// to decode.
-pub fn decode(frame: &[u8]) -> Result<SteamMessage> {
-    if frame.len() < PREFIX_LEN {
-        return Err(Error::Codec("frame shorter than 8-byte prefix".into()));
-    }
-
-    let mut cur = frame;
-    let raw_msg = cur.get_u32_le();
-    if raw_msg & PROTO_MASK == 0 {
-        return Err(Error::Codec(format!(
+pub fn decode(bytes: &[u8]) -> Result<SteamMessage> {
+    try_decode(bytes)?.ok_or_else(|| {
+        // `try_decode` only returns `None` once it has confirmed the prefix, so
+        // the first word is present to report.
+        let raw_msg = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        Error::Codec(format!(
             "non-protobuf message (raw type {raw_msg:#010x}) not supported"
-        )));
-    }
-    let emsg = raw_msg & EMSG_MASK;
-
-    let header_len = cur.get_u32_le() as usize;
-    if cur.remaining() < header_len {
-        return Err(Error::Codec(format!(
-            "header length {header_len} exceeds {} remaining bytes",
-            cur.remaining()
-        )));
-    }
-
-    let header = CMsgProtoBufHeader::decode(&cur[..header_len])
-        .map_err(|e| Error::Codec(format!("decode header: {e}")))?;
-    let body = cur[header_len..].to_vec();
-
-    Ok(SteamMessage { emsg, header, body })
+        ))
+    })
 }
 
 #[cfg(test)]
