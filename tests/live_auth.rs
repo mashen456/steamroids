@@ -214,7 +214,7 @@ async fn discover_cm_servers_lists_endpoints() {
 #[tokio::test]
 #[ignore = "full CM logon against real Steam; CI runs it via --include-ignored"]
 async fn cm_logon_over_wss() {
-    use steamroids::session::{spawn_session, SessionConfig};
+    use steamroids::session::{spawn_session, SessionConfig, SessionState};
 
     let Some(acc) = load_account("2FA") else {
         eprintln!(
@@ -274,14 +274,23 @@ async fn cm_logon_over_wss() {
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert!(!join.is_finished(), "driver should still be running");
 
+    // Clean logoff: tell Steam, tear down the socket, driver stops.
     drop(events);
-    drop(handle);
+    handle.logoff().await.expect("clean logoff");
     tokio::time::timeout(Duration::from_secs(5), join)
         .await
-        .expect("driver task ends after handles drop")
+        .expect("driver task ends after logoff")
         .expect("driver task did not panic")
         .expect("clean driver shutdown");
-    eprintln!("OK driver: clean shutdown after handles dropped");
+    assert!(
+        matches!(handle.state(), SessionState::LoggedOff { .. }),
+        "state should be LoggedOff after logoff, was {}",
+        handle.state().label()
+    );
+    eprintln!(
+        "OK driver: clean logoff, final state={}",
+        handle.state().label()
+    );
 }
 
 /// The refresh-token round-trip: a single `GenerateAccessTokenForApp` call.

@@ -125,11 +125,14 @@ roadmap folded this into 0.1.x; it's really its own milestone.
       channel projected onto [`SessionState`]: `state()` (snapshot) and
       `watch_state()` (await transitions: `LoggedOn` → `Connecting` while
       reconnecting → `LoggedOff` / `Failed`). Practical for fleet monitoring. ✅
-- [ ] **Clean logoff** — `CMsgClientLogOff` and graceful socket teardown.
+- [x] **Clean logoff** — `SessionHandle::logoff()` sends `CMsgClientLogOff` and
+      the driver closes the socket (WebSocket Close frame), ending in
+      `LoggedOff`. ✅
 
-**Acceptance:** `examples/06_cm_session.rs` logs a bot in over the CM, holds the
-session open through several heartbeats, survives one forced reconnect, and logs
-off cleanly.
+**Acceptance:** met by the live test `cm_logon_over_wss` — signs in, runs the
+session through several heartbeats, dispatches events, and logs off cleanly
+(state `LoggedOn` → `LoggedOff`), all against real Steam in CI. (A forced-reconnect
+live test is still worth adding; reconnect is currently structural.)
 
 ## v0.3.x — Game Coordinator + CS2
 

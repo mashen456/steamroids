@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -40,6 +40,8 @@ const EVENT_CAPACITY: usize = 256;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Upper bound on reconnect backoff.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+// k_EMsgClientLogOff, from protos/steam/enums_clientserver.proto.
+const EMSG_CLIENT_LOGOFF: u32 = 706;
 
 /// Everything the driver needs to establish — and re-establish — a session.
 #[derive(Debug, Clone)]
@@ -62,6 +64,8 @@ enum Command {
     },
     /// Fire-and-forget send (no reply expected).
     Notify { emsg: u32, body: Vec<u8> },
+    /// Cleanly log off: tell Steam, then stop the driver.
+    Logoff { ack: oneshot::Sender<()> },
 }
 
 /// Why the connected loop ended.
@@ -152,6 +156,24 @@ impl SessionHandle {
     pub fn subscribe(&self) -> broadcast::Receiver<SteamMessage> {
         self.events.subscribe()
     }
+
+    /// Cleanly log the session off: send `CMsgClientLogOff` to Steam and tear
+    /// the socket down. The session stops afterwards (the driver's `JoinHandle`
+    /// resolves to `Ok(())`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WebSocket`] if the driver has already stopped.
+    pub async fn logoff(&self) -> Result<()> {
+        let (ack, rx) = oneshot::channel();
+        self.commands
+            .send(Command::Logoff { ack })
+            .await
+            .map_err(|_| Error::WebSocket("session driver stopped".into()))?;
+        // Ignore the result: if the driver ended before acking, we're done anyway.
+        let _ = rx.await;
+        Ok(())
+    }
 }
 
 /// Establish a session from `config` and move it onto a background task.
@@ -227,19 +249,13 @@ struct SessionDriver {
 
 impl SessionDriver {
     async fn run(mut self) -> Result<()> {
-        loop {
+        let result = loop {
             match self.run_connected().await {
                 LoopExit::Shutdown => {
-                    let _ = self.state.send(SessionState::LoggedOff {
-                        reason: "session closed".into(),
-                    });
-                    return Ok(());
+                    break Ok("session closed");
                 }
                 LoopExit::LoggedOff => {
-                    let _ = self.state.send(SessionState::LoggedOff {
-                        reason: "logged off by Steam".into(),
-                    });
-                    return Ok(());
+                    break Ok("logged off by Steam");
                 }
                 LoopExit::Disconnected => {
                     // In-flight requests can't be answered on a dead socket.
@@ -251,14 +267,27 @@ impl SessionDriver {
                                 steam_id: self.steam_id,
                             });
                         }
-                        Err(e) => {
-                            let _ = self.state.send(SessionState::Failed {
-                                error: e.to_string(),
-                            });
-                            return Err(e);
-                        }
+                        Err(e) => break Err(e),
                     }
                 }
+            }
+        };
+
+        // Graceful socket teardown (sends a WebSocket Close frame), then publish
+        // the terminal state.
+        let _ = self.write.close().await;
+        match result {
+            Ok(reason) => {
+                let _ = self.state.send(SessionState::LoggedOff {
+                    reason: reason.to_owned(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.state.send(SessionState::Failed {
+                    error: e.to_string(),
+                });
+                Err(e)
             }
         }
     }
@@ -277,6 +306,12 @@ impl SessionDriver {
                             if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, &body).await.is_err() {
                                 return LoopExit::Disconnected;
                             }
+                        }
+                        Some(Command::Logoff { ack }) => {
+                            // Best-effort goodbye to Steam, then stop.
+                            let _ = send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_LOGOFF, None, &[]).await;
+                            let _ = ack.send(());
+                            return LoopExit::Shutdown;
                         }
                         Some(Command::Request { emsg, body, reply }) => {
                             let jobid = self.next_jobid;
