@@ -1,6 +1,6 @@
 //! # steamroids
 //!
-//! Rust client for the Steam Connection Manager and (future) CS2 Game Coordinator,
+//! Rust client for the Steam Connection Manager and the CS2 Game Coordinator,
 //! built for high-concurrency automation workloads.
 //!
 //! ## Scope of this version
@@ -40,6 +40,8 @@
 //! - [`auth`] — credentials, TOTP, and the `WebAPI` sign-in flow ([`auth::SignIn`])
 //! - [`codec`] — Steam `EMsg` + protobuf message framing for the CM transport
 //! - [`session`] — live CM session lifecycle ([`session::spawn_session`])
+//! - [`persona`] — player summary, profile info, and vanity-URL resolution
+//! - [`friends`] — friends list, add / remove
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 
