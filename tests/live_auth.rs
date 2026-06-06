@@ -16,6 +16,10 @@
 //!   has email Guard the test soft-skips (our flow can't enter an email code
 //!   yet). This account also drives the CS2 Game Coordinator scan
 //!   (`cs2_profile_scan`).
+//! - **CS2 account** (`STEAM_TEST_CS2_*`, optional) — an account that owns / has
+//!   launched CS2, so its Game Coordinator welcomes us. Drives the real profile
+//!   scan; if unset, `cs2_profile_scan` falls back to the plain account and
+//!   soft-skips when the GC stays silent. Must differ from the 2FA account.
 //! - **Refresh token** (`STEAM_TEST_REFRESH_TOKEN`, optional) — exercises the
 //!   token-reuse path.
 //!
@@ -36,6 +40,8 @@
 //!
 //! - `STEAM_TEST_2FA_ACCOUNT` / `_2FA_PASSWORD` / `_2FA_SHARED_SECRET`
 //! - `STEAM_TEST_PLAIN_ACCOUNT` / `_PLAIN_PASSWORD`
+//! - `STEAM_TEST_CS2_ACCOUNT` / `_CS2_PASSWORD` / `_CS2_SHARED_SECRET` (optional)
+//! - `STEAM_TEST_CS2_TARGET_ID` (optional) — scan this `SteamID64` instead of self
 //! - `STEAM_TEST_REFRESH_TOKEN` (optional)
 //! - `STEAM_TEST_PROXY_URL` (optional) — routes every call through a proxy
 
@@ -188,8 +194,13 @@ async fn cs2_profile_scan() {
     use steamroids::session::{spawn_session, SessionConfig};
     use steamroids::{cs2, Error};
 
-    let Some(acc) = load_account("PLAIN") else {
-        eprintln!("SKIP cs2_profile_scan: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
+    // Prefer a dedicated CS2-licensed account; fall back to the plain account
+    // (which usually lacks a CS2 license, so the GC won't welcome and we
+    // soft-skip below).
+    let Some(acc) = load_account("CS2").or_else(|| load_account("PLAIN")) else {
+        eprintln!(
+            "SKIP cs2_profile_scan: set STEAM_TEST_CS2_ACCOUNT / _PASSWORD (a CS2-licensed account) or STEAM_TEST_PLAIN_*"
+        );
         return;
     };
     let proxy = env_opt("STEAM_TEST_PROXY_URL")
@@ -222,8 +233,15 @@ async fn cs2_profile_scan() {
     }
     eprintln!("OK cs2: GC welcomed us");
 
-    // 3. Scan our own profile and assert the round-trip.
-    let account_id = cs2::account_id_from_steam_id(steam_id);
+    // 3. Scan a profile and assert the round-trip. An explicit target (a known
+    //    active player) guarantees data; otherwise scan our own account.
+    let account_id = match env_opt("STEAM_TEST_CS2_TARGET_ID") {
+        Some(id) => cs2::account_id_from_steam_id(
+            id.parse()
+                .expect("STEAM_TEST_CS2_TARGET_ID must be a SteamID64"),
+        ),
+        None => cs2::account_id_from_steam_id(steam_id),
+    };
     match cs2::request_player_profile(&gc, account_id).await {
         Ok(profile) => {
             assert_eq!(
