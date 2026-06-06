@@ -10,6 +10,12 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
+- **Profile details (`persona`)** — `persona::request_player_summary` pulls a
+  player's persona name, avatar URL, online status, and current game over the CM
+  session (no `WebAPI` key) via `CMsgClientRequestFriendData` →
+  `CMsgClientPersonaState`; `persona::request_profile_info` adds the public
+  fields (real name, location, summary, account age). `persona::profile_url` /
+  `avatar_url` build the community URLs. Example `08_profile_details`.
 - **Game Coordinator layer (`gc`)** — app-agnostic GC plumbing: `gc::wrap` /
   `gc::unwrap` frame messages into the `CMsgClientToGC` / `…FromGC` relay (using
   the GC's own `CMsgProtoBufHeader`), and `gc::GameCoordinator` rides on a

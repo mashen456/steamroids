@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "protos/steam/encrypted_app_ticket.proto",
         "protos/steam/steammessages_clientserver.proto",
         "protos/steam/steammessages_clientserver_2.proto",
+        "protos/steam/steammessages_clientserver_friends.proto",
     ];
 
     // Game Coordinator (CS2) protos. These are package-less like the Steam set,

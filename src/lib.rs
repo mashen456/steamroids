@@ -12,6 +12,9 @@
 //! - **CM session** — [`session::spawn_session`] holds a live, self-healing
 //!   Connection Manager session over WSS (`ClientLogon`, heartbeat, reconnect,
 //!   job-id-multiplexed `request` / `notify` / `subscribe`).
+//! - **Persona / profile** — [`persona::request_player_summary`] pulls a
+//!   player's name, avatar, status, and current game over the session (no
+//!   `WebAPI` key); [`persona::request_profile_info`] adds the public fields.
 //! - **Game Coordinator** — [`gc::GameCoordinator`] talks to an app's GC on top
 //!   of a session; [`cs2`] is the first consumer (CS2 player profiles).
 //!
@@ -44,6 +47,7 @@ pub mod codec;
 pub mod cs2;
 pub mod error;
 pub mod gc;
+pub mod persona;
 pub mod proto;
 pub mod session;
 pub mod transport;
