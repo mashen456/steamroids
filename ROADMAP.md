@@ -119,9 +119,12 @@ roadmap folded this into 0.1.x; it's really its own milestone.
       requests so callers retry; gives up only if the token is rejected. Session
       now created from a `SessionConfig` (account + refresh token + proxy) via
       `CmConnection::establish`. ✅
-- [ ] **Typestate `Session<Disconnected | LoggingOn | LoggedOn | LoggedOff>`** —
-      compile-time prevention of "request before logged on"; the observability
-      `SessionState` enum becomes its projection.
+- [x] **Session state** — the handle architecture already makes "request before
+      logged on" unrepresentable (no handle exists until logon). Instead of a
+      redundant typestate, `SessionHandle` exposes live state via a `watch`
+      channel projected onto [`SessionState`]: `state()` (snapshot) and
+      `watch_state()` (await transitions: `LoggedOn` → `Connecting` while
+      reconnecting → `LoggedOff` / `Failed`). Practical for fleet monitoring. ✅
 - [ ] **Clean logoff** — `CMsgClientLogOff` and graceful socket teardown.
 
 **Acceptance:** `examples/06_cm_session.rs` logs a bot in over the CM, holds the

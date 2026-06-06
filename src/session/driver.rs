@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::StreamExt;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -27,6 +27,7 @@ use crate::proto::CMsgProtoBufHeader;
 use crate::session::connection::{
     read_message, write_frame, CmConnection, EMSG_CLIENT_HEARTBEAT, EMSG_CLIENT_LOGGED_OFF,
 };
+use crate::session::state::SessionState;
 use crate::transport::proxy::ProxyConfig;
 use crate::transport::websocket::SteamWebSocket;
 use crate::{Error, Result};
@@ -82,6 +83,7 @@ enum LoopExit {
 pub struct SessionHandle {
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<SteamMessage>,
+    state: watch::Receiver<SessionState>,
     steam_id: u64,
 }
 
@@ -89,6 +91,18 @@ impl SessionHandle {
     /// The logged-on account's 64-bit `SteamID` (stable across reconnects).
     pub fn steam_id(&self) -> u64 {
         self.steam_id
+    }
+
+    /// A snapshot of the current session state — `LoggedOn` while connected,
+    /// `Connecting` mid-reconnect, `LoggedOff` / `Failed` once it has stopped.
+    pub fn state(&self) -> SessionState {
+        self.state.borrow().clone()
+    }
+
+    /// A [`watch::Receiver`] to await state transitions (e.g. to react when the
+    /// session drops and starts reconnecting). Useful for fleet monitoring.
+    pub fn watch_state(&self) -> watch::Receiver<SessionState> {
+        self.state.clone()
     }
 
     /// Send `req` and await the reply Steam correlates by job id, decoding its
@@ -166,6 +180,7 @@ pub async fn spawn_session(
     let (write, read) = ws.split();
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (evt_tx, _evt_rx) = broadcast::channel(EVENT_CAPACITY);
+    let (state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id });
 
     let driver = SessionDriver {
         write,
@@ -178,6 +193,7 @@ pub async fn spawn_session(
         pending: HashMap::new(),
         commands: cmd_rx,
         events: evt_tx.clone(),
+        state: state_tx,
         config,
     };
     let join = tokio::spawn(driver.run());
@@ -186,6 +202,7 @@ pub async fn spawn_session(
         SessionHandle {
             commands: cmd_tx,
             events: evt_tx,
+            state: state_rx,
             steam_id,
         },
         join,
@@ -204,6 +221,7 @@ struct SessionDriver {
     pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>>,
     commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<SteamMessage>,
+    state: watch::Sender<SessionState>,
     config: SessionConfig,
 }
 
@@ -211,11 +229,35 @@ impl SessionDriver {
     async fn run(mut self) -> Result<()> {
         loop {
             match self.run_connected().await {
-                LoopExit::Shutdown | LoopExit::LoggedOff => return Ok(()),
+                LoopExit::Shutdown => {
+                    let _ = self.state.send(SessionState::LoggedOff {
+                        reason: "session closed".into(),
+                    });
+                    return Ok(());
+                }
+                LoopExit::LoggedOff => {
+                    let _ = self.state.send(SessionState::LoggedOff {
+                        reason: "logged off by Steam".into(),
+                    });
+                    return Ok(());
+                }
                 LoopExit::Disconnected => {
                     // In-flight requests can't be answered on a dead socket.
                     self.fail_all_pending();
-                    self.reconnect().await?;
+                    let _ = self.state.send(SessionState::Connecting);
+                    match self.reconnect().await {
+                        Ok(()) => {
+                            let _ = self.state.send(SessionState::LoggedOn {
+                                steam_id: self.steam_id,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = self.state.send(SessionState::Failed {
+                                error: e.to_string(),
+                            });
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }

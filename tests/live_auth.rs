@@ -255,7 +255,12 @@ async fn cm_logon_over_wss() {
     };
     let (handle, join) = spawn_session(config).await.expect("establish CM session");
     assert!(handle.steam_id() > 0, "expected a real SteamID");
-    eprintln!("OK CM session: steamid={}", handle.steam_id());
+    assert!(handle.state().is_ready(), "session should report LoggedOn");
+    eprintln!(
+        "OK CM session: steamid={} state={}",
+        handle.steam_id(),
+        handle.state().label()
+    );
 
     // 3. Receive an unsolicited event, stay alive across heartbeat intervals,
     //    then shut down cleanly when all handles drop.
