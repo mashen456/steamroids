@@ -49,28 +49,45 @@ pub struct SteamMessage {
 /// `emsg` is the bare [`EMsg`](crate::proto::EMsg) value; the protobuf flag is
 /// applied here. Any extra high bits in `emsg` are masked off.
 pub fn encode<M: Message>(emsg: u32, header: &CMsgProtoBufHeader, body: &M) -> Vec<u8> {
-    encode_raw(emsg, header, &body.encode_to_vec())
+    // Encode the header and body straight into one pre-sized buffer — a single
+    // allocation for the whole frame, no intermediate `Vec`s.
+    let header_len = header.encoded_len();
+    let mut out = Vec::with_capacity(PREFIX_LEN + header_len + body.encoded_len());
+    put_prefix(&mut out, emsg, header_len);
+    encode_into(&mut out, header);
+    encode_into(&mut out, body);
+    out
 }
 
-/// Like [`encode`], but takes an already-serialized protobuf `body`. Useful when
-/// the body bytes were produced elsewhere (e.g. queued for a background driver).
-pub fn encode_raw(emsg: u32, header: &CMsgProtoBufHeader, body: &[u8]) -> Vec<u8> {
-    frame(emsg, &header.encode_to_vec(), body)
+/// Like [`encode`], but takes an already-serialized `body`. Useful when the body
+/// bytes were produced elsewhere (e.g. queued for the background driver, or the
+/// nested payload of a [`gc`](crate::gc) envelope). Generic over the header type
+/// so the CM codec and the GC envelope (different headers) share one path.
+///
+/// Builds the whole frame in a single allocation.
+pub fn encode_raw<H: Message>(emsg: u32, header: &H, body: &[u8]) -> Vec<u8> {
+    let header_len = header.encoded_len();
+    let mut out = Vec::with_capacity(PREFIX_LEN + header_len + body.len());
+    put_prefix(&mut out, emsg, header_len);
+    encode_into(&mut out, header);
+    out.extend_from_slice(body);
+    out
 }
 
-/// Build a frame from an already-serialized header and body — the framing core
-/// shared by the CM codec and the [`gc`](crate::gc) envelope, which only differ
-/// in their header type. The protobuf flag is applied to `msg_type`; any stray
-/// high bits are masked off.
-pub(crate) fn frame(msg_type: u32, header_bytes: &[u8], body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PREFIX_LEN + header_bytes.len() + body.len());
+/// Write the 8-byte frame prefix: the `msg_type` (proto flag applied, stray high
+/// bits masked) and the header length, both little-endian.
+fn put_prefix(out: &mut Vec<u8>, msg_type: u32, header_len: usize) {
     out.extend_from_slice(&((msg_type & EMSG_MASK) | PROTO_MASK).to_le_bytes());
     // A real header is far smaller than u32::MAX; the cast cannot wrap.
     #[allow(clippy::cast_possible_truncation)]
-    out.extend_from_slice(&(header_bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(header_bytes);
-    out.extend_from_slice(body);
-    out
+    out.extend_from_slice(&(header_len as u32).to_le_bytes());
+}
+
+/// Encode a protobuf message onto the end of `out`. Encoding into a `Vec` is
+/// infallible (it grows as needed), so the `EncodeError` path is unreachable.
+fn encode_into<M: Message>(out: &mut Vec<u8>, msg: &M) {
+    msg.encode(out)
+        .expect("encoding a protobuf message into a Vec is infallible");
 }
 
 /// The borrowed parts of a frame after splitting off the prefix: the bare
@@ -87,7 +104,7 @@ pub(crate) struct FrameParts<'a> {
 
 /// Split a frame into its [`FrameParts`] with the protobuf flag stripped from
 /// the message type. Returns `Ok(None)` for a legacy non-protobuf frame. The
-/// byte-level counterpart to [`frame`].
+/// decode-side counterpart to [`encode_raw`].
 ///
 /// # Errors
 ///

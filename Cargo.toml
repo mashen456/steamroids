@@ -85,6 +85,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Loads a git-ignored .env for the opt-in live integration tests. Dev-only —
 # never compiled into the published crate.
 dotenvy = "0.15"
+# Benchmarks (criterion) + prost for building protobuf inputs in bench setup.
+criterion = "0.5"
+prost = "0.13"
+
+[[bench]]
+name = "codec"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"

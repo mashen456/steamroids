@@ -21,6 +21,17 @@ While in `0.x.y`, **any minor version may break the API**.
   logoffs (with the `EResult`), and heartbeats; plus a per-GC span (`appid`) with
   attach / welcome / hello-retry / reconnect-re-announce events. Filter via
   `RUST_LOG` (e.g. `steamroids=debug`).
+- **Benchmarks** — a `criterion` suite (`benches/codec.rs`) over the framing hot
+  path: `codec` encode / encode_raw / decode / try_decode and the GC envelope
+  wrap / unwrap. Run with `cargo bench --bench codec`.
+
+### Changed
+
+- **Zero-allocation framing** — `codec::encode` and `encode_raw` now encode the
+  protobuf header (and body) straight into one pre-sized buffer instead of via
+  intermediate `Vec`s: `encode` drops from 3 allocations to 1, `encode_raw` and
+  the GC envelope from 2 to 1. `encode_raw` is now generic over the header type,
+  so the CM codec and the GC envelope share the one allocation-free path.
 
 ## [0.3.0] - 2026-06-07
 

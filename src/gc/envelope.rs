@@ -53,7 +53,7 @@ impl GcMessage {
 /// it in the relay envelope tagged with `appid`.
 #[must_use]
 pub fn wrap(appid: u32, msgtype: u32, header: &GcHeader, body: &[u8]) -> CMsgGcClient {
-    let payload = codec::frame(msgtype, &header.encode_to_vec(), body);
+    let payload = codec::encode_raw(msgtype, header, body);
     CMsgGcClient {
         appid: Some(appid),
         // The relay's msgtype carries the proto flag too, mirroring the payload.
