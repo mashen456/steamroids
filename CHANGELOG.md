@@ -10,6 +10,11 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
+- **Proxy pool / dead-proxy detection (`pool`)** — `pool::ProxyPool` holds a set
+  of proxies, tracks per-proxy consecutive connect failures, hands out healthy
+  ones round-robin (`acquire`), and surfaces dead exits (`healthy`, `statuses`)
+  so a fleet can rotate them out. Passive: feed it outcomes via `report_success`
+  / `report_failure`. Configurable `HealthPolicy`.
 - **tracing observability** — structured `tracing` spans + events across the
   session and GC wire boundaries: a per-session span (`account`, `steam_id`) with
   events for CM discovery, connect attempts, logon, reconnect/backoff, server-side

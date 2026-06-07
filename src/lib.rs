@@ -44,6 +44,7 @@
 //! - [`friends`] — friends list, add / remove
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
+//! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
 
 #![doc(html_root_url = "https://docs.rs/steamroids/0.3.0")]
 
@@ -54,6 +55,7 @@ pub mod error;
 pub mod friends;
 pub mod gc;
 pub mod persona;
+pub mod pool;
 pub mod proto;
 pub mod session;
 pub mod transport;
