@@ -19,6 +19,7 @@ use prost::Message as _;
 use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tracing::{debug, info};
 
 use crate::codec::{self, SteamMessage};
 use crate::proto::{
@@ -103,17 +104,27 @@ impl CmConnection {
             // Bound each server attempt so a slow/silent proxy exit is skipped
             // rather than stalling the whole connect. Each attempt opens a fresh
             // connection, so the next one routes through a new rotating exit.
+            debug!(server = %server.endpoint, "cm connect attempt");
             let attempt = async {
                 let mut conn = Self::connect(&server.ws_url(), proxy).await?;
                 let logged = conn.logon(account_name, refresh_token).await?;
                 Ok::<_, Error>((conn, logged))
             };
             match timeout(CONNECT_ATTEMPT_TIMEOUT, attempt).await {
-                Ok(Ok(ok)) => return Ok(ok),
+                Ok(Ok((conn, logged))) => {
+                    info!(steam_id = logged.steam_id, server = %server.endpoint, "cm logged on");
+                    return Ok((conn, logged));
+                }
                 // A rejected token won't improve on another server — stop now.
                 Ok(Err(e @ Error::AuthRejected(_))) => return Err(e),
-                Ok(Err(e)) => last_err = Some(e),
-                Err(_) => last_err = Some(Error::Timeout("cm connect attempt")),
+                Ok(Err(e)) => {
+                    debug!(server = %server.endpoint, error = %e, "cm connect attempt failed");
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    debug!(server = %server.endpoint, "cm connect attempt timed out");
+                    last_err = Some(Error::Timeout("cm connect attempt"));
+                }
             }
         }
         Err(last_err.unwrap_or_else(|| Error::Network("no CM servers to connect to".into())))

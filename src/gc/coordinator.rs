@@ -5,6 +5,7 @@ use std::time::Duration;
 use prost::Message;
 use tokio::sync::{broadcast, watch};
 use tokio::time::timeout;
+use tracing::{debug, info, trace, Instrument};
 
 use crate::gc::envelope::{self, GcMessage, EMSG_CLIENT_FROM_GC, EMSG_CLIENT_TO_GC};
 use crate::gc::{GC_CLIENT_HELLO, GC_CLIENT_WELCOME};
@@ -65,15 +66,19 @@ impl GameCoordinator {
         let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
         let (ready_tx, ready_rx) = watch::channel(false);
 
-        tokio::spawn(pump(
-            appid,
-            hello_version,
-            session.clone(),
-            events_in,
-            state_in,
-            events_out.clone(),
-            ready_tx,
-        ));
+        debug!(appid, hello_version, "attaching GC");
+        tokio::spawn(
+            pump(
+                appid,
+                hello_version,
+                session.clone(),
+                events_in,
+                state_in,
+                events_out.clone(),
+                ready_tx,
+            )
+            .instrument(tracing::debug_span!("gc", appid)),
+        );
 
         // Kick the first launch eagerly so callers don't wait a state cycle.
         launch(&session, appid, hello_version).await?;
@@ -272,6 +277,7 @@ async fn pump(
                 ready = false;
                 let _ = ready_tx.send(false);
                 if ready_again {
+                    debug!("re-announcing app to GC after reconnect");
                     hello_attempts = 0;
                     let _ = launch(&session, appid, hello_version).await;
                 }
@@ -281,6 +287,7 @@ async fn pump(
             _ = hello.tick() => {
                 if !ready && hello_attempts < MAX_HELLO_ATTEMPTS {
                     hello_attempts += 1;
+                    trace!(attempt = hello_attempts, "GC hello retry");
                     let _ = send_hello(&session, appid, hello_version).await;
                 }
             }
@@ -294,6 +301,7 @@ async fn pump(
                             Ok(Some(gc_msg)) if gc_msg.appid == appid => {
                                 if gc_msg.msgtype == GC_CLIENT_WELCOME {
                                     ready = true;
+                                    info!("GC welcomed");
                                     let _ = ready_tx.send(true);
                                 }
                                 // Ignored if there are no subscribers.

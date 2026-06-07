@@ -8,6 +8,15 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ## [Unreleased]
 
+### Added
+
+- **tracing observability** — structured `tracing` spans + events across the
+  session and GC wire boundaries: a per-session span (`account`, `steam_id`) with
+  events for CM discovery, connect attempts, logon, reconnect/backoff, server-side
+  logoffs (with the `EResult`), and heartbeats; plus a per-GC span (`appid`) with
+  attach / welcome / hello-retry / reconnect-re-announce events. Filter via
+  `RUST_LOG` (e.g. `steamroids=debug`).
+
 ## [0.3.0] - 2026-06-07
 
 The Game Coordinator milestone: a generic GC layer with CS2 as the first

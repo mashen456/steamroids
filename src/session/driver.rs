@@ -22,6 +22,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use prost::Message as _;
+use tracing::{debug, error, info, trace, warn, Instrument};
 
 use crate::auth::RefreshToken;
 use crate::codec::{self, SteamMessage};
@@ -216,6 +217,7 @@ pub async fn spawn_session(
     let (evt_tx, _evt_rx) = broadcast::channel(EVENT_CAPACITY);
     let (state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id });
 
+    info!(steam_id, account = %config.account_name, "session established");
     let driver = SessionDriver {
         write,
         read,
@@ -230,7 +232,9 @@ pub async fn spawn_session(
         state: state_tx,
         config,
     };
-    let join = tokio::spawn(driver.run());
+    // One span per session so every driver event is correlated by account / id.
+    let span = tracing::info_span!("session", account = %driver.config.account_name, steam_id);
+    let join = tokio::spawn(driver.run().instrument(span));
 
     Ok((
         SessionHandle {
@@ -301,10 +305,15 @@ impl SessionDriver {
                 }
                 LoopExit::Disconnected => {
                     // In-flight requests can't be answered on a dead socket.
+                    warn!(
+                        pending = self.pending.len(),
+                        "session disconnected, reconnecting"
+                    );
                     self.fail_all_pending();
                     let _ = self.state.send(SessionState::Connecting);
                     match self.reconnect().await {
                         Ok(()) => {
+                            info!(steam_id = self.steam_id, "session reconnected");
                             let _ = self.state.send(SessionState::LoggedOn {
                                 steam_id: self.steam_id,
                             });
@@ -320,10 +329,12 @@ impl SessionDriver {
         let _ = self.write.close().await;
         match result {
             Ok(reason) => {
+                info!(%reason, "session ended");
                 let _ = self.state.send(SessionState::LoggedOff { reason });
                 Ok(())
             }
             Err(e) => {
+                error!(error = %e, "session failed");
                 let _ = self.state.send(SessionState::Failed {
                     error: e.to_string(),
                 });
@@ -372,6 +383,7 @@ impl SessionDriver {
                     }
                 }
                 () = tokio::time::sleep(wait) => {
+                    trace!("heartbeat");
                     if send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, &[]).await.is_err() {
                         return LoopExit::Disconnected;
                     }
@@ -387,6 +399,7 @@ impl SessionDriver {
         let mut backoff = INITIAL_BACKOFF;
         loop {
             tokio::time::sleep(backoff).await;
+            debug!(backoff_secs = backoff.as_secs(), "reconnect attempt");
             match CmConnection::establish(
                 &self.config.account_name,
                 self.config.refresh_token.expose(),
@@ -406,8 +419,14 @@ impl SessionDriver {
                     return Ok(());
                 }
                 // A rejected token won't fix itself — give up.
-                Err(e @ Error::AuthRejected(_)) => return Err(e),
-                Err(_transient) => backoff = (backoff * 2).min(MAX_BACKOFF),
+                Err(e @ Error::AuthRejected(_)) => {
+                    error!(error = %e, "reconnect: token rejected, giving up");
+                    return Err(e);
+                }
+                Err(e) => {
+                    debug!(error = %e, "reconnect attempt failed, backing off");
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
             }
         }
     }
@@ -449,9 +468,13 @@ fn classify_logoff(msg: &SteamMessage) -> LoopExit {
         .unwrap_or(0);
     match eresult {
         ERESULT_NO_CONNECTION | ERESULT_SERVICE_UNAVAILABLE | ERESULT_TRY_ANOTHER_CM => {
+            warn!(eresult, "server logged us off (transient, reconnecting)");
             LoopExit::Disconnected
         }
-        other => LoopExit::LoggedOff(format!("logged off by Steam (eresult {other})")),
+        other => {
+            warn!(eresult = other, "server logged us off (terminal)");
+            LoopExit::LoggedOff(format!("logged off by Steam (eresult {other})"))
+        }
     }
 }
 

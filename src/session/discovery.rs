@@ -7,6 +7,7 @@
 //! for [`connect_ws`](crate::transport::connect_ws).
 
 use serde::Deserialize;
+use tracing::debug;
 
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
@@ -67,7 +68,13 @@ pub async fn discover_cm_servers(proxy: Option<&ProxyConfig>) -> Result<Vec<CmSe
         )));
     }
 
-    parse_servers(&body)
+    let servers = parse_servers(&body)?;
+    debug!(
+        count = servers.len(),
+        first = ?servers.first().map(|s| s.endpoint.as_str()),
+        "discovered CM servers"
+    );
+    Ok(servers)
 }
 
 /// JSON shapes returned by `GetCMListForConnect` (only the fields we use).
