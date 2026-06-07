@@ -8,13 +8,45 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ## [Unreleased]
 
-### Fixed
+## [0.3.0] - 2026-06-07
 
-- **CS2 GC logon** — the GC `ClientHello` now carries the app's protocol version.
-  CS2's Game Coordinator rejected a version-less hello with a fatal logon error
-  (`ClientLogonFatalError`), so the welcome never arrived; `cs2::attach` supplies
-  `cs2::GC_HELLO_VERSION`. The pump also re-sends the hello until welcomed (the
-  GC ignores the first one right after launch).
+The Game Coordinator milestone: a generic GC layer with CS2 as the first
+consumer, plus session-level profile/friends features and rotating-proxy
+resilience.
+
+### Added
+
+- **Game Coordinator layer (`gc`)** — app-agnostic GC plumbing: `gc::wrap` /
+  `gc::unwrap` frame messages into the `CMsgClientToGC` / `…FromGC` relay (using
+  the GC's own `CMsgProtoBufHeader`), and `gc::GameCoordinator` rides on a
+  `SessionHandle` to announce the app (`CMsgClientGamesPlayed`), do the
+  `ClientHello` → `ClientWelcome` handshake, and correlate replies. Re-announces
+  the app automatically when the session reconnects.
+- **CS2 helpers (`cs2`)** — `cs2::attach` + `cs2::request_player_profile` return
+  an idiomatic `cs2::PlayerProfile` (account id, level, current XP, competitive
+  rank/wins) with no protobuf types at the boundary, plus `cs2::APP_ID` and
+  `cs2::account_id_from_steam_id`. Example `07_scan_one_profile` and the live
+  `cs2_profile_scan` test pull a real level + XP through the GC.
+- **Profile details (`persona`)** — `persona::request_player_summary` pulls a
+  player's persona name, avatar URL, online status, and current game over the CM
+  session (no `WebAPI` key) via `CMsgClientRequestFriendData` →
+  `CMsgClientPersonaState`; `persona::request_profile_info` adds the public
+  fields (real name, location, summary, account age). `persona::profile_url` /
+  `avatar_url` build the community URLs. Example `08_profile_details`.
+- **Vanity URL resolution** — `persona::resolve_vanity_url` maps a custom URL
+  name back to a `SteamID` keyless via the community XML view. `persona::profile_url`
+  is documented as the always-valid canonical form (Steam redirects it to the
+  vanity); the reverse pretty form needs the `WebAPI` `GetPlayerSummaries`.
+- **Friends (`friends`)** — `friends::request_friends_list` captures the
+  post-login `CMsgClientFriendsList` (with `FriendRelationship`),
+  `friends::add_friend` / `add_friend_by_name` send requests (job-correlated
+  `CMsgClientAddFriend`), and `friends::remove_friend` removes / declines.
+  Example `09_friends`.
+- `Error::Remote` for "Steam processed the request but returned a non-OK
+  `EResult`" (e.g. a rejected `AddFriend`).
+- Vendored CS2 Game Coordinator protos (`protos/csgo/`) compiled into a separate
+  `proto::gc` module to avoid the package-less name clashes with the Steam set
+  (`CMsgProtoBufHeader`, `CMsgClientHello`).
 
 ### Changed
 
@@ -31,34 +63,21 @@ While in `0.x.y`, **any minor version may break the API**.
 - `GameCoordinator::attach` takes a `hello_version` argument; CS2 callers should
   use `cs2::attach`.
 
+### Fixed
+
+- **CS2 GC logon** — the GC `ClientHello` now carries the app's protocol version.
+  CS2's Game Coordinator rejected a version-less hello with a fatal logon error
+  (`ClientLogonFatalError`), so the welcome never arrived; `cs2::attach` supplies
+  `cs2::GC_HELLO_VERSION`. The pump also re-sends the hello until welcomed (the
+  GC ignores the first one right after launch).
+
+## [0.2.0] - 2026-06-06
+
+The live-session milestone: hold a real, self-healing CM connection, plus auth
+hardening for fleet use.
+
 ### Added
 
-- **Friends (`friends`)** — `friends::request_friends_list` captures the
-  post-login `CMsgClientFriendsList` (with `FriendRelationship`),
-  `friends::add_friend` / `add_friend_by_name` send requests (job-correlated
-  `CMsgClientAddFriend`), and `friends::remove_friend` removes / declines.
-  Example `09_friends`.
-- **Vanity URL resolution** — `persona::resolve_vanity_url` maps a custom URL
-  name back to a `SteamID` keyless via the community XML view. `persona::profile_url`
-  is documented as the always-valid canonical form (Steam redirects it to the
-  vanity); the reverse pretty form needs the `WebAPI` `GetPlayerSummaries`.
-- **Profile details (`persona`)** — `persona::request_player_summary` pulls a
-  player's persona name, avatar URL, online status, and current game over the CM
-  session (no `WebAPI` key) via `CMsgClientRequestFriendData` →
-  `CMsgClientPersonaState`; `persona::request_profile_info` adds the public
-  fields (real name, location, summary, account age). `persona::profile_url` /
-  `avatar_url` build the community URLs. Example `08_profile_details`.
-- **Game Coordinator layer (`gc`)** — app-agnostic GC plumbing: `gc::wrap` /
-  `gc::unwrap` frame messages into the `CMsgClientToGC` / `…FromGC` relay (using
-  the GC's own `CMsgProtoBufHeader`), and `gc::GameCoordinator` rides on a
-  `SessionHandle` to announce the app (`CMsgClientGamesPlayed`), do the
-  `ClientHello` → `ClientWelcome` handshake, and correlate replies. Re-announces
-  the app automatically when the session reconnects.
-- **CS2 helpers (`cs2`)** — `cs2::request_player_profile` returns an idiomatic
-  `cs2::PlayerProfile` (account id, level, current XP, competitive rank/wins)
-  with no protobuf types at the boundary, plus `cs2::APP_ID` and
-  `cs2::account_id_from_steam_id`. Example `07_scan_one_profile` and the live
-  `cs2_profile_scan` test pull a real level + XP through the GC.
 - **CM session lifecycle (`session`)** — `session::spawn_session` establishes a
   logged-on CM connection over WSS (`CMsgClientLogon` + refresh token), then runs
   a background driver that heartbeats, multiplexes `request` / `notify` /
@@ -73,9 +92,6 @@ While in `0.x.y`, **any minor version may break the API**.
   WebSocket transport, in addition to SOCKS5 and plain HTTP-CONNECT.
 - Opt-in live integration tests (`tests/live_auth.rs`) that authenticate against
   real Steam, gated by environment variables / CI secrets.
-- Vendored CS2 Game Coordinator protos (`protos/csgo/`) compiled into a separate
-  `proto::gc` module to avoid the package-less name clashes with the Steam set
-  (`CMsgProtoBufHeader`, `CMsgClientHello`).
 
 ### Security
 
@@ -126,6 +142,8 @@ While in `0.x.y`, **any minor version may break the API**.
 - GitHub Actions: fmt, clippy, test, doc, weekly audit.
 - Examples: TOTP generation, proxy connectivity test, WebSocket echo through proxy.
 
-[Unreleased]: https://github.com/mashen456/steamroids/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mashen456/steamroids/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mashen456/steamroids/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/mashen456/steamroids/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mashen456/steamroids/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/mashen456/steamroids/releases/tag/v0.0.1

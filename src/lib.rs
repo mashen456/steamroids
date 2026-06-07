@@ -45,7 +45,7 @@
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 
-#![doc(html_root_url = "https://docs.rs/steamroids/0.1.0")]
+#![doc(html_root_url = "https://docs.rs/steamroids/0.3.0")]
 
 pub mod auth;
 pub mod codec;

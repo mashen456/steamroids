@@ -5,9 +5,9 @@
 [![CI](https://github.com/mashen456/steamroids/actions/workflows/ci.yml/badge.svg)](https://github.com/mashen456/steamroids/actions/workflows/ci.yml)
 [![Audit](https://github.com/mashen456/steamroids/actions/workflows/audit.yml/badge.svg)](https://github.com/mashen456/steamroids/actions/workflows/audit.yml)
 
-**Status:** pre-alpha — `main` carries the full **auth → live CM session → Game
-Coordinator → CS2** stack (crate version still tagged `0.1.0`). API changes
-weekly; don't depend on this for production yet.
+**Status:** `0.3.0` — pre-alpha, with the full **auth → live CM session → Game
+Coordinator → CS2** stack. API changes weekly; don't depend on this for
+production yet.
 
 ## What this is
 
@@ -154,7 +154,7 @@ While this is in pre-alpha, pin to a specific commit:
 
 ```toml
 [dependencies]
-steamroids = { git = "ssh://git@github.com/mashen456/steamroids.git", tag = "v0.1.0" }
+steamroids = { git = "ssh://git@github.com/mashen456/steamroids.git", tag = "v0.3.0" }
 ```
 
 ## Layout
