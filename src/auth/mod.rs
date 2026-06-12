@@ -18,4 +18,4 @@ mod webapi;
 
 pub use credentials::{Credentials, PasswordCredentials, RefreshToken};
 pub use signin::{SignIn, SignInOutcome};
-pub use token_store::{TokenStore, TokenStoreError};
+pub use token_store::{FileTokenStore, TokenStore, TokenStoreError};

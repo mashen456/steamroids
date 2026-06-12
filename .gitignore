@@ -28,3 +28,7 @@ tarpaulin-report.html
 .cargo/config.toml
 # Avatar images downloaded by examples/10_account_dump
 avatar_*.jpg
+
+# Refresh-token store written by examples/11_persist_login (contains secrets)
+steam_tokens.json
+*.tokens.json
