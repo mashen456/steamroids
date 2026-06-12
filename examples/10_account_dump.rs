@@ -104,6 +104,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(g) => println!("in game       : {} (app {})", g.name, g.app_id),
                 None => println!("in game       : —"),
             }
+            // Download the actual image and save it next to the binary's CWD.
+            match persona::fetch_avatar(&s.avatar_url, proxy.as_ref()).await {
+                Ok(bytes) => {
+                    let path = format!("avatar_{account_id}.jpg");
+                    if let Err(e) = std::fs::write(&path, &bytes) {
+                        println!(
+                            "avatar image  : ({} bytes, but save failed: {e})",
+                            bytes.len()
+                        );
+                    } else {
+                        println!("avatar image  : saved {} bytes -> {path}", bytes.len());
+                    }
+                }
+                Err(e) => println!("avatar image  : (download failed: {e})"),
+            }
         }
         Err(e) => println!("(unavailable: {e})"),
     }

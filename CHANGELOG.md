@@ -10,6 +10,9 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
+- **Avatar download** — `persona::fetch_avatar(url, proxy)` fetches the raw JPEG
+  bytes of an avatar from its CDN URL (proxy-aware, keyless). Example
+  `10_account_dump` saves it to a file.
 - **Proxy pool / dead-proxy detection (`pool`)** — `pool::ProxyPool` holds a set
   of proxies, tracks per-proxy consecutive connect failures, hands out healthy
   ones round-robin (`acquire`), and surfaces dead exits (`healthy`, `statuses`)

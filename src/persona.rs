@@ -227,6 +227,35 @@ pub fn avatar_url_sized(hash: &[u8], size: AvatarSize) -> String {
     format!("{AVATAR_HOST}{hex}{suffix}.jpg")
 }
 
+/// Download an avatar image by URL, returning the raw JPEG bytes.
+///
+/// `url` is an avatar URL from [`PlayerSummary::avatar_url`], [`avatar_url`], or
+/// [`avatar_url_sized`] — a public Steam CDN link, so no auth is needed. The
+/// request goes through `proxy` when given. Write the bytes to a file, or decode
+/// them with an image crate.
+///
+/// # Errors
+///
+/// [`Error::Network`] if the CDN is unreachable or returns a non-success status.
+pub async fn fetch_avatar(url: &str, proxy: Option<&ProxyConfig>) -> Result<Vec<u8>> {
+    let response = crate::http::client(proxy)?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| Error::Network(format!("fetch avatar: {e}")))?;
+    if !response.status().is_success() {
+        return Err(Error::Network(format!(
+            "fetch avatar: HTTP {}",
+            response.status()
+        )));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| Error::Network(format!("fetch avatar body: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 /// Lowercase-hex encode a byte slice.
 fn hash_to_hex(hash: &[u8]) -> String {
     use std::fmt::Write as _;

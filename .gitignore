@@ -26,3 +26,5 @@ tarpaulin-report.html
 # not portable. See the file's header comment. The real fix is repairing the
 # 10.0.26100 SDK in the VS Installer.
 .cargo/config.toml
+# Avatar images downloaded by examples/10_account_dump
+avatar_*.jpg
