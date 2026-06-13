@@ -10,12 +10,12 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
-- **`auth::FileTokenStore`** — a batteries-included `TokenStore` backed by a JSON
-  file (one `{account: token}` map for a whole fleet, read-modify-write so
-  accounts don't clobber each other). Persist the refresh token after the
-  one-time password+2FA login, then reuse it. Example `11_persist_login` shows
-  the full cycle: save once, then bring up a session straight from the saved
-  token via `spawn_session` — no password / 2FA / extra `WebAPI` round-trip.
+- **Token persistence example** — `11_persist_login` shows the bring-your-own-
+  storage pattern: get the refresh token (`RefreshToken::expose`), persist it in
+  your own store (DB / Redis / file), and reuse it by handing it to
+  `spawn_session` — no password / 2FA / `WebAPI` round-trip. The library stays
+  storage-agnostic; implement the `TokenStore` trait over your store for
+  automatic load / try / save via `SignIn::execute_with_store`.
 - **Avatar download** — `persona::fetch_avatar(url, proxy)` fetches the raw JPEG
   bytes of an avatar from its CDN URL (proxy-aware, keyless). Example
   `10_account_dump` saves it to a file.
