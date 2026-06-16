@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
@@ -50,6 +51,23 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
 // k_EMsgClientLogOff, from protos/steam/enums_clientserver.proto.
 const EMSG_CLIENT_LOGOFF: u32 = 706;
+
+// One-shot snapshots Steam pushes exactly once after each logon: the full
+// friends list (`k_EMsgClientFriendsList` = 767), friends-groups list (5553)
+// and player-nickname list (5587). The full snapshot always precedes any
+// incremental delta on the same emsg, so the driver caches the **first** body
+// it sees per emsg since the last logon (see [`SnapshotCache`]) — a later delta
+// never overwrites it. This lets [`crate::friends`]'s `request_*` read the
+// snapshot race-free instead of having to subscribe the instant the session
+// comes up, only to find the push already broadcast and gone.
+const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 3] = [767, 5553, 5587];
+
+/// First-wins-per-emsg cache of the [`POST_LOGIN_SNAPSHOT_EMSGS`] bodies for the
+/// current logon. Shared between the driver (the only writer) and every
+/// [`SessionHandle`] (readers); cleared on every (re)logon because Steam
+/// re-pushes the snapshots. Critical sections are a single map op — never held
+/// across an `.await` — so a blocking `std::sync::Mutex` is the right fit.
+type SnapshotCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
 
 // `EResult` values (from `steammessages_base.proto`) that make a server-side
 // logoff *transient*: the session is gone, but reconnecting — through a rotating
@@ -105,6 +123,7 @@ pub struct SessionHandle {
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<SteamMessage>,
     state: watch::Receiver<SessionState>,
+    snapshots: SnapshotCache,
     steam_id: u64,
 }
 
@@ -174,6 +193,23 @@ impl SessionHandle {
         self.events.subscribe()
     }
 
+    /// The cached body of a one-shot post-login snapshot Steam pushes once after
+    /// logon (the full friends list, friends-groups list or player-nickname
+    /// list), or `None` if that snapshot hasn't arrived yet on this logon.
+    ///
+    /// Lets a caller read a snapshot it may have missed on [`Self::subscribe`]
+    /// without racing the post-login push. To stay race-free, **subscribe
+    /// first, then read the cache**: any snapshot not yet cached is still
+    /// guaranteed to reach the subscription. The cache is cleared and repopulated
+    /// on every reconnect. Only the [`POST_LOGIN_SNAPSHOT_EMSGS`] are cached.
+    pub fn cached_snapshot(&self, emsg: u32) -> Option<Vec<u8>> {
+        self.snapshots
+            .lock()
+            .expect("snapshot cache mutex poisoned")
+            .get(&emsg)
+            .cloned()
+    }
+
     /// Cleanly log the session off: send `CMsgClientLogOff` to Steam and tear
     /// the socket down. The session stops afterwards (the driver's `JoinHandle`
     /// resolves to `Ok(())`).
@@ -216,6 +252,7 @@ pub async fn spawn_session(
     let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (evt_tx, _evt_rx) = broadcast::channel(EVENT_CAPACITY);
     let (state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id });
+    let snapshots: SnapshotCache = Arc::new(Mutex::new(HashMap::new()));
 
     info!(steam_id, account = %config.account_name, "session established");
     let driver = SessionDriver {
@@ -230,6 +267,7 @@ pub async fn spawn_session(
         commands: cmd_rx,
         events: evt_tx.clone(),
         state: state_tx,
+        snapshots: snapshots.clone(),
         config,
     };
     // One span per session so every driver event is correlated by account / id.
@@ -241,6 +279,7 @@ pub async fn spawn_session(
             commands: cmd_tx,
             events: evt_tx,
             state: state_rx,
+            snapshots,
             steam_id,
         },
         join,
@@ -290,6 +329,7 @@ struct SessionDriver {
     commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<SteamMessage>,
     state: watch::Sender<SessionState>,
+    snapshots: SnapshotCache,
     config: SessionConfig,
 }
 
@@ -314,6 +354,12 @@ impl SessionDriver {
                     match self.reconnect().await {
                         Ok(()) => {
                             info!(steam_id = self.steam_id, "session reconnected");
+                            // Steam re-pushes the post-login snapshots on the new
+                            // logon; drop the stale ones so the cache repopulates.
+                            self.snapshots
+                                .lock()
+                                .expect("snapshot cache mutex poisoned")
+                                .clear();
                             let _ = self.state.send(SessionState::LoggedOn {
                                 steam_id: self.steam_id,
                             });
@@ -378,7 +424,7 @@ impl SessionDriver {
                 received = read_message(&mut self.read, &mut self.inbox) => {
                     match received {
                         Ok(msg) if msg.emsg == EMSG_CLIENT_LOGGED_OFF => return classify_logoff(&msg),
-                        Ok(msg) => dispatch(&mut self.pending, &self.events, msg),
+                        Ok(msg) => dispatch(&mut self.pending, &self.events, &self.snapshots, msg),
                         Err(_) => return LoopExit::Disconnected,
                     }
                 }
@@ -483,6 +529,7 @@ fn classify_logoff(msg: &SteamMessage) -> LoopExit {
 fn dispatch(
     pending: &mut HashMap<u64, oneshot::Sender<Result<SteamMessage>>>,
     events: &broadcast::Sender<SteamMessage>,
+    snapshots: &SnapshotCache,
     msg: SteamMessage,
 ) {
     // jobid_target defaults to u64::MAX (invalid) when there is no target.
@@ -491,6 +538,16 @@ fn dispatch(
             let _ = reply.send(Ok(msg));
             return;
         }
+    }
+    // Cache the first body seen per post-login-snapshot emsg this logon (the full
+    // list precedes any delta), so `friends::request_*` can read it after the
+    // fact instead of racing the push. `or_insert_with` makes it first-wins.
+    if POST_LOGIN_SNAPSHOT_EMSGS.contains(&msg.emsg) {
+        snapshots
+            .lock()
+            .expect("snapshot cache mutex poisoned")
+            .entry(msg.emsg)
+            .or_insert_with(|| msg.body.clone());
     }
     // Unsolicited, or no waiter — broadcast (ignored if there are no subscribers).
     let _ = events.send(msg);
@@ -511,6 +568,10 @@ mod tests {
         }
     }
 
+    fn empty_snapshots() -> SnapshotCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
     #[tokio::test]
     async fn dispatch_routes_reply_by_jobid() {
         let mut pending = HashMap::new();
@@ -518,7 +579,12 @@ mod tests {
         pending.insert(42u64, tx);
         let (events, _keep) = broadcast::channel(8);
 
-        dispatch(&mut pending, &events, msg(751, Some(42), vec![9]));
+        dispatch(
+            &mut pending,
+            &events,
+            &empty_snapshots(),
+            msg(751, Some(42), vec![9]),
+        );
 
         assert!(pending.is_empty(), "pending entry should be consumed");
         let routed = rx.await.expect("reply delivered").expect("ok message");
@@ -530,7 +596,12 @@ mod tests {
         let mut pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>> = HashMap::new();
         let (events, mut rx) = broadcast::channel(8);
 
-        dispatch(&mut pending, &events, msg(5, None, vec![1, 2]));
+        dispatch(
+            &mut pending,
+            &events,
+            &empty_snapshots(),
+            msg(5, None, vec![1, 2]),
+        );
 
         let got = rx.try_recv().expect("event broadcast");
         assert_eq!(got.body, vec![1, 2]);
@@ -541,8 +612,52 @@ mod tests {
         let mut pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>> = HashMap::new();
         let (events, mut rx) = broadcast::channel(8);
 
-        dispatch(&mut pending, &events, msg(751, Some(7), vec![3]));
+        dispatch(
+            &mut pending,
+            &events,
+            &empty_snapshots(),
+            msg(751, Some(7), vec![3]),
+        );
 
         assert_eq!(rx.try_recv().expect("event broadcast").body, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_caches_first_snapshot_per_emsg() {
+        let mut pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>> = HashMap::new();
+        let (events, _keep) = broadcast::channel(8);
+        let snapshots = empty_snapshots();
+        let friends_list = POST_LOGIN_SNAPSHOT_EMSGS[0];
+
+        // The full snapshot arrives first and is cached…
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(friends_list, None, vec![1, 1]),
+        );
+        // …a later delta on the same emsg must NOT overwrite it (first-wins).
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(friends_list, None, vec![2, 2]),
+        );
+
+        let cached = snapshots.lock().unwrap().get(&friends_list).cloned();
+        assert_eq!(cached, Some(vec![1, 1]), "first snapshot body wins");
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_cache_unlisted_emsg() {
+        let mut pending: HashMap<u64, oneshot::Sender<Result<SteamMessage>>> = HashMap::new();
+        let (events, _keep) = broadcast::channel(8);
+        let snapshots = empty_snapshots();
+
+        // An arbitrary unsolicited emsg (persona state, say) is broadcast but
+        // never cached — only the post-login snapshots are.
+        dispatch(&mut pending, &events, &snapshots, msg(766, None, vec![7]));
+
+        assert!(snapshots.lock().unwrap().is_empty());
     }
 }
