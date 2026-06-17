@@ -201,7 +201,7 @@ impl SessionHandle {
     /// without racing the post-login push. To stay race-free, **subscribe
     /// first, then read the cache**: any snapshot not yet cached is still
     /// guaranteed to reach the subscription. The cache is cleared and repopulated
-    /// on every reconnect. Only the [`POST_LOGIN_SNAPSHOT_EMSGS`] are cached.
+    /// on every reconnect. Only the post-login snapshot emsgs are cached.
     pub fn cached_snapshot(&self, emsg: u32) -> Option<Vec<u8>> {
         self.snapshots
             .lock()
