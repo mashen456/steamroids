@@ -192,7 +192,9 @@ impl CmConnection {
             client_package_version: Some(CLIENT_PACKAGE_VERSION),
             client_language: Some("english".to_string()),
             client_os_type: Some(CLIENT_OS_WINDOWS_10),
-            should_remember_password: Some(false),
+            // Persistent logon: the refresh token is meant to be reused across
+            // sessions, so don't let Steam treat it as a one-shot session token.
+            should_remember_password: Some(true),
             account_name: Some(account_name.to_string()),
             access_token: Some(refresh_token.to_string()),
             supports_rate_limit_response: Some(true),
