@@ -51,35 +51,43 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --no-deps --all-features
 
-  # Live auth tests against real Steam. Runs only on push (not pull_request) so
+  # Live tests against real Steam. Runs only on push (not pull_request) so
   # secrets are never exposed to fork PRs. `--include-ignored` opts in to the
-  # full logins (2FA CM session + the CS2 GC scan). Any account whose secrets
-  # are unset soft-skips, so the job stays green until you configure the secrets
-  # under Settings > Secrets and variables > Actions. For a real CS2 profile
-  # scan, set STEAM_TEST_CS2_* to an account that owns CS2 (distinct from the
-  # 2FA account).
+  # full logins (2FA CM session, CS2 GC scan, friends API). Any account whose
+  # secrets are unset soft-skips, so the job stays green until you configure the
+  # secrets under Settings > Secrets and variables > Actions. For a real CS2
+  # profile scan, set STEAM_TEST_CS2_* to an account that owns CS2 (distinct
+  # from the 2FA account).
+  #
+  # The two live steps run in order on the same runner: live_auth logs Account A
+  # (2FA) in once and parks its refresh token at target/refresh_token_a.txt, then
+  # live_friends reuses that token — so Account A is never logged in twice in the
+  # same TOTP window (Steam rejects a reused 2FA code). Env is hoisted to the job
+  # so both steps see the secrets.
   live:
-    name: live auth
+    name: live (auth + friends)
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    env:
+      STEAM_TEST_2FA_ACCOUNT: ${{ secrets.STEAM_TEST_2FA_ACCOUNT }}
+      STEAM_TEST_2FA_PASSWORD: ${{ secrets.STEAM_TEST_2FA_PASSWORD }}
+      STEAM_TEST_2FA_SHARED_SECRET: ${{ secrets.STEAM_TEST_2FA_SHARED_SECRET }}
+      STEAM_TEST_PLAIN_ACCOUNT: ${{ secrets.STEAM_TEST_PLAIN_ACCOUNT }}
+      STEAM_TEST_PLAIN_PASSWORD: ${{ secrets.STEAM_TEST_PLAIN_PASSWORD }}
+      STEAM_TEST_CS2_ACCOUNT: ${{ secrets.STEAM_TEST_CS2_ACCOUNT }}
+      STEAM_TEST_CS2_PASSWORD: ${{ secrets.STEAM_TEST_CS2_PASSWORD }}
+      STEAM_TEST_CS2_SHARED_SECRET: ${{ secrets.STEAM_TEST_CS2_SHARED_SECRET }}
+      STEAM_TEST_CS2_TARGET_ID: ${{ secrets.STEAM_TEST_CS2_TARGET_ID }}
+      STEAM_TEST_REFRESH_TOKEN: ${{ secrets.STEAM_TEST_REFRESH_TOKEN }}
+      STEAM_TEST_PROXY_URL: ${{ secrets.STEAM_TEST_PROXY_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: live logins
-        env:
-          STEAM_TEST_2FA_ACCOUNT: ${{ secrets.STEAM_TEST_2FA_ACCOUNT }}
-          STEAM_TEST_2FA_PASSWORD: ${{ secrets.STEAM_TEST_2FA_PASSWORD }}
-          STEAM_TEST_2FA_SHARED_SECRET: ${{ secrets.STEAM_TEST_2FA_SHARED_SECRET }}
-          STEAM_TEST_PLAIN_ACCOUNT: ${{ secrets.STEAM_TEST_PLAIN_ACCOUNT }}
-          STEAM_TEST_PLAIN_PASSWORD: ${{ secrets.STEAM_TEST_PLAIN_PASSWORD }}
-          STEAM_TEST_CS2_ACCOUNT: ${{ secrets.STEAM_TEST_CS2_ACCOUNT }}
-          STEAM_TEST_CS2_PASSWORD: ${{ secrets.STEAM_TEST_CS2_PASSWORD }}
-          STEAM_TEST_CS2_SHARED_SECRET: ${{ secrets.STEAM_TEST_CS2_SHARED_SECRET }}
-          STEAM_TEST_CS2_TARGET_ID: ${{ secrets.STEAM_TEST_CS2_TARGET_ID }}
-          STEAM_TEST_REFRESH_TOKEN: ${{ secrets.STEAM_TEST_REFRESH_TOKEN }}
-          STEAM_TEST_PROXY_URL: ${{ secrets.STEAM_TEST_PROXY_URL }}
+      - name: live auth logins
         run: cargo test --test live_auth -- --include-ignored --nocapture
+      - name: live friends api
+        run: cargo test --test live_friends -- --include-ignored --nocapture
 
   # Post the overall CI result to Discord. Push-only (so fork PRs never see the
   # webhook secret); always() so failures are reported too. Skips quietly if the
