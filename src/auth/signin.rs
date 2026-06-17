@@ -18,8 +18,9 @@
 //!   `BeginAuthSessionViaCredentials` → (optional) `UpdateAuthSessionWithSteamGuardCode`
 //!   with a TOTP code derived from the shared secret → poll
 //!   `PollAuthSessionStatus` until we get a refresh token.
-//! - **Refresh-token flow:** decode the `SteamID` from the token's JWT payload
-//!   and call `GenerateAccessTokenForApp` to mint a fresh access token.
+//! - **Refresh-token flow:** decode and validate the token's JWT (`SteamID`,
+//!   expiry) locally and hand it back for a CM `ClientLogon`. `SteamClient`
+//!   tokens can't be redeemed over the `WebAPI`, so no access token is minted.
 //!
 //! No Connection Manager / `ClientLogon` WSS connection is established here —
 //! that lands in `0.2.x` once we have the `EMsg` envelope codec.
@@ -47,14 +48,12 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::debug;
 
-use crate::auth::jwt::steam_id_from_refresh_token;
+use crate::auth::jwt::{refresh_token_claims, steam_id_from_refresh_token};
 use crate::auth::rsa_pw::encrypt_password;
 use crate::auth::token_store::TokenStore;
-use crate::auth::webapi::{map_non_ok_eresult, EResult, FlowKind, HttpMethod, WebApiClient};
+use crate::auth::webapi::{map_non_ok_eresult, EResult, HttpMethod, WebApiClient};
 use crate::auth::{Credentials, RefreshToken};
 use crate::proto::{
-    CAuthenticationAccessTokenGenerateForAppRequest,
-    CAuthenticationAccessTokenGenerateForAppResponse,
     CAuthenticationBeginAuthSessionViaCredentialsRequest,
     CAuthenticationBeginAuthSessionViaCredentialsResponse, CAuthenticationDeviceDetails,
     CAuthenticationGetPasswordRsaPublicKeyRequest, CAuthenticationGetPasswordRsaPublicKeyResponse,
@@ -78,8 +77,8 @@ const PLATFORM_STEAM_CLIENT: i32 = 1;
 const OS_TYPE_WINDOWS_10: i32 = 16;
 // ESessionPersistence_Persistent
 const SESSION_PERSISTENT: i32 = 1;
-// ETokenRenewalType_None
-const TOKEN_RENEWAL_NONE: i32 = 0;
+// Seconds of slack so a token about to expire isn't treated as still valid.
+const TOKEN_EXPIRY_SLACK_SECS: u64 = 60;
 
 // Polling defaults — Steam returns a per-session `interval` (seconds) but
 // some responses leave it zero. Anchor on the bounds steam-user uses.
@@ -185,6 +184,13 @@ impl SignIn {
     }
 
     /// Start a sign-in with a previously-obtained refresh token. Skips 2FA.
+    ///
+    /// `execute` validates the token locally (decodes the JWT, checks it isn't
+    /// expired) and returns it for use with
+    /// [`spawn_session`](crate::session::spawn_session), which logs on over the
+    /// CM. It does **not** mint a web access token: Steam only redeems these
+    /// `SteamClient` tokens over an authenticated CM session, not the `WebAPI`,
+    /// so [`SignInOutcome::Success::access_token`] is `None` for this flow.
     pub fn with_refresh_token(token: impl Into<String>) -> Self {
         Self {
             credentials: Credentials::refresh_token(token),
@@ -225,7 +231,7 @@ impl SignIn {
     pub async fn execute(self) -> Result<SignInOutcome> {
         match &self.credentials {
             Credentials::Password(_) => self.execute_password_flow().await,
-            Credentials::RefreshToken(_) => self.execute_refresh_token_flow().await,
+            Credentials::RefreshToken(_) => self.execute_refresh_token_flow(),
         }
     }
 
@@ -340,47 +346,43 @@ impl SignIn {
         poll_for_token(&client, &begin).await
     }
 
-    async fn execute_refresh_token_flow(self) -> Result<SignInOutcome> {
+    /// Validate a refresh token locally and hand it back for a CM logon.
+    ///
+    /// This library issues **`SteamClient`-platform** refresh tokens (see the
+    /// `with_password` flow). Steam will **not** redeem those over the plain
+    /// `WebAPI` — `GenerateAccessTokenForApp` answers `AccessDenied`; that
+    /// exchange has to ride an *authenticated* CM session. The token is instead
+    /// meant to be used directly in `CMsgClientLogon`, which
+    /// [`spawn_session`](crate::session::spawn_session) does. So here we only
+    /// decode and sanity-check the JWT (Steam ID present, not expired) and
+    /// return the token unchanged. No web access token is minted — `Success`
+    /// carries `access_token: None`.
+    fn execute_refresh_token_flow(self) -> Result<SignInOutcome> {
         let Credentials::RefreshToken(token) = &self.credentials else {
             unreachable!("dispatched by execute()");
         };
 
-        let steam_id = steam_id_from_refresh_token(token.expose())?;
-        let client = WebApiClient::new(self.proxy.as_ref())?;
-
-        let req = CAuthenticationAccessTokenGenerateForAppRequest {
-            refresh_token: Some(token.expose().to_string()),
-            steamid: Some(steam_id),
-            renewal_type: Some(TOKEN_RENEWAL_NONE),
-        };
-        let (er, resp): (_, CAuthenticationAccessTokenGenerateForAppResponse) = client
-            .call("GenerateAccessTokenForApp", HttpMethod::Post, &req)
-            .await?;
-        if er != EResult::OK {
-            if let Some(outcome) = map_non_ok_eresult(er, FlowKind::RefreshToken) {
-                return Ok(outcome);
+        let claims = refresh_token_claims(token.expose())?;
+        if let Some(exp) = claims.exp {
+            if exp.saturating_sub(TOKEN_EXPIRY_SLACK_SECS) <= now_unix() {
+                return Ok(SignInOutcome::TokenRejected);
             }
-            return Err(Error::AuthRejected(format!(
-                "GenerateAccessTokenForApp eresult {}",
-                er.0
-            )));
         }
 
-        let access_token = resp.access_token.filter(|s| !s.is_empty());
-        // With `renewal_type = TOKEN_RENEWAL_NONE` Steam does not rotate the
-        // refresh token, but if a server-side policy ever flips it on, persist
-        // whatever Steam returned in place of the old one. Falling back to the
-        // input keeps the caller's persisted state consistent on no-rotation.
-        let refresh_token = resp
-            .refresh_token
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| token.clone(), RefreshToken::new);
         Ok(SignInOutcome::Success {
-            steam_id,
-            refresh_token,
-            access_token,
+            steam_id: claims.steam_id,
+            refresh_token: token.clone(),
+            access_token: None,
         })
     }
+}
+
+/// Current Unix time in seconds (0 if the clock is before the epoch).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Either continue the flow with `T`, or short-circuit out with a final
@@ -420,7 +422,7 @@ async fn fetch_rsa_key(
         .call("GetPasswordRSAPublicKey", HttpMethod::Get, &req)
         .await?;
     if er != EResult::OK {
-        if let Some(outcome) = map_non_ok_eresult(er, FlowKind::Password) {
+        if let Some(outcome) = map_non_ok_eresult(er) {
             return Ok(EarlyExit::Outcome(outcome));
         }
         return Err(Error::AuthRejected(format!(
@@ -472,7 +474,7 @@ async fn begin_session(
         .call("BeginAuthSessionViaCredentials", HttpMethod::Post, &req)
         .await?;
     if er != EResult::OK {
-        if let Some(outcome) = map_non_ok_eresult(er, FlowKind::Password) {
+        if let Some(outcome) = map_non_ok_eresult(er) {
             return Ok(EarlyExit::Outcome(outcome));
         }
         return Err(Error::AuthRejected(format!(
@@ -547,7 +549,7 @@ async fn resolve_guard(
             )
             .await?;
         if er != EResult::OK {
-            if let Some(outcome) = map_non_ok_eresult(er, FlowKind::Password) {
+            if let Some(outcome) = map_non_ok_eresult(er) {
                 return Ok(EarlyExit::Outcome(outcome));
             }
             return Err(Error::AuthRejected(format!(
@@ -589,7 +591,7 @@ async fn poll_for_token(client: &WebApiClient, begin: &BeginSession) -> Result<S
             .call("PollAuthSessionStatus", HttpMethod::Post, &req)
             .await?;
         if er != EResult::OK {
-            if let Some(outcome) = map_non_ok_eresult(er, FlowKind::Password) {
+            if let Some(outcome) = map_non_ok_eresult(er) {
                 return Ok(outcome);
             }
             return Err(Error::AuthRejected(format!(
@@ -661,6 +663,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::AuthRejected(_)));
+    }
+
+    /// Build a JWT whose payload is `payload_json`. Header / signature are
+    /// placeholders — the flow only decodes the middle segment.
+    fn build_jwt(payload_json: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+        use base64::Engine;
+        let header = B64URL.encode(br#"{"alg":"none"}"#);
+        let payload = B64URL.encode(payload_json.as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[tokio::test]
+    async fn refresh_token_valid_jwt_passes_through_without_webapi() {
+        // exp far in the future (year ~2100); no network is touched.
+        let jwt = build_jwt(r#"{"sub":"76561198000000001","exp":4102444800}"#);
+        let outcome = SignIn::with_refresh_token(&jwt).execute().await.unwrap();
+        match outcome {
+            SignInOutcome::Success {
+                steam_id,
+                refresh_token,
+                access_token,
+            } => {
+                assert_eq!(steam_id, 76_561_198_000_000_001);
+                assert_eq!(refresh_token.expose(), jwt, "token handed back unchanged");
+                assert!(access_token.is_none(), "no web access token is minted");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_token_expired_jwt_is_rejected() {
+        let jwt = build_jwt(r#"{"sub":"76561198000000001","exp":1}"#);
+        let outcome = SignIn::with_refresh_token(&jwt).execute().await.unwrap();
+        assert!(matches!(outcome, SignInOutcome::TokenRejected));
     }
 
     #[test]

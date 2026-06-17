@@ -10,14 +10,14 @@
 //! `examples/04_signin_credentials.rs`. Persist them per-account so subsequent
 //! logins are 2FA-free and (usually) password-free.
 //!
-//! If Steam rejects the token (expired / revoked), the example exits with
-//! status 1 — callers should fall back to the password flow.
+//! If the token is expired, the example exits with status 1 — callers should
+//! fall back to the password flow.
 //!
-//! Validates the token via `IAuthenticationService/GenerateAccessTokenForApp`
-//! on `api.steampowered.com`; on success the Steam ID is read from the JWT
-//! `sub` claim and a fresh access token is returned. Optional `PROXY_URL`
-//! is routed through reqwest. A live CM `ClientLogon` is intentionally out
-//! of scope here — that lands with the 0.2.x Game Coordinator work.
+//! Validates the token locally: the Steam ID is read from the JWT `sub` claim
+//! and the `exp` claim is checked. No web access token is minted — Steam only
+//! redeems these `SteamClient` tokens over an authenticated CM session, not the
+//! `WebAPI`, so `access_token` is `None`. The token is meant to be handed to
+//! `spawn_session` for a CM `ClientLogon` (see `examples/11_persist_login.rs`).
 
 use std::env;
 

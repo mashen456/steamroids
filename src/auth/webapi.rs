@@ -32,8 +32,6 @@ pub(crate) struct EResult(pub i32);
 impl EResult {
     pub(crate) const OK: Self = Self(1);
     pub(crate) const INVALID_PASSWORD: Self = Self(5);
-    pub(crate) const ACCESS_DENIED: Self = Self(15);
-    pub(crate) const EXPIRED: Self = Self(27);
     pub(crate) const ACCOUNT_LOGON_DENIED: Self = Self(63);
     pub(crate) const RATE_LIMIT_EXCEEDED: Self = Self(84);
     pub(crate) const ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR: Self = Self(85);
@@ -49,35 +47,16 @@ pub(crate) enum HttpMethod {
     Post,
 }
 
-/// The flow context the `EResult` mapping is being applied in.
+/// Translate a non-OK [`EResult`] into a [`SignInOutcome`] when the mapping is
+/// well-defined, or `None` when the caller should raise an error instead.
 ///
-/// `EResult` 5 (`InvalidPassword`) means "bad password" during the password
-/// flow but "the refresh token Steam was handed is no good" during the
-/// refresh flow. Same wire code, different user-facing outcome.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum FlowKind {
-    Password,
-    RefreshToken,
-}
-
-/// Translate a non-OK [`EResult`] into a [`SignInOutcome`] when the mapping
-/// is well-defined for the current flow, or `None` when the caller should
-/// raise an error instead.
-pub(crate) fn map_non_ok_eresult(er: EResult, flow: FlowKind) -> Option<SignInOutcome> {
-    // Codes that depend on the flow context.
-    match (er, flow) {
-        (EResult::INVALID_PASSWORD, FlowKind::Password) => {
-            return Some(SignInOutcome::InvalidCredentials);
-        }
-        (
-            EResult::INVALID_PASSWORD | EResult::ACCESS_DENIED | EResult::EXPIRED,
-            FlowKind::RefreshToken,
-        ) => return Some(SignInOutcome::TokenRejected),
-        _ => {}
-    }
-
-    // Codes that are flow-agnostic.
+/// This is used by the **password** sign-in flow (and its Steam Guard / poll
+/// steps). The refresh-token flow no longer hits the `WebAPI` — `SteamClient`
+/// tokens are validated locally and redeemed over the CM — so its rejections
+/// don't pass through here.
+pub(crate) fn map_non_ok_eresult(er: EResult) -> Option<SignInOutcome> {
     match er {
+        EResult::INVALID_PASSWORD => Some(SignInOutcome::InvalidCredentials),
         EResult::ACCOUNT_LOGON_DENIED => Some(SignInOutcome::NeedsEmailGuardCode {
             email_domain: String::new(),
         }),
@@ -205,51 +184,32 @@ mod tests {
     fn ok_does_not_map_to_outcome() {
         // The mapping table is for non-OK only. OK is handled in-line by
         // each flow's success path.
-        assert!(map_non_ok_eresult(EResult::OK, FlowKind::Password).is_none());
-        assert!(map_non_ok_eresult(EResult::OK, FlowKind::RefreshToken).is_none());
+        assert!(map_non_ok_eresult(EResult::OK).is_none());
     }
 
     #[test]
-    fn password_flow_maps_invalid_password() {
-        let o = map_non_ok_eresult(EResult::INVALID_PASSWORD, FlowKind::Password).unwrap();
+    fn maps_invalid_password() {
+        let o = map_non_ok_eresult(EResult::INVALID_PASSWORD).unwrap();
         assert!(matches!(o, SignInOutcome::InvalidCredentials));
     }
 
     #[test]
-    fn refresh_flow_maps_invalid_password_to_token_rejected() {
-        let o = map_non_ok_eresult(EResult::INVALID_PASSWORD, FlowKind::RefreshToken).unwrap();
-        assert!(matches!(o, SignInOutcome::TokenRejected));
-    }
-
-    #[test]
-    fn refresh_flow_maps_expired_and_access_denied() {
-        let a = map_non_ok_eresult(EResult::ACCESS_DENIED, FlowKind::RefreshToken).unwrap();
-        let b = map_non_ok_eresult(EResult::EXPIRED, FlowKind::RefreshToken).unwrap();
-        assert!(matches!(a, SignInOutcome::TokenRejected));
-        assert!(matches!(b, SignInOutcome::TokenRejected));
-    }
-
-    #[test]
     fn account_logon_denied_maps_to_email_guard() {
-        let o = map_non_ok_eresult(EResult::ACCOUNT_LOGON_DENIED, FlowKind::Password).unwrap();
+        let o = map_non_ok_eresult(EResult::ACCOUNT_LOGON_DENIED).unwrap();
         assert!(matches!(o, SignInOutcome::NeedsEmailGuardCode { .. }));
     }
 
     #[test]
     fn need_two_factor_and_mismatch_map_to_mobile_guard() {
-        let a = map_non_ok_eresult(
-            EResult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR,
-            FlowKind::Password,
-        )
-        .unwrap();
-        let b = map_non_ok_eresult(EResult::TWO_FACTOR_CODE_MISMATCH, FlowKind::Password).unwrap();
+        let a = map_non_ok_eresult(EResult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR).unwrap();
+        let b = map_non_ok_eresult(EResult::TWO_FACTOR_CODE_MISMATCH).unwrap();
         assert!(matches!(a, SignInOutcome::NeedsMobileGuardCode));
         assert!(matches!(b, SignInOutcome::NeedsMobileGuardCode));
     }
 
     #[test]
     fn rate_limit_carries_a_hint() {
-        let o = map_non_ok_eresult(EResult::RATE_LIMIT_EXCEEDED, FlowKind::Password).unwrap();
+        let o = map_non_ok_eresult(EResult::RATE_LIMIT_EXCEEDED).unwrap();
         match o {
             SignInOutcome::RateLimited { retry_hint } => assert!(retry_hint.is_some()),
             _ => panic!("expected RateLimited"),
@@ -259,6 +219,6 @@ mod tests {
     #[test]
     fn unknown_eresult_does_not_map() {
         // The caller is expected to convert this into Error::AuthRejected.
-        assert!(map_non_ok_eresult(EResult(42), FlowKind::Password).is_none());
+        assert!(map_non_ok_eresult(EResult(42)).is_none());
     }
 }

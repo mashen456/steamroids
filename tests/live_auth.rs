@@ -47,9 +47,42 @@
 
 use std::time::Duration;
 
-use steamroids::auth::{SignIn, SignInOutcome};
+use steamroids::auth::{RefreshToken, SignIn, SignInOutcome};
 use steamroids::transport::proxy::ProxyConfig;
 use steamroids::Error;
+
+/// Where `cm_logon_over_wss` parks Account A's refresh token so the friends live
+/// test — a separate binary, run as the next CI step — can reuse it instead of
+/// doing a second 2FA login in the same 30s TOTP window, which Steam rejects as
+/// a duplicate code. Same path `tests/live_friends.rs` reads from, so the
+/// handoff is just "first test writes, second test reads."
+const TOKEN_FILE_A: &str = "target/refresh_token_a.txt";
+
+/// Persist a refresh token with mode 0600 (best-effort — on failure the consumer
+/// just falls back to its own login).
+fn persist_token(path: &str, token: &RefreshToken) {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = f.write_all(token.expose().as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, token.expose());
+    }
+}
 
 /// Read an environment variable, loading `.env` first (best-effort). Returns
 /// `None` for missing *or* empty values — CI passes unset secrets through as
@@ -349,6 +382,10 @@ async fn cm_logon_over_wss() {
         }
     };
 
+    // Park the (valid) refresh token so the friends live test reuses it instead
+    // of logging Account A in a second time — CM logon below doesn't consume it.
+    persist_token(TOKEN_FILE_A, &refresh);
+
     // 2. Establish a self-healing session — discover -> connect -> logon all
     //    happen inside spawn_session — and run the background driver.
     let config = SessionConfig {
@@ -396,10 +433,13 @@ async fn cm_logon_over_wss() {
     );
 }
 
-/// The refresh-token round-trip: a single `GenerateAccessTokenForApp` call.
-/// Cheap and low-risk, so this one is *not* ignored.
+/// The refresh-token flow validates the token locally (no WebAPI call) and
+/// hands it back for a CM logon. `SteamClient` tokens can't be redeemed over
+/// the WebAPI, so this flow mints **no** access token — it only asserts the
+/// token decodes to a real Steam ID and isn't reported expired. Offline-safe
+/// (no network), so it's *not* ignored.
 #[tokio::test]
-async fn refresh_token_flow_issues_access_token() {
+async fn refresh_token_flow_validates_token() {
     let Some(token) = env_opt("STEAM_TEST_REFRESH_TOKEN") else {
         eprintln!("SKIP refresh_token_flow: set STEAM_TEST_REFRESH_TOKEN to run");
         return;
@@ -418,16 +458,14 @@ async fn refresh_token_flow_issues_access_token() {
         } => {
             assert!(steam_id > 0, "expected a real SteamID");
             assert!(
-                access_token.is_some(),
-                "refresh flow should mint an access token"
+                access_token.is_none(),
+                "the refresh flow no longer mints a web access token (SteamClient \
+                 tokens are redeemed over the CM, not the WebAPI)"
             );
-            eprintln!("OK refresh-token flow for steam_id {steam_id}");
-        }
-        SignInOutcome::RateLimited { retry_hint } => {
-            eprintln!("SKIP: Steam rate-limited the refresh-token test (retry {retry_hint:?})");
+            eprintln!("OK refresh-token flow validated steam_id {steam_id}");
         }
         SignInOutcome::TokenRejected => {
-            panic!("STEAM_TEST_REFRESH_TOKEN was rejected (expired/revoked) — rotate the secret");
+            panic!("STEAM_TEST_REFRESH_TOKEN is expired — rotate the secret");
         }
         other => panic!("unexpected outcome for refresh-token flow: {other:?}"),
     }
