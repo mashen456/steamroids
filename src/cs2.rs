@@ -78,6 +78,11 @@ pub struct PlayerProfile {
     pub competitive_rank: Option<u32>,
     /// Competitive wins, if known.
     pub competitive_wins: Option<u32>,
+    /// Displayed medals/coins as item definition indexes, in display order.
+    /// Resolve each to an icon via the econ items manifest. Empty if none.
+    pub medals: Vec<u32>,
+    /// The featured (showcased) medal's defindex, if the player set one.
+    pub featured_medal: Option<u32>,
 }
 
 /// Request one player's public CS2 profile through `gc`.
@@ -124,12 +129,18 @@ pub async fn request_player_profile(
         .ok_or_else(|| Error::Network("GC returned an empty PlayersProfile".into()))?;
 
     let ranking = profile.ranking;
+    let (medals, featured_medal) = profile
+        .medals
+        .map(|m| (m.display_items_defidx, m.featured_display_item_defidx))
+        .unwrap_or_default();
     Ok(PlayerProfile {
         account_id: profile.account_id.unwrap_or(account_id),
         level: profile.player_level.unwrap_or(0),
         current_xp: profile.player_cur_xp.unwrap_or(0),
         competitive_rank: ranking.as_ref().and_then(|r| r.rank_id),
         competitive_wins: ranking.as_ref().and_then(|r| r.wins),
+        medals,
+        featured_medal,
     })
 }
 
