@@ -16,26 +16,36 @@ use tracing::debug;
 use url::Url;
 
 use crate::auth::signin::SignInOutcome;
+use crate::error::eresult;
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
 const BASE_URL: &str = "https://api.steampowered.com/IAuthenticationService/";
 
+/// Backoff we suggest on a rate-limited / throttled sign-in. Steam's auth
+/// responses carry no retry-after field, so this is our own fixed default.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
+
 /// Steam's `EResult` enum value, lifted from the `x-eresult` header.
 ///
 /// Wrapped so calling code is forced to acknowledge the integer is a Steam
-/// result code and not a generic HTTP status. Only the codes we actually
-/// branch on are named; everything else is treated as "unknown failure".
+/// result code and not a generic HTTP status. The values come from
+/// [`crate::error::eresult`], the crate's single `EResult` table; only the
+/// codes this flow branches on are named here, and everything else is treated
+/// as "unknown failure".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EResult(pub i32);
 
 impl EResult {
-    pub(crate) const OK: Self = Self(1);
-    pub(crate) const INVALID_PASSWORD: Self = Self(5);
-    pub(crate) const ACCOUNT_LOGON_DENIED: Self = Self(63);
-    pub(crate) const RATE_LIMIT_EXCEEDED: Self = Self(84);
-    pub(crate) const ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR: Self = Self(85);
-    pub(crate) const TWO_FACTOR_CODE_MISMATCH: Self = Self(88);
+    pub(crate) const OK: Self = Self(eresult::OK);
+    pub(crate) const INVALID_PASSWORD: Self = Self(eresult::INVALID_PASSWORD);
+    pub(crate) const ACCOUNT_LOGON_DENIED: Self = Self(eresult::ACCOUNT_LOGON_DENIED);
+    pub(crate) const RATE_LIMIT_EXCEEDED: Self = Self(eresult::RATE_LIMIT_EXCEEDED);
+    pub(crate) const ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR: Self =
+        Self(eresult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR);
+    pub(crate) const ACCOUNT_LOGIN_DENIED_THROTTLE: Self =
+        Self(eresult::ACCOUNT_LOGIN_DENIED_THROTTLE);
+    pub(crate) const TWO_FACTOR_CODE_MISMATCH: Self = Self(eresult::TWO_FACTOR_CODE_MISMATCH);
 }
 
 /// HTTP verb to use for a call.
@@ -60,12 +70,14 @@ pub(crate) fn map_non_ok_eresult(er: EResult) -> Option<SignInOutcome> {
         EResult::ACCOUNT_LOGON_DENIED => Some(SignInOutcome::NeedsEmailGuardCode {
             email_domain: String::new(),
         }),
-        EResult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR | EResult::TWO_FACTOR_CODE_MISMATCH => {
-            Some(SignInOutcome::NeedsMobileGuardCode)
+        EResult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR => Some(SignInOutcome::NeedsMobileGuardCode),
+        // Distinct from "we never sent one": Steam saw a code and refused it.
+        EResult::TWO_FACTOR_CODE_MISMATCH => Some(SignInOutcome::GuardCodeRejected),
+        EResult::RATE_LIMIT_EXCEEDED | EResult::ACCOUNT_LOGIN_DENIED_THROTTLE => {
+            Some(SignInOutcome::RateLimited {
+                retry_hint: Some(RATE_LIMIT_BACKOFF),
+            })
         }
-        EResult::RATE_LIMIT_EXCEEDED => Some(SignInOutcome::RateLimited {
-            retry_hint: Some(Duration::from_secs(60)),
-        }),
         _ => None,
     }
 }
@@ -200,25 +212,42 @@ mod tests {
     }
 
     #[test]
-    fn need_two_factor_and_mismatch_map_to_mobile_guard() {
-        let a = map_non_ok_eresult(EResult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR).unwrap();
-        let b = map_non_ok_eresult(EResult::TWO_FACTOR_CODE_MISMATCH).unwrap();
-        assert!(matches!(a, SignInOutcome::NeedsMobileGuardCode));
-        assert!(matches!(b, SignInOutcome::NeedsMobileGuardCode));
+    fn need_two_factor_maps_to_mobile_guard() {
+        let o = map_non_ok_eresult(EResult::ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR).unwrap();
+        assert!(matches!(o, SignInOutcome::NeedsMobileGuardCode));
+    }
+
+    #[test]
+    fn code_mismatch_is_not_a_missing_secret() {
+        // 88 means Steam saw our TOTP and refused it; reporting it as
+        // "supply a shared secret" sends the caller down the wrong path.
+        let o = map_non_ok_eresult(EResult::TWO_FACTOR_CODE_MISMATCH).unwrap();
+        assert!(matches!(o, SignInOutcome::GuardCodeRejected));
     }
 
     #[test]
     fn rate_limit_carries_a_hint() {
         let o = map_non_ok_eresult(EResult::RATE_LIMIT_EXCEEDED).unwrap();
         match o {
-            SignInOutcome::RateLimited { retry_hint } => assert!(retry_hint.is_some()),
+            SignInOutcome::RateLimited { retry_hint } => {
+                assert_eq!(retry_hint, Some(RATE_LIMIT_BACKOFF));
+            }
             _ => panic!("expected RateLimited"),
         }
     }
 
     #[test]
+    fn login_denied_throttle_is_rate_limited_not_an_error() {
+        // 87 is transient; leaving it unmapped turned a throttle into a hard
+        // Error::AuthRejected.
+        let o = map_non_ok_eresult(EResult::ACCOUNT_LOGIN_DENIED_THROTTLE).unwrap();
+        assert!(matches!(o, SignInOutcome::RateLimited { .. }));
+    }
+
+    #[test]
     fn unknown_eresult_does_not_map() {
-        // The caller is expected to convert this into Error::AuthRejected.
+        // 42 is NoMatch, a code this flow never branches on. The caller is
+        // expected to convert it into Error::AuthRejected.
         assert!(map_non_ok_eresult(EResult(42)).is_none());
     }
 }

@@ -1,6 +1,48 @@
-//! Crate-wide error type.
+//! Crate-wide error type and Steam's `EResult` codes.
 
 use thiserror::Error;
+
+/// Steam's `EResult` codes: the crate's single source of truth.
+///
+/// The vendored protos carry no `EResult` enum, so the values are transcribed
+/// from `SteamKit`'s `Resources/SteamLanguage/eresult.steamd`
+/// (<https://github.com/SteamRE/SteamKit>), which is the canonical listing to
+/// re-verify against. Only the codes the crate actually branches on are named.
+///
+/// Steam sends them as protobuf `int32` fields (message bodies and the routing
+/// header) and as the `x-eresult` header on `WebAPI` responses.
+pub(crate) mod eresult {
+    /// `EResult::OK` (1).
+    pub(crate) const OK: i32 = 1;
+    /// `EResult::Fail` (2): the proto2 default for every `eresult` field.
+    pub(crate) const FAIL: i32 = 2;
+    /// `EResult::NoConnection` (3).
+    pub(crate) const NO_CONNECTION: i32 = 3;
+    /// `EResult::InvalidPassword` (5).
+    pub(crate) const INVALID_PASSWORD: i32 = 5;
+    /// `EResult::Busy` (10).
+    pub(crate) const BUSY: i32 = 10;
+    /// `EResult::Timeout` (16).
+    pub(crate) const TIMEOUT: i32 = 16;
+    /// `EResult::ServiceUnavailable` (20).
+    pub(crate) const SERVICE_UNAVAILABLE: i32 = 20;
+    /// `EResult::DuplicateRequest` (29): the friendship, or our pending request
+    /// for it, already exists.
+    pub(crate) const DUPLICATE_REQUEST: i32 = 29;
+    /// `EResult::TryAnotherCM` (48). **Not 42**, which is `NoMatch`. This is the
+    /// code Valve sends most often when load-balancing a session off a CM.
+    pub(crate) const TRY_ANOTHER_CM: i32 = 48;
+    /// `EResult::AccountLogonDenied` (63): Steam Guard email code required.
+    pub(crate) const ACCOUNT_LOGON_DENIED: i32 = 63;
+    /// `EResult::RateLimitExceeded` (84).
+    pub(crate) const RATE_LIMIT_EXCEEDED: i32 = 84;
+    /// `EResult::AccountLoginDeniedNeedTwoFactor` (85).
+    pub(crate) const ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR: i32 = 85;
+    /// `EResult::AccountLoginDeniedThrottle` (87).
+    pub(crate) const ACCOUNT_LOGIN_DENIED_THROTTLE: i32 = 87;
+    /// `EResult::TwoFactorCodeMismatch` (88).
+    pub(crate) const TWO_FACTOR_CODE_MISMATCH: i32 = 88;
+}
 
 /// Every fallible operation in `steamroids` produces one of these.
 #[derive(Debug, Error)]
@@ -62,6 +104,14 @@ pub enum Error {
     #[error("auth rejected: {0}")]
     AuthRejected(String),
 
+    /// Steam refused a CM logon for a *transient* reason (`TryAnotherCM`,
+    /// `ServiceUnavailable`, `NoConnection`, rate limiting, …). The credentials
+    /// are fine: a fresh connection, through a fresh proxy exit, is expected to
+    /// succeed. Distinct from [`Error::AuthRejected`] so the session driver
+    /// keeps reconnecting instead of killing the session for good.
+    #[error("cm logon retryable: {0}")]
+    LogonRetryable(String),
+
     /// Steam processed a request but returned a non-OK `EResult` (e.g. an
     /// `AddFriend` that was rejected, a GC request that failed). The string
     /// carries the operation and result for diagnostics.
@@ -95,7 +145,7 @@ pub enum Error {
     ///
     /// This is a deliberate sentinel — examples and integration code can
     /// surface a clear "wired but not finished" signal instead of panicking.
-    /// Remove the variant once 0.1.x is feature-complete.
+    /// Nothing in the crate returns it today.
     #[error("not implemented yet: {0}")]
     NotImplemented(&'static str),
 }
