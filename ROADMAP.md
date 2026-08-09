@@ -37,24 +37,24 @@ Transport + crypto. Everything Steam-protocol-agnostic.
 - [x] Vendored `.proto` files from SteamTracking + `prost-build` in `build.rs`
 - [x] CI (fmt, clippy, test, doc, weekly audit)
 
-## v0.1.0 — Cut the auth release 🎯 next, mechanical
+## v0.1.0 — Cut the auth release ✅ done
 
-The WebAPI auth flow already shipped in code (`auth::signin`) but the crate
-metadata still claims `0.0.1` with "no login flow". Close that gap and tag a
-real release. **No new features — just make the repo tell the truth.**
+Closing the gap between the shipped WebAPI auth flow (`auth::signin`) and the
+crate metadata, then tagging a real release. **No new features — just making the
+repo tell the truth.**
 
-- [ ] Bump `Cargo.toml`, `lib.rs` (`html_root_url`), `README` status to `0.1.0`
-- [ ] `CHANGELOG.md` `[0.1.0]` entry: RSA password flow, mobile 2FA, refresh-token
+- [x] Bump `Cargo.toml`, `lib.rs` (`html_root_url`), `README` status to `0.1.0`
+- [x] `CHANGELOG.md` `[0.1.0]` entry: RSA password flow, mobile 2FA, refresh-token
       flow, `SignIn` builder, WebAPI client, proto vendoring
-- [ ] Update `README` "What's in" + lib.rs crate docs to reflect that auth works
-- [ ] Decide on the unused `Error::NotImplemented` sentinel (keep for 0.2.x CM
-      stubs, or drop now)
-- [ ] Tag `v0.1.0`
+- [x] Update `README` "What's in" + lib.rs crate docs to reflect that auth works
+- [x] Decide on the unused `Error::NotImplemented` sentinel: **kept**, still the
+      "wired but not implemented" signal (examples exit `EX_TEMPFAIL` on it)
+- [x] Tag `v0.1.0`
 
 **Acceptance:** `cargo build && cargo test && cargo doc` green; README, CHANGELOG,
 and `Cargo.toml` version all agree; no doc claims a feature the code lacks.
 
-## v0.1.x — Auth hardening 🎯 current focus
+## v0.1.x — Auth hardening
 
 Make the existing WebAPI auth production-grade before building the CM layer on
 top of it. This is where fleet operators actually get burned.
@@ -70,10 +70,16 @@ top of it. This is where fleet operators actually get burned.
 - [~] **Email-Guard** — intentionally **unsupported**: `NeedsEmailGuardCode` is
       surfaced but can't complete; use mobile 2FA or a Guard-disabled account.
       Documented in the README.
-- [ ] **Poll-loop review** — `POLL_MAX_ATTEMPTS`/interval interplay; confirm the
-      120s budget message matches actual worst-case timing.
-- [ ] **Replace hand-rolled `percent_decode`** in `proxy.rs` with a vetted path,
-      or document why the minimal version is sufficient.
+- [x] **Poll-loop review** — the attempt counter is gone; `poll_for_token` runs
+      against a wall-clock `POLL_BUDGET` of 120s, which is exactly what the
+      timeout message says. ✅
+- [x] **Hand-rolled `percent_decode`** in `proxy.rs`: kept, and justified. It
+      decodes to bytes then UTF-8 (not Latin-1), is covered by round-trip tests
+      over non-ASCII input, and saves a dependency for one small need. ✅
+- [x] **Refresh-token flow is offline**: `SteamClient` tokens can't be redeemed
+      over the `WebAPI` (`GenerateAccessTokenForApp` answers `AccessDenied`), so
+      `with_refresh_token` validates the JWT locally and the CM logon is the only
+      thing that can prove a token is live. Documented on `auth::signin`. ✅
 - [ ] `tracing` spans on every WebAPI call boundary with structured fields.
 
 **Acceptance:** a bot logs in via password+2FA, persists its refresh token, and a
@@ -144,14 +150,16 @@ Generic GC plumbing, then CS2 as the first consumer.
 > `CMsgProtoBufHeader` has its own field layout. They therefore compile into a
 > separate [`proto::gc`](crate::proto::gc) module (own `OUT_DIR/gc` output) so
 > the flat namespaces can't clash. The GC payload reuses the CM frame layout, so
-> [`codec::frame`] / `codec::unframe` are shared, just with the GC header type.
+> [`codec::encode_raw`] (generic over the header type) and the crate-private
+> frame splitter are shared, just with the GC header.
 
 - [x] **`CMsgClientGamesPlayed`** — launch the app (730) so the GC routes to us.
       Done in [`gc::GameCoordinator::attach`]. ✅
-- [x] **Generic GC envelope** — `CMsgClientFromGC` / `CMsgClientToGC` en/decode
-      in [`gc::wrap`] / [`gc::unwrap`], app-agnostic, decoding the GC routing
-      header; `GcMessage::jobid_target` exposes GC job ids (CS2 doesn't populate
-      them, so the client correlates by response type instead). ✅
+- [x] **Generic GC envelope** — `CMsgGCClient` en/decode in [`gc::wrap`] /
+      [`gc::unwrap`], sent as `k_EMsgClientToGC` and received as
+      `k_EMsgClientFromGC`; app-agnostic, decoding the GC routing header.
+      `GcMessage::jobid_target` exposes GC job ids (CS2 doesn't populate them, so
+      the client correlates by response type instead). ✅
 - [x] **GC welcome handling** — `attach` sends a `ClientHello` and the pump
       flags readiness on `ClientWelcome`; [`gc::GameCoordinator::wait_ready`]
       awaits it before requests. The pump re-announces the app on reconnect.
@@ -161,7 +169,8 @@ Generic GC plumbing, then CS2 as the first consumer.
       `...PlayersProfile` wired through [`cs2::request_player_profile`]; CS2
       protos vendored and compiled via `build.rs`. ✅
 - [x] **`PlayerProfile` idiomatic Rust type** — [`cs2::PlayerProfile`] (level,
-      XP, competitive rank/wins) with no protobuf leakage at the boundary. ✅
+      XP, competitive rank/wins, displayed + featured medal defindexes) with no
+      protobuf leakage at the boundary. ✅
 
 **Acceptance:** met by `examples/07_scan_one_profile.rs` and the live
 `cs2_profile_scan` test — sign in, bring up a CM session, attach the CS2 GC,
@@ -174,11 +183,22 @@ soft-skips if the GC never welcomes.)
 Stable enough for downstream services to depend on without weekly breakage.
 
 - [ ] **Soak test:** 10+ bots, 1 hour, zero panics, stable memory.
-- [ ] **Bad-IP / dead-proxy detection hook** — surface a proxy as unhealthy.
+- [x] **Bad-IP / dead-proxy detection hook** — [`pool::ProxyPool`] counts
+      consecutive per-proxy connect failures, hands out healthy exits
+      round-robin, and reports dead ones (`healthy`, `statuses`). ✅
 - [ ] **Connection-pooling primitive** (optional) for many sessions per process.
-- [ ] **`tracing` spans on every wire boundary** (CM + GC, not just WebAPI).
-- [ ] **Benchmark suite** (`criterion`) on the hot paths (codec en/decode).
-- [ ] **Zero-allocation audit** of the framing hot path (a stated design goal).
+      (`pool` pools *proxies*, not sessions.)
+- [x] **`tracing` spans on every wire boundary**: a per-session span
+      (`account`, `steam_id`) and a per-GC span (`appid`), with events for
+      discovery, connect, logon, reconnect/backoff, logoffs, heartbeats, and the
+      GC attach / welcome / re-announce. WebAPI boundaries are still bare. ✅
+- [x] **Benchmark suite** (`criterion`) on the hot paths: `benches/codec.rs`
+      covers `encode` / `encode_raw` / `decode` / `try_decode` and the GC
+      envelope wrap / unwrap. `cargo bench --bench codec`. ✅
+- [x] **Allocation audit** of the framing hot path: the floor is **one**
+      allocation, not zero: a frame is built into a single pre-sized `Vec`
+      (`encode` 3 → 1, `encode_raw` and the GC envelope 2 → 1). Returning owned
+      bytes means that last allocation stays. ✅
 
 **Acceptance:** soak test green in CI (or a documented manual run), benchmarks
 tracked, no `unwrap`/`panic` reachable from bad-network input.
@@ -188,7 +208,9 @@ tracked, no `unwrap`/`panic` reachable from bad-network input.
 Semver guarantees kick in. Breaking changes require a major bump.
 
 - [ ] Full rustdoc coverage (`missing_docs` already `warn`).
-- [ ] Public-API surface review — no leaked `prost`/`reqwest`/`tungstenite` types.
+- [ ] Public-API surface review — keep `reqwest` / `tungstenite` internal.
+      `prost::Message` is deliberately public (the `codec`, `SessionHandle`, and
+      `GameCoordinator` generics); the feature modules stay protobuf-free.
 - [ ] Migration guide from `steam-vent` / `steam-user`.
 - [ ] Decision on open-sourcing.
 

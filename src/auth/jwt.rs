@@ -21,17 +21,30 @@ pub(crate) struct RefreshTokenClaims {
 
 /// Decode `jwt`'s middle (payload) segment as JSON.
 ///
+/// The input must be exactly three non-empty dot-separated segments; anything
+/// else is rejected before any base64 work, so an arbitrary string that happens
+/// to contain a decodable run of characters can't pass for a token.
+///
 /// Errors map to [`Error::AuthRejected`] with a short reason — callers surface
 /// this as an `Err`, not a `SignInOutcome` (a malformed JWT is a caller-side
 /// input error, not a Steam-side rejection).
 fn decode_payload(jwt: &str) -> Result<serde_json::Value> {
-    let mid = jwt
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| Error::AuthRejected("jwt: no payload segment".into()))?;
+    let mut segments = jwt.split('.');
+    // exactly 3 segs
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(Error::AuthRejected("jwt: expected 3 segments".into()));
+    };
+    if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        return Err(Error::AuthRejected("jwt: empty segment".into()));
+    }
 
     let bytes = B64URL
-        .decode(mid)
+        .decode(payload)
         .map_err(|e| Error::AuthRejected(format!("jwt b64: {e}")))?;
 
     serde_json::from_slice(&bytes).map_err(|e| Error::AuthRejected(format!("jwt json: {e}")))
@@ -90,6 +103,26 @@ mod tests {
     fn rejects_single_segment() {
         let err = steam_id_from_refresh_token("singleseg").unwrap_err();
         assert!(matches!(err, Error::AuthRejected(_)));
+    }
+
+    #[test]
+    fn rejects_wrong_segment_count() {
+        // Two segments, and four: both are not JWTs even though segment 1
+        // would base64-decode fine.
+        for s in ["aGVhZGVy.e30", "aGVhZGVy.e30.sig.extra"] {
+            let err = steam_id_from_refresh_token(s).unwrap_err();
+            assert!(matches!(err, Error::AuthRejected(_)), "accepted {s}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_segment() {
+        // An empty payload decodes to zero bytes; an empty header or
+        // signature means the string was never a token to begin with.
+        for s in ["aGVhZGVy..sig", ".e30.sig", "aGVhZGVy.e30."] {
+            let err = steam_id_from_refresh_token(s).unwrap_err();
+            assert!(matches!(err, Error::AuthRejected(_)), "accepted {s}");
+        }
     }
 
     #[test]

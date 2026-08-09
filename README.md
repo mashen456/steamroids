@@ -19,10 +19,10 @@ The Rust Steam ecosystem today is `steam-vent` (capable but pre-1.0, no native p
 
 Design priorities, in order:
 
-1. **Stability under fleet load** — zero-allocation hot paths, deterministic state machines, no panics on bad-network inputs.
-2. **Proxy support is first-class** — SOCKS5, HTTP-CONNECT, and `https://`, with auth, baked into the transport layer; the session self-heals across flaky **rotating** proxies (skip a bad exit, reconnect onto a fresh one).
-3. **Small dependency surface** — no Steam-specific dependencies, only foundational crates (tokio, rustls, prost).
-4. **Embedded-friendly API** — clean re-exports, no leaked protobuf types, idiomatic Rust at the boundary.
+1. **Stability under fleet load**: single-allocation framing on the hot path, a self-healing session driver, and bad-network input that parses into a `Result` rather than panicking (bounded `Multi` batches, bounded proxy handshakes, length-checked frames).
+2. **Proxy support is first-class**: SOCKS5, HTTP-CONNECT, and `https://`, with auth, baked into the transport layer; the session self-heals across flaky **rotating** proxies (skip a bad exit, reconnect onto a fresh one).
+3. **Small dependency surface**: no Steam-specific dependencies, only foundational crates (tokio, rustls, prost).
+4. **Idiomatic types at the feature boundary**: `cs2`, `persona`, and `friends` return plain Rust structs, with no protobuf in their signatures. The layers underneath (`codec`, `SessionHandle::request` / `notify`, `GameCoordinator::send`) are generic over `prost::Message`, so `prost` is a public dependency by design.
 
 ## What's in (current `main`)
 
@@ -31,8 +31,12 @@ Coordinator → CS2** — keyless (no Steam Web API key) and proxy-aware through
 
 **Auth & transport**
 
-- ✅ **WebAPI sign-in** — password + mobile 2FA (TOTP) or stored refresh token
-  via the `SignIn` builder; RSA password encryption, `EResult` → outcome mapping
+- ✅ **WebAPI sign-in**: password + mobile 2FA (TOTP) via the `SignIn` builder;
+  RSA password encryption, `EResult` → outcome mapping
+- ✅ **Refresh-token reuse**: `SignIn::with_refresh_token` validates a stored
+  token offline (JWT shape + `exp`) and hands it straight to the CM logon. Steam
+  won't redeem a `SteamClient` token over the `WebAPI`, so no access token is
+  minted and a *revoked* token only surfaces at `spawn_session`
 - ✅ **Refresh-token persistence** hook (`auth::TokenStore`) — reuse a stored
   token, fall back to the password flow, persist the issued token
 - ✅ Steam **TOTP** code generation (HMAC-SHA1 / base-26 variant)
@@ -40,16 +44,19 @@ Coordinator → CS2** — keyless (no Steam Web API key) and proxy-aware through
   with auth; resilient to flaky **rotating** proxies (per-attempt connect
   timeouts, retry onto fresh exits)
 - ✅ WebSocket + TLS transport; secret-redacting `Debug` on credentials/tokens
+- ✅ **Proxy pool** (`pool::ProxyPool`): round-robin hand-out, per-proxy failure
+  counting, dead-exit reporting for fleet rotation
 - ✅ Vendored Steam protobufs + `prost-build` codegen (`crate::proto`)
 
 **Live CM session** (`session`)
 
 - ✅ `spawn_session` — logged-on CM session over WSS (`ClientLogon` + refresh
   token) on a background driver with heartbeat
-- ✅ Job-id-multiplexed `request` / `notify` / `subscribe`
+- ✅ Job-id-multiplexed `request` / `notify` / `subscribe`, with a per-request
+  timeout and a non-OK reply `EResult` surfaced as `Error::Remote`
 - ✅ **Self-healing**: reconnect with backoff on drops, transient server-side
-  logoffs (`TryAnotherCM` / `ServiceUnavailable`) reconnect, observable
-  `SessionState`, clean logoff
+  logoffs (`TryAnotherCM` / `ServiceUnavailable`) reconnect, a read-idle
+  watchdog for dead-but-open sockets, observable `SessionState`, clean logoff
 - ✅ `EMsg` frame codec (`codec`)
 
 **Game Coordinator** (`gc`, `cs2`)
@@ -58,16 +65,26 @@ Coordinator → CS2** — keyless (no Steam Web API key) and proxy-aware through
   `ClientHello` → `ClientWelcome` handshake, reply correlation, re-announce on
   reconnect
 - ✅ **CS2 player-profile scan** → idiomatic `cs2::PlayerProfile` (level, XP,
-  competitive rank) via `cs2::attach` + `cs2::request_player_profile`
+  competitive rank/wins, displayed medals + featured medal) via `cs2::attach` +
+  `cs2::request_player_profile`
 
 **Persona / profile / friends** (`persona`, `friends`)
 
 - ✅ `persona::request_player_summary` — name, avatar, online status, current
   game; `request_profile_info` — real name, location, summary, account age
-- ✅ `persona::resolve_vanity_url` — custom URL → `SteamID` (keyless); `profile_url`
-  / `avatar_url` helpers
-- ✅ `friends::request_friends_list`, `add_friend` / `add_friend_by_name`,
-  `remove_friend`
+- ✅ `persona::resolve_vanity_url`: custom URL → `SteamID` (keyless);
+  `profile_url` / `avatar_url` / `avatar_url_sized` helpers, plus
+  `fetch_avatar` for the raw JPEG bytes
+- ✅ **Friends**: `friends::request_friends_list` (the post-login snapshot,
+  cached by the session so you can't miss it), `add_friend` (by `SteamID`; there
+  is deliberately no `add_friend_by_name`, since Steam account names aren't
+  unique), `remove_friend`
+- ✅ **Nicknames**: `set_nickname` / `clear_nickname` / `request_nicknames`
+- ✅ **Visibility**: `hide_friend` / `unhide_friend`
+- ✅ **Chat**: `send_message` / `send_typing`
+- ✅ **Friend groups**: `create_friends_group` / `delete_friends_group` /
+  `rename_friends_group`, `add_friends_to_group` / `remove_friends_from_group`,
+  `request_friends_groups_list`
 
 **Not supported**
 
@@ -110,6 +127,13 @@ STEAM_ACCOUNT="bot01" STEAM_PASSWORD="hunter2" cargo run --example 08_profile_de
 # List friends (with names), resolve a vanity URL, optionally add/remove
 STEAM_ACCOUNT="bot01" STEAM_PASSWORD="hunter2" \
   RESOLVE_VANITY="gabelogannewell" cargo run --example 09_friends
+
+# Dump everything fetchable about one account (persona, profile, friends, CS2)
+STEAM_ACCOUNT="bot01" STEAM_PASSWORD="hunter2" cargo run --example 10_account_dump
+
+# Log in once, persist the refresh token, reuse it on later runs
+STEAM_ACCOUNT="bot01" STEAM_PASSWORD="hunter2" SHARED_SECRET="<base64>" \
+  TOKEN_FILE="refresh_token.txt" cargo run --example 11_persist_login
 ```
 
 ## Quick tour (library)
@@ -161,17 +185,19 @@ steamroids = { git = "ssh://git@github.com/mashen456/steamroids.git", tag = "v0.
 
 ```
 src/
-├── lib.rs               — crate root, re-exports
-├── error.rs             — Error enum
-├── proto.rs             — generated protobuf types (Steam + GC, built from protos/)
-├── codec.rs             — EMsg frame en/decoder (shared by CM + GC)
-├── transport/           — WebSocket + TLS + Proxy (SOCKS5 / HTTP / https)
-├── auth/                — Credentials, TOTP, RSA, JWT, WebAPI sign-in, TokenStore
-├── session/             — live CM session: discovery, connection, driver, state
-├── gc/                  — generic Game Coordinator envelope + GameCoordinator
-├── cs2.rs               — CS2 consumer of the GC layer (PlayerProfile)
-├── persona.rs           — player summary / profile info / vanity URL resolution
-└── friends.rs           — friends list, add / remove
+├── lib.rs               # crate root, re-exports
+├── error.rs             # Error enum
+├── proto.rs             # generated protobuf types (Steam + GC, built from protos/)
+├── codec.rs             # EMsg frame en/decoder (shared by CM + GC)
+├── http.rs              # crate-private shared reqwest client + proxy setup
+├── transport/           # WebSocket + TLS + Proxy (SOCKS5 / HTTP / https)
+├── auth/                # Credentials, TOTP, RSA, JWT, WebAPI sign-in, TokenStore
+├── session/             # live CM session: discovery, connection, driver, state
+├── gc/                  # generic Game Coordinator envelope + GameCoordinator
+├── cs2.rs               # CS2 consumer of the GC layer (PlayerProfile)
+├── persona.rs           # player summary / profile info / vanity URL / avatars
+├── friends.rs           # friends, nicknames, visibility, chat, friend groups
+└── pool.rs              # proxy pool + dead-proxy detection for fleets
 ```
 
 ## License

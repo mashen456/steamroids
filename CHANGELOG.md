@@ -8,8 +8,50 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ## [Unreleased]
 
+> **Public API breaks in this cycle**, all detailed below: `add_friend_by_name`
+> is gone (*Removed*); `SignIn::with_refresh_token` makes no network call and
+> never yields an `access_token` (*Changed*); `SessionState::Disconnected` /
+> `Authenticating` are gone and `SessionState` is not `#[non_exhaustive]`, so an
+> exhaustive downstream `match` breaks (*Removed*); `SessionHandle::request` now
+> times out and turns a non-OK reply `EResult` into `Error::Remote` where it
+> used to hand back an empty response; `SessionHandle::notify` can now return
+> `Err`; `CmConnection::run` / `send_heartbeat` are gone (*Removed*).
+
 ### Added
 
+- **Friends expansion (`friends`)**: the module grew from "list / add / remove"
+  to 16 public functions, all keyless over the CM session:
+  - *Nicknames*: `set_nickname` / `clear_nickname` (job-correlated
+    `CMsgClientSetPlayerNickname` to the AM) and `request_nicknames`, plus the
+    `Nickname` type. Local to the account: only you see them.
+  - *Visibility*: `hide_friend` / `unhide_friend` (`CMsgClientHideFriend`).
+    Fire-and-forget; the effect shows up in a later friends list.
+  - *Chat*: `send_message` and `send_typing` (`CMsgClientFriendMsg`), plus
+    `ChatEntryType`. Also fire-and-forget: `Ok` means the frame was written, not
+    that Steam accepted or delivered it.
+  - *Friend groups* (the custom tags in the friends list):
+    `create_friends_group` / `delete_friends_group` / `rename_friends_group`,
+    `add_friends_to_group` / `remove_friends_from_group`, and
+    `request_friends_groups_list`, plus the `FriendsGroup` / `NewFriendsGroup`
+    types. The add/remove wire messages carry a single `SteamID`, so those two
+    loop one job-correlated request per id and short-circuit on the first
+    rejection.
+  - Covered by the opt-in live test `tests/live_friends.rs`.
+- **Post-login snapshot cache (`session`)**: Steam pushes the friends list
+  (`767`), friends-groups list (`5553`) and nickname list (`5587`) exactly once
+  per logon. The driver now caches the first body it sees per emsg (a later
+  incremental delta never overwrites it) and clears the cache on every relogon,
+  since Steam re-pushes. Read it with `SessionHandle::cached_snapshot(emsg)`.
+  `friends::request_friends_list` / `request_nicknames` /
+  `request_friends_groups_list` subscribe first and then read the cache, so they
+  no longer have to be called the instant `spawn_session` returns to catch the
+  push.
+- **CS2 medals**: `cs2::PlayerProfile::medals` (displayed medal/coin item
+  definition indexes, in display order) and `cs2::PlayerProfile::featured_medal`
+  (the showcased one). Resolve either through the econ items manifest.
+- **Avatar sizes**: `persona::AvatarSize` (32 / 64 / 184 px) and
+  `persona::avatar_url_sized`; `persona::avatar_url` is now the `Full` case of
+  it.
 - **Token persistence example** — `11_persist_login` shows the bring-your-own-
   storage pattern: get the refresh token (`RefreshToken::expose`), persist it in
   your own store (DB / Redis / file), and reuse it by handing it to
@@ -33,14 +75,142 @@ While in `0.x.y`, **any minor version may break the API**.
 - **Benchmarks** — a `criterion` suite (`benches/codec.rs`) over the framing hot
   path: `codec` encode / encode_raw / decode / try_decode and the GC envelope
   wrap / unwrap. Run with `cargo bench --bench codec`.
+- `Error::LogonRetryable(String)` for a *transient* CM logon rejection
+  (`NoConnection`, `Busy`, `Timeout`, `ServiceUnavailable`, `TryAnotherCM`,
+  `RateLimitExceeded`). `CmConnection::logon` / `establish` and `spawn_session`'s
+  initial connect used to report these as `Error::AuthRejected`, which made a
+  busy CM indistinguishable from a dead account.
+- `SessionHandle::request_with_timeout(emsg, req, timeout)` for a request budget
+  other than the default.
+- `GameCoordinator::request_matching(.., accept)`: a `request` variant that keeps
+  waiting until a predicate accepts the decoded reply, so an empty or foreign GC
+  reply cannot satisfy the wrong request.
+- `friends::AddedFriend::eresult`: `1` (`OK`) for a newly sent or accepted
+  request, `29` (`DuplicateRequest`) when the relationship already existed.
+- `friends::ChatEntryType::raw` / `from_raw`.
+- `SignInOutcome::GuardCodeRejected` for `EResult` 88 (`TwoFactorCodeMismatch`):
+  Steam saw a code and refused it, which re-prompting cannot fix.
+- `test-seam` cargo feature, exposing `SessionHandle::for_test` /
+  `GameCoordinator::for_test` (and `session::driver::Command`) to out-of-crate
+  tests. Off by default, so the seam is not compiled into a normal build.
 
 ### Changed
 
-- **Zero-allocation framing** — `codec::encode` and `encode_raw` now encode the
+- **The refresh-token sign-in flow no longer touches the `WebAPI`.** This crate
+  issues `SteamClient`-platform tokens and Steam won't redeem those over the
+  plain `WebAPI`: `GenerateAccessTokenForApp` answers `AccessDenied`, and that
+  exchange has to ride an authenticated CM session. `SignIn::with_refresh_token`
+  therefore validates the token locally (JWT shape, `SteamID`, `exp`) and hands
+  it back for `spawn_session` to present in `CMsgClientLogon`. Consequences for
+  callers: the flow makes **no** network call, so `.proxy(..)` on it is a no-op;
+  `SignInOutcome::Success::access_token` is always `None`; and
+  `SignInOutcome::TokenRejected` now means "expired", never "revoked". A revoked
+  token looks valid here and is only rejected later, by the CM, as
+  `Error::AuthRejected` out of `spawn_session`, which is the signal a fleet must
+  treat as "discard the stored token and re-run the password flow".
+- **Single-allocation framing**: `codec::encode` and `encode_raw` now encode the
   protobuf header (and body) straight into one pre-sized buffer instead of via
   intermediate `Vec`s: `encode` drops from 3 allocations to 1, `encode_raw` and
   the GC envelope from 2 to 1. `encode_raw` is now generic over the header type,
   so the CM codec and the GC envelope share the one allocation-free path.
+- `SessionHandle::request` now fails with `Error::Timeout` when Steam does not
+  answer inside a default budget, and with `Error::Remote` when the reply
+  *header* carries a non-OK `EResult`. A Steam-side failure previously decoded
+  as a default/empty response and read as success.
+- `SessionHandle::notify` awaits the actual socket write instead of returning as
+  soon as the command is queued, so it can now return `Err`.
+- **Read-idle watchdog**: the driver reconnects when no inbound frame of any
+  kind, control or application, has arrived for several heartbeat intervals
+  (with a floor, in case Steam hands out a very short interval). Steam never
+  acks the CM-level heartbeat, so a dead-but-open exit (the classic
+  rotating-proxy failure) has no other symptom.
+- `GameCoordinator::request` awaits the GC welcome inside its own deadline, and
+  decodes the reply inside the deadline window. A request against a GC that never
+  welcomes us now fails with `Error::Timeout("GC welcome")` and writes nothing.
+- Dropping the last `GameCoordinator` clone now stops its pump.
+- `cs2::request_player_profile` discards an empty or foreign `PlayersProfile`
+  instead of returning it, so `PlayerProfile::account_id` is always the requested
+  account. An unknown account now fails with `Error::Timeout` after 15s.
+- `persona::request_profile_info` returns `Error::Remote` on a non-OK `EResult`
+  (including an absent one, whose proto2 default is `2` = `Fail`) instead of an
+  all-`None` `ProfileInfo`.
+- `persona::request_player_summary` no longer builds a summary out of an
+  unrelated unsolicited push that happens to mention the same `SteamID`; a
+  partial answer now runs into the existing 10s `Error::Timeout`.
+- `persona::resolve_vanity_url` returns `Error::Network` for a non-success HTTP
+  status (429, 5xx, …) instead of `Ok(None)`. `Ok(None)` now means only "no such
+  vanity URL".
+- `friends::add_friend` treats only `EResult` `1` and `29` as success; every
+  other result is `Error::Remote`, even when Steam still identified the target.
+- `friends::create_friends_group` errors when an OK response omits `groupid`
+  instead of reporting group id `0`.
+- `friends::request_nicknames` / `request_friends_groups_list` skip a push
+  carrying `removal` / `bremoval`, which is an incremental delta rather than the
+  post-login snapshot.
+- `ProxyConfig::host` stores an IPv6 literal without the URL's square brackets
+  (`socks5://[::1]:1080` yields `::1`). `ProxyConfig::parse` now always honours a
+  port written in the URL (`http://host:80` is 80, not 8080), keeps
+  username-only and password-only userinfo as credentials, and percent-decodes
+  userinfo as UTF-8 rather than Latin-1.
+- `transport::connect_ws` bounds the proxy branch at 45s
+  (`Error::Timeout("proxy connect")`); the HTTP-CONNECT path gives up after 64
+  response header lines instead of reading unbounded.
+- Auth: `EResult` 87 (`AccountLoginDeniedThrottle`) maps to
+  `SignInOutcome::RateLimited` instead of falling through to
+  `Error::AuthRejected`; `SignIn::execute_with_store` falls through to the
+  password flow when a stored token fails to decode; `poll_for_token` uses a
+  wall-clock 120s budget rather than 24 attempts, so a large Steam-supplied poll
+  interval no longer stretches the flow to ~23 minutes.
+
+### Fixed
+
+- **Session teardown frees its callers.** Every exit from the driver's connected
+  loop (a transport drop, a server-side logoff, a `logoff()` / dropped-handles
+  shutdown, or a fatal reconnect) now fails the in-flight requests instead of
+  holding them until the driver task itself drops. The goodbye `Close` write is
+  bounded too: a half-open proxy exit could leave the flush pending forever,
+  stranding the `JoinHandle` and every `SessionState` watcher behind it.
+- **Coalesced `Multi` batches are bounded**: the driver refuses a batch that
+  declares or inflates past 8 MiB, or that nests more than 4 deep. A crafted or
+  corrupt `Multi` could previously drive unbounded allocation and recursion.
+- **JWT parsing** rejects anything that is not exactly 3 non-empty dot-separated
+  segments, instead of parsing on a best-effort basis. Reachable through
+  `SignIn::with_refresh_token`.
+- `SignInOutcome::RateLimited::retry_hint` is documented as this crate's own
+  fixed 60s default, not a value Steam supplied. The value is unchanged.
+- **Doc drift in `README`, `examples/`, `protos/` and `ROADMAP`.** The `README`
+  no longer advertises `friends::add_friend_by_name` (removed API; this was the
+  one doc bug that broke user code on paste), no longer claims "zero-allocation
+  hot paths"
+  (the framing floor is one allocation), "deterministic state machines"
+  (`SessionState` is an observability projection, not a state machine), or "no
+  leaked protobuf types" (`prost::Message` is a public bound on `codec`,
+  `SessionHandle::request` / `notify`, and `GameCoordinator::send`; it is the
+  *feature* modules that stay protobuf-free). The `README` layout tree now lists
+  `pool.rs` and `http.rs` and describes `friends` as what it is. `examples/`
+  documents `07` to `11` instead of promising an `06`, and no longer claims the
+  refresh-token example calls `GenerateAccessTokenForApp`. `protos/` lists all
+  18 vendored files and stops calling the CS2 set future work. `ROADMAP` marks
+  `v0.1.0` shipped, ticks the `v0.4.x` items that landed (benchmarks,
+  dead-proxy detection, wire-boundary tracing spans, the allocation audit), and
+  drops the reference to a `codec::frame` that never existed. The GC relay is
+  named correctly throughout: the message is `CMsgGCClient`, carried as the
+  `k_EMsgClientToGC` / `k_EMsgClientFromGC` `EMsg`s.
+
+### Removed
+
+- **`friends::add_friend_by_name`** (shipped in `0.3.0`). Steam account names
+  are not unique, and `CMsgClientAddFriend` with `accountname_or_email_to_add`
+  resolves an ambiguous match, so the wrong account could be befriended. A
+  `SteamID64` is now the only supported target for `friends::add_friend`;
+  resolve a vanity URL with `persona::resolve_vanity_url` first if that's all
+  you have.
+- `SessionState::Disconnected` and `SessionState::Authenticating`. Neither was
+  ever emitted by any code path. `SessionState` is not `#[non_exhaustive]`, so a
+  downstream exhaustive `match` (and serde payloads naming either variant)
+  breaks.
+- `CmConnection::run` and `CmConnection::send_heartbeat`, both callerless. The
+  driver's own loop is the supported path.
 
 ## [0.3.0] - 2026-06-07
 
@@ -51,8 +221,9 @@ resilience.
 ### Added
 
 - **Game Coordinator layer (`gc`)** — app-agnostic GC plumbing: `gc::wrap` /
-  `gc::unwrap` frame messages into the `CMsgClientToGC` / `…FromGC` relay (using
-  the GC's own `CMsgProtoBufHeader`), and `gc::GameCoordinator` rides on a
+  `gc::unwrap` frame messages into a `CMsgGCClient` relay envelope (using the
+  GC's own `CMsgProtoBufHeader`), sent as `k_EMsgClientToGC` and received as
+  `k_EMsgClientFromGC`, and `gc::GameCoordinator` rides on a
   `SessionHandle` to announce the app (`CMsgClientGamesPlayed`), do the
   `ClientHello` → `ClientWelcome` handshake, and correlate replies. Re-announces
   the app automatically when the session reconnects.
@@ -73,9 +244,10 @@ resilience.
   vanity); the reverse pretty form needs the `WebAPI` `GetPlayerSummaries`.
 - **Friends (`friends`)** — `friends::request_friends_list` captures the
   post-login `CMsgClientFriendsList` (with `FriendRelationship`),
-  `friends::add_friend` / `add_friend_by_name` send requests (job-correlated
-  `CMsgClientAddFriend`), and `friends::remove_friend` removes / declines.
-  Example `09_friends`.
+  `friends::add_friend` sends requests (job-correlated `CMsgClientAddFriend`),
+  and `friends::remove_friend` removes / declines. Example `09_friends`.
+  (`0.3.0` also shipped an `add_friend_by_name`; it has since been removed, see
+  `[Unreleased]`.)
 - `Error::Remote` for "Steam processed the request but returned a non-OK
   `EResult`" (e.g. a rejected `AddFriend`).
 - Vendored CS2 Game Coordinator protos (`protos/csgo/`) compiled into a separate

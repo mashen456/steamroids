@@ -15,9 +15,11 @@ use tracing::debug;
 
 use crate::error::Error;
 use crate::transport::proxy::{connect_via_proxy, ProxyConfig};
-use crate::transport::{tls_connector, AsyncStream};
+use crate::transport::{authority, tls_connector, unbracket, AsyncStream};
 
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+// proxy connect is multi-phase (tcp, tls, CONNECT, reply), so looser than direct
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -34,10 +36,12 @@ pub type SteamWebSocket = WebSocketStream<Box<dyn AsyncStream>>;
 /// 3. Do the WebSocket client handshake.
 pub async fn connect_ws(url: &str, proxy: Option<&ProxyConfig>) -> Result<SteamWebSocket, Error> {
     let parsed = url::Url::parse(url)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| Error::InvalidUrl("ws url missing host".into()))?
-        .to_string();
+    let host = unbracket(
+        parsed
+            .host_str()
+            .ok_or_else(|| Error::InvalidUrl("ws url missing host".into()))?,
+    )
+    .to_string();
     let port = parsed
         .port_or_known_default()
         .ok_or_else(|| Error::InvalidUrl("ws url missing port".into()))?;
@@ -52,9 +56,11 @@ pub async fn connect_ws(url: &str, proxy: Option<&ProxyConfig>) -> Result<SteamW
 
     // 1. TCP — proxy or direct
     let tcp: Box<dyn AsyncStream> = if let Some(p) = proxy {
-        connect_via_proxy(p, &host, port).await?
+        timeout(PROXY_CONNECT_TIMEOUT, connect_via_proxy(p, &host, port))
+            .await
+            .map_err(|_| Error::Timeout("proxy connect"))??
     } else {
-        let addr = format!("{host}:{port}");
+        let addr = authority(&host, port);
         let stream = timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect(&addr))
             .await
             .map_err(|_| Error::Timeout("tcp connect"))??;

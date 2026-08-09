@@ -5,18 +5,32 @@ use serde::{Deserialize, Serialize};
 /// Where a Steam session is in its lifecycle, from an external observer's
 /// point of view.
 ///
-/// This enum is for **observability** — UIs, status reports, structured logs.
-/// The internal session machine in `0.1.x` is enforced via typestate
-/// (`Session<Connecting>` cannot call `request_profile`), so this enum is
-/// the projection of that state for code outside the typestate world.
+/// This enum is for **observability**: UIs, status reports, structured logs.
+/// Published by [`SessionHandle::state`](crate::session::SessionHandle::state)
+/// and [`watch_state`](crate::session::SessionHandle::watch_state). It is a
+/// report, not a guard: nothing in the type system stops a caller issuing a
+/// request while the session is [`Self::Connecting`], so an operation on a
+/// session that is not ready fails at runtime instead of failing to compile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[allow(deprecated)]
 pub enum SessionState {
     /// No connection attempted, or fully closed.
+    #[deprecated(
+        since = "0.4.0",
+        note = "never emitted; a session that is not connected reports Connecting while it \
+                re-establishes, or LoggedOff / Failed once it stops. Match on those instead."
+    )]
     Disconnected,
-    /// TCP/TLS/WS handshake in progress.
+    /// Establishing (or re-establishing) the CM connection: discovery, the
+    /// TCP/TLS/WS handshake and the logon round-trip.
     Connecting,
-    /// Steam auth flow in progress (`BeginAuthSession` → `PollAuthSession`).
+    /// Steam auth flow in progress.
+    #[deprecated(
+        since = "0.4.0",
+        note = "never emitted; the WebAPI auth flow completes before a session exists, so the \
+                session reports Connecting for the whole establish path. Match on that instead."
+    )]
     Authenticating,
     /// `loggedOn` event received, session is ready to do work.
     LoggedOn {
@@ -44,11 +58,12 @@ impl SessionState {
     }
 
     /// Short tag for log lines and metrics labels.
+    #[allow(deprecated)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Disconnected => "disconnected",
-            Self::Connecting => "connecting",
             Self::Authenticating => "authenticating",
+            Self::Connecting => "connecting",
             Self::LoggedOn { .. } => "logged_on",
             Self::LoggedOff { .. } => "logged_off",
             Self::Failed { .. } => "failed",
@@ -63,11 +78,23 @@ mod tests {
     #[test]
     fn is_ready_only_when_logged_on() {
         assert!(SessionState::LoggedOn { steam_id: 1 }.is_ready());
-        assert!(!SessionState::Disconnected.is_ready());
         assert!(!SessionState::Connecting.is_ready());
-        assert!(!SessionState::Authenticating.is_ready());
         assert!(!SessionState::LoggedOff { reason: "x".into() }.is_ready());
         assert!(!SessionState::Failed { error: "x".into() }.is_ready());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn labels_cover_every_state() {
+        assert_eq!(SessionState::Disconnected.label(), "disconnected");
+        assert_eq!(SessionState::Authenticating.label(), "authenticating");
+        assert_eq!(SessionState::Connecting.label(), "connecting");
+        assert_eq!(SessionState::LoggedOn { steam_id: 1 }.label(), "logged_on");
+        assert_eq!(
+            SessionState::LoggedOff { reason: "x".into() }.label(),
+            "logged_off"
+        );
+        assert_eq!(SessionState::Failed { error: "x".into() }.label(), "failed");
     }
 
     #[test]

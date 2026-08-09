@@ -53,6 +53,7 @@ use prost::Message;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+use crate::error::eresult;
 use crate::proto::{
     c_msg_client_friends_groups_list::{
         FriendGroup as ProtoFriendGroup, FriendGroupsMembership as ProtoMembership,
@@ -86,8 +87,11 @@ const EMSG_AM_CLIENT_MANAGE_FRIENDS_GROUP: u32 = 5564;
 const EMSG_AM_CLIENT_ADD_FRIEND_TO_GROUP: u32 = 5566;
 const EMSG_AM_CLIENT_REMOVE_FRIEND_FROM_GROUP: u32 = 5568;
 
-/// `EResult::OK`.
-const ERESULT_OK: i32 = 1;
+/// `EResult::OK` as `u32`: the AM nickname and friends-group responses type
+/// their `eresult` field unsigned.
+const ERESULT_OK_U32: u32 = eresult::OK as u32;
+/// `EResult::Fail` as `u32`, the proto2 default of those same fields.
+const ERESULT_FAIL_U32: u32 = eresult::FAIL as u32;
 
 /// How long to wait for the post-login friends list.
 const FRIENDS_LIST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -151,6 +155,10 @@ pub struct AddedFriend {
     pub steam_id: u64,
     /// Their persona name at the time, if Steam returned it.
     pub persona_name: String,
+    /// The `EResult` Steam answered with: `1` (`OK`) for a request that was
+    /// newly sent or accepted, `29` (`DuplicateRequest`) when the relationship
+    /// (or our pending request for it) already existed.
+    pub eresult: i32,
 }
 
 /// A friend you have given a personal nickname to. Nicknames are local: only
@@ -207,14 +215,36 @@ pub enum ChatEntryType {
     Unknown(i32),
 }
 
+impl ChatEntryType {
+    /// The `EChatEntryType` value this maps to on the wire.
+    pub fn raw(self) -> i32 {
+        match self {
+            Self::Text => 1,
+            Self::Typing => 2,
+            Self::InviteGame => 3,
+            Self::Unknown(other) => other,
+        }
+    }
+
+    /// Map a wire `EChatEntryType` value, keeping unknown ones intact.
+    pub fn from_raw(value: i32) -> Self {
+        match value {
+            1 => Self::Text,
+            2 => Self::Typing,
+            3 => Self::InviteGame,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
 /// Send a friend request to (or accept an incoming one from) `steam_id`.
 ///
-/// Steam returns the resolved target `SteamID` and persona name on `OK` and
-/// also when the request is redundant (the account is already on the friends
-/// list) — in that case the function still returns `Ok(AddedFriend)` with the
-/// existing friendship's data. Only an `EResult` that *doesn't* carry a
-/// `steam_id_added` (blocked, rate-limited, user not found, …) surfaces as
-/// [`Error::Remote`].
+/// Steam answers with an `EResult`. `OK` (the request was sent, or an incoming
+/// one accepted) and `DuplicateRequest` (the relationship already exists) both
+/// return `Ok(AddedFriend)` carrying the resolved target `SteamID` and persona
+/// name; read [`AddedFriend::eresult`] to tell "added" from "already a friend".
+/// Every other `EResult` (blocked, rate-limited, user not found, …) surfaces
+/// as [`Error::Remote`].
 ///
 /// `steam_id` is the **only** supported target identifier — there is no
 /// `add_friend_by_name`, because Steam account names are not unique and
@@ -224,9 +254,8 @@ pub enum ChatEntryType {
 ///
 /// # Errors
 ///
-/// [`Error::Remote`] if Steam rejects the request without identifying the
-/// target, [`Error::WebSocket`] if the session stopped, or a transport / decode
-/// error.
+/// [`Error::Remote`] if Steam rejects the request, [`Error::WebSocket`] if the
+/// session stopped, or a transport / decode error.
 pub async fn add_friend(session: &SessionHandle, steam_id: u64) -> Result<AddedFriend> {
     let request = CMsgClientAddFriend {
         steamid_to_add: Some(steam_id),
@@ -237,28 +266,34 @@ pub async fn add_friend(session: &SessionHandle, steam_id: u64) -> Result<AddedF
 
 /// Shared `AddFriend` request/response handling.
 ///
-/// Steam returns the resolved `steam_id_added` (and the persona name) on
-/// `eresult == OK` *and* on the "already friends" path — we surface it in
-/// both cases so callers that just need the `SteamID` (e.g. resolving a
-/// username without checking the relationship state) get it either way. Only
-/// when `steam_id_added` is missing — block, rate-limit, "user not found",
-/// … — do we propagate the `EResult` as `Error::Remote`.
+/// The `EResult` decides, not the presence of `steam_id_added`: only `OK` and
+/// `DuplicateRequest` are success. `DuplicateRequest` stays non-fatal because
+/// Steam returns the existing friendship's `steam_id_added` and persona name
+/// with it, which is what a caller resolving an id wants either way.
+///
+/// The body result is the only one that counts, so this takes
+/// [`SessionHandle::request_ignoring_eresult`]: the generic header check would
+/// otherwise reject a `DuplicateRequest` before we ever see the body, should
+/// Steam mirror the code into the routing header.
 async fn add(session: &SessionHandle, request: &CMsgClientAddFriend) -> Result<AddedFriend> {
-    let response: CMsgClientAddFriendResponse =
-        session.request(EMSG_CLIENT_ADD_FRIEND, request).await?;
+    let response: CMsgClientAddFriendResponse = session
+        .request_ignoring_eresult(EMSG_CLIENT_ADD_FRIEND, request)
+        .await?;
 
-    let steam_id = response.steam_id_added.unwrap_or(0);
-    let persona_name = response.persona_name_added.unwrap_or_default();
-
-    if steam_id != 0 {
-        return Ok(AddedFriend {
-            steam_id,
-            persona_name,
-        });
+    let code = response.eresult.unwrap_or(eresult::FAIL);
+    if code != eresult::OK && code != eresult::DUPLICATE_REQUEST {
+        return Err(Error::Remote(format!("add friend: eresult {code}")));
     }
+    let steam_id = response
+        .steam_id_added
+        .filter(|&id| id != 0)
+        .ok_or_else(|| Error::Remote(format!("add friend: eresult {code}, no steam id")))?;
 
-    let eresult = response.eresult.unwrap_or(2);
-    Err(Error::Remote(format!("add friend: eresult {eresult}")))
+    Ok(AddedFriend {
+        steam_id,
+        persona_name: response.persona_name_added.unwrap_or_default(),
+        eresult: code,
+    })
 }
 
 /// Remove a friend, or decline / cancel a friend request, for `steam_id`.
@@ -268,7 +303,7 @@ async fn add(session: &SessionHandle, request: &CMsgClientAddFriend) -> Result<A
 ///
 /// # Errors
 ///
-/// [`Error::WebSocket`] if the session stopped.
+/// [`Error::WebSocket`] if the session stopped or the write failed.
 pub async fn remove_friend(session: &SessionHandle, steam_id: u64) -> Result<()> {
     let request = CMsgClientRemoveFriend {
         friendid: Some(steam_id),
@@ -345,9 +380,9 @@ pub async fn set_nickname(session: &SessionHandle, steam_id: u64, nickname: &str
     let response: CMsgClientSetPlayerNicknameResponse = session
         .request(EMSG_AM_CLIENT_SET_PLAYER_NICKNAME, &request)
         .await?;
-    let eresult = response.eresult.unwrap_or(2);
-    if eresult != ERESULT_OK as u32 {
-        return Err(Error::Remote(format!("set nickname: eresult {eresult}")));
+    let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+    if code != ERESULT_OK_U32 {
+        return Err(Error::Remote(format!("set nickname: eresult {code}")));
     }
     Ok(())
 }
@@ -367,9 +402,9 @@ pub async fn clear_nickname(session: &SessionHandle, steam_id: u64) -> Result<()
     let response: CMsgClientSetPlayerNicknameResponse = session
         .request(EMSG_AM_CLIENT_SET_PLAYER_NICKNAME, &request)
         .await?;
-    let eresult = response.eresult.unwrap_or(2);
-    if eresult != ERESULT_OK as u32 {
-        return Err(Error::Remote(format!("clear nickname: eresult {eresult}")));
+    let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+    if code != ERESULT_OK_U32 {
+        return Err(Error::Remote(format!("clear nickname: eresult {code}")));
     }
     Ok(())
 }
@@ -394,7 +429,7 @@ pub async fn request_nicknames(session: &SessionHandle) -> Result<Vec<Nickname>>
     if let Some(body) = session.cached_snapshot(EMSG_CLIENT_PLAYER_NICKNAME_LIST) {
         let list = CMsgClientPlayerNicknameList::decode(body.as_slice())
             .map_err(|e| Error::Codec(format!("decode nicknames: {e}")))?;
-        if !list.incremental.unwrap_or(false) {
+        if is_full_nicknames(&list) {
             return Ok(nicknames_from(list));
         }
     }
@@ -404,7 +439,8 @@ pub async fn request_nicknames(session: &SessionHandle) -> Result<Vec<Nickname>>
                 Ok(msg) if msg.emsg == EMSG_CLIENT_PLAYER_NICKNAME_LIST => {
                     let list = CMsgClientPlayerNicknameList::decode(msg.body.as_slice())
                         .map_err(|e| Error::Codec(format!("decode nicknames: {e}")))?;
-                    if list.incremental.unwrap_or(false) {
+                    // Deltas and removal pushes aren't the post-login dump.
+                    if !is_full_nicknames(&list) {
                         continue;
                     }
                     return Ok(nicknames_from(list));
@@ -429,7 +465,7 @@ pub async fn request_nicknames(session: &SessionHandle) -> Result<Vec<Nickname>>
 ///
 /// # Errors
 ///
-/// [`Error::WebSocket`] if the session stopped.
+/// [`Error::WebSocket`] if the session stopped or the write failed.
 pub async fn hide_friend(session: &SessionHandle, steam_id: u64) -> Result<()> {
     let request = CMsgClientHideFriend {
         friendid: Some(steam_id),
@@ -444,7 +480,7 @@ pub async fn hide_friend(session: &SessionHandle, steam_id: u64) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::WebSocket`] if the session stopped.
+/// [`Error::WebSocket`] if the session stopped or the write failed.
 pub async fn unhide_friend(session: &SessionHandle, steam_id: u64) -> Result<()> {
     let request = CMsgClientHideFriend {
         friendid: Some(steam_id),
@@ -459,13 +495,19 @@ pub async fn unhide_friend(session: &SessionHandle, steam_id: u64) -> Result<()>
 /// messages; treat this as a chat line, not a file transfer. For "is typing"
 /// notifications, use [`send_typing`].
 ///
+/// Fire-and-forget: `CMsgClientFriendMsg` is not job-correlated and Steam sends
+/// no reply, so `Ok` means the frame was written to the socket, **not** that
+/// the message was accepted or delivered. A message Steam drops (not friends,
+/// muted, rate-limited, a limited account) is indistinguishable from a
+/// delivered one here.
+///
 /// # Errors
 ///
-/// [`Error::WebSocket`] if the session stopped, or a transport error.
+/// [`Error::WebSocket`] if the session stopped or the write failed.
 pub async fn send_message(session: &SessionHandle, steam_id: u64, text: &str) -> Result<()> {
     let request = CMsgClientFriendMsg {
         steamid: Some(steam_id),
-        chat_entry_type: Some(1), // EChatEntryType_ChatMsg
+        chat_entry_type: Some(ChatEntryType::Text.raw()),
         message: Some(text.as_bytes().to_vec()),
         ..Default::default()
     };
@@ -474,15 +516,16 @@ pub async fn send_message(session: &SessionHandle, steam_id: u64, text: &str) ->
 
 /// Send a "user is typing…" notification to `steam_id`.
 ///
-/// Fire-and-forget; the official client expires these after a few seconds.
+/// Fire-and-forget, exactly like [`send_message`]: `Ok` means sent, not
+/// delivered. The official client expires these after a few seconds.
 ///
 /// # Errors
 ///
-/// [`Error::WebSocket`] if the session stopped, or a transport error.
+/// [`Error::WebSocket`] if the session stopped or the write failed.
 pub async fn send_typing(session: &SessionHandle, steam_id: u64) -> Result<()> {
     let request = CMsgClientFriendMsg {
         steamid: Some(steam_id),
-        chat_entry_type: Some(2), // EChatEntryType_Typing
+        chat_entry_type: Some(ChatEntryType::Typing.raw()),
         ..Default::default()
     };
     session.notify(EMSG_CLIENT_FRIEND_MSG, &request).await
@@ -495,8 +538,9 @@ pub async fn send_typing(session: &SessionHandle, steam_id: u64) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Remote`] if Steam rejects the request (e.g. too many groups),
-/// [`Error::WebSocket`] if the session stopped, or a transport / decode error.
+/// [`Error::Remote`] if Steam rejects the request (e.g. too many groups) or
+/// answers `OK` without a group id, [`Error::WebSocket`] if the session
+/// stopped, or a transport / decode error.
 pub async fn create_friends_group(
     session: &SessionHandle,
     name: &str,
@@ -510,14 +554,18 @@ pub async fn create_friends_group(
     let response: CMsgClientCreateFriendsGroupResponse = session
         .request(EMSG_AM_CLIENT_CREATE_FRIENDS_GROUP, &request)
         .await?;
-    let eresult = response.eresult.unwrap_or(2);
-    if eresult != ERESULT_OK as u32 {
+    let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+    if code != ERESULT_OK_U32 {
         return Err(Error::Remote(format!(
-            "create friends group: eresult {eresult}"
+            "create friends group: eresult {code}"
         )));
     }
+    // no sentinel: 0 is a usable group id
+    let group_id = response
+        .groupid
+        .ok_or_else(|| Error::Remote("create friends group: OK without a groupid".to_string()))?;
     Ok(NewFriendsGroup {
-        group_id: response.groupid.unwrap_or(0),
+        group_id,
         name: name.to_string(),
     })
 }
@@ -537,10 +585,10 @@ pub async fn delete_friends_group(session: &SessionHandle, group_id: i32) -> Res
     let response: CMsgClientDeleteFriendsGroupResponse = session
         .request(EMSG_AM_CLIENT_DELETE_FRIENDS_GROUP, &request)
         .await?;
-    let eresult = response.eresult.unwrap_or(2);
-    if eresult != ERESULT_OK as u32 {
+    let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+    if code != ERESULT_OK_U32 {
         return Err(Error::Remote(format!(
-            "delete friends group: eresult {eresult}"
+            "delete friends group: eresult {code}"
         )));
     }
     Ok(())
@@ -565,10 +613,10 @@ pub async fn rename_friends_group(
     let response: CMsgClientManageFriendsGroupResponse = session
         .request(EMSG_AM_CLIENT_MANAGE_FRIENDS_GROUP, &request)
         .await?;
-    let eresult = response.eresult.unwrap_or(2);
-    if eresult != ERESULT_OK as u32 {
+    let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+    if code != ERESULT_OK_U32 {
         return Err(Error::Remote(format!(
-            "rename friends group: eresult {eresult}"
+            "rename friends group: eresult {code}"
         )));
     }
     Ok(())
@@ -596,10 +644,10 @@ pub async fn add_friends_to_group(
         let response: CMsgClientAddFriendToGroupResponse = session
             .request(EMSG_AM_CLIENT_ADD_FRIEND_TO_GROUP, &request)
             .await?;
-        let eresult = response.eresult.unwrap_or(2);
-        if eresult != ERESULT_OK as u32 {
+        let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+        if code != ERESULT_OK_U32 {
             return Err(Error::Remote(format!(
-                "add friend {sid} to group {group_id}: eresult {eresult}"
+                "add friend {sid} to group {group_id}: eresult {code}"
             )));
         }
     }
@@ -627,10 +675,10 @@ pub async fn remove_friends_from_group(
         let response: CMsgClientRemoveFriendFromGroupResponse = session
             .request(EMSG_AM_CLIENT_REMOVE_FRIEND_FROM_GROUP, &request)
             .await?;
-        let eresult = response.eresult.unwrap_or(2);
-        if eresult != ERESULT_OK as u32 {
+        let code = response.eresult.unwrap_or(ERESULT_FAIL_U32);
+        if code != ERESULT_OK_U32 {
             return Err(Error::Remote(format!(
-                "remove friend {sid} from group {group_id}: eresult {eresult}"
+                "remove friend {sid} from group {group_id}: eresult {code}"
             )));
         }
     }
@@ -655,7 +703,7 @@ pub async fn request_friends_groups_list(session: &SessionHandle) -> Result<Vec<
     if let Some(body) = session.cached_snapshot(EMSG_CLIENT_FRIENDS_GROUPS_LIST) {
         let list = CMsgClientFriendsGroupsList::decode(body.as_slice())
             .map_err(|e| Error::Codec(format!("decode groups list: {e}")))?;
-        if !list.bincremental.unwrap_or(false) {
+        if is_full_groups(&list) {
             return Ok(groups_from(list));
         }
     }
@@ -665,8 +713,8 @@ pub async fn request_friends_groups_list(session: &SessionHandle) -> Result<Vec<
                 Ok(msg) if msg.emsg == EMSG_CLIENT_FRIENDS_GROUPS_LIST => {
                     let list = CMsgClientFriendsGroupsList::decode(msg.body.as_slice())
                         .map_err(|e| Error::Codec(format!("decode groups list: {e}")))?;
-                    // We want the full post-login dump, not a delta.
-                    if list.bincremental.unwrap_or(false) {
+                    // We want the full post-login dump, not a delta or removal.
+                    if !is_full_groups(&list) {
                         continue;
                     }
                     return Ok(groups_from(list));
@@ -681,6 +729,18 @@ pub async fn request_friends_groups_list(session: &SessionHandle) -> Result<Vec<
     timeout(GROUPS_TIMEOUT, wait)
         .await
         .map_err(|_| Error::Timeout("friends groups list"))?
+}
+
+/// Whether a `CMsgClientPlayerNicknameList` is the full post-login dump rather
+/// than an incremental delta or a removal push.
+fn is_full_nicknames(list: &CMsgClientPlayerNicknameList) -> bool {
+    !list.incremental.unwrap_or(false) && !list.removal.unwrap_or(false)
+}
+
+/// Whether a `CMsgClientFriendsGroupsList` is the full post-login dump rather
+/// than an incremental delta or a removal push.
+fn is_full_groups(list: &CMsgClientFriendsGroupsList) -> bool {
+    !list.bincremental.unwrap_or(false) && !list.bremoval.unwrap_or(false)
 }
 
 /// Map a decoded `CMsgClientPlayerNicknameList` into our [`Nickname`] entries.
@@ -742,6 +802,7 @@ mod tests {
     use super::*;
     use crate::codec::SteamMessage;
     use crate::proto::{c_msg_client_friends_list::Friend as ProtoFriend, CMsgProtoBufHeader};
+    use crate::session::driver::Command;
 
     #[test]
     fn relationship_maps_known_values() {
@@ -883,7 +944,7 @@ mod tests {
         let resp = CMsgClientSetPlayerNicknameResponse { eresult: Some(1) };
         let bytes = resp.encode_to_vec();
         let back = CMsgClientSetPlayerNicknameResponse::decode(bytes.as_slice()).unwrap();
-        assert_eq!(back.eresult, Some(ERESULT_OK as u32));
+        assert_eq!(back.eresult, Some(ERESULT_OK_U32));
     }
 
     #[test]
@@ -962,7 +1023,7 @@ mod tests {
         };
         let bytes = resp.encode_to_vec();
         let back = CMsgClientCreateFriendsGroupResponse::decode(bytes.as_slice()).unwrap();
-        assert_eq!(back.eresult, Some(ERESULT_OK as u32));
+        assert_eq!(back.eresult, Some(ERESULT_OK_U32));
         assert_eq!(back.groupid, Some(7));
     }
 
@@ -1106,5 +1167,282 @@ mod tests {
         assert_eq!(EMSG_AM_CLIENT_MANAGE_FRIENDS_GROUP, 5564);
         assert_eq!(EMSG_AM_CLIENT_ADD_FRIEND_TO_GROUP, 5566);
         assert_eq!(EMSG_AM_CLIENT_REMOVE_FRIEND_FROM_GROUP, 5568);
+    }
+
+    // ---- Response handling, driven through the test session seam -----------
+
+    /// Run `op` against a driverless handle, answering its single request with
+    /// `body`.
+    async fn answer_one<T, F, Fut>(body: Vec<u8>, expect_emsg: u32, op: F) -> Result<T>
+    where
+        F: FnOnce(SessionHandle) -> Fut,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        answer_one_with_header(body, CMsgProtoBufHeader::default(), expect_emsg, op).await
+    }
+
+    /// [`answer_one`] with a caller-built routing header, to drive the
+    /// header-level `EResult` check.
+    async fn answer_one_with_header<T, F, Fut>(
+        body: Vec<u8>,
+        header: CMsgProtoBufHeader,
+        expect_emsg: u32,
+        op: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(SessionHandle) -> Fut,
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let task = tokio::spawn(op(handle));
+        match commands.recv().await.expect("request queued") {
+            Command::Request { emsg, reply, .. } => {
+                assert_eq!(emsg, expect_emsg);
+                reply
+                    .send(Ok(SteamMessage {
+                        emsg: expect_emsg,
+                        header,
+                        body,
+                    }))
+                    .expect("reply delivered");
+            }
+            _ => panic!("expected a Request"),
+        }
+        task.await.expect("op task")
+    }
+
+    async fn add_friend_answered(response: &CMsgClientAddFriendResponse) -> Result<AddedFriend> {
+        answer_one(
+            response.encode_to_vec(),
+            EMSG_CLIENT_ADD_FRIEND,
+            |h| async move { add_friend(&h, 76_561_198_000_000_001).await },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn add_friend_accepts_ok() {
+        let added = add_friend_answered(&CMsgClientAddFriendResponse {
+            eresult: Some(eresult::OK),
+            steam_id_added: Some(111),
+            persona_name_added: Some("mate".into()),
+        })
+        .await
+        .expect("ok is a success");
+        assert_eq!(added.steam_id, 111);
+        assert_eq!(added.persona_name, "mate");
+        assert_eq!(added.eresult, eresult::OK);
+    }
+
+    #[tokio::test]
+    async fn add_friend_accepts_duplicate_request() {
+        let added = add_friend_answered(&CMsgClientAddFriendResponse {
+            eresult: Some(eresult::DUPLICATE_REQUEST),
+            steam_id_added: Some(222),
+            persona_name_added: None,
+        })
+        .await
+        .expect("already-friends stays non-fatal");
+        assert_eq!(added.steam_id, 222);
+        assert_eq!(added.eresult, eresult::DUPLICATE_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn add_friend_ignores_a_non_ok_header_eresult() {
+        // DuplicateRequest mirrored into the routing header: the generic header
+        // check would reject it, so add_friend must not be running it.
+        let response = CMsgClientAddFriendResponse {
+            eresult: Some(eresult::DUPLICATE_REQUEST),
+            steam_id_added: Some(555),
+            persona_name_added: Some("old mate".into()),
+        };
+        let header = CMsgProtoBufHeader {
+            eresult: Some(eresult::DUPLICATE_REQUEST),
+            ..Default::default()
+        };
+        let added = answer_one_with_header(
+            response.encode_to_vec(),
+            header,
+            EMSG_CLIENT_ADD_FRIEND,
+            |h| async move { add_friend(&h, 76_561_198_000_000_001).await },
+        )
+        .await
+        .expect("the body result is the one that counts");
+        assert_eq!(added.steam_id, 555);
+        assert_eq!(added.eresult, eresult::DUPLICATE_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn add_friend_rejects_non_ok_eresult_carrying_a_steam_id() {
+        // Steam identifies the target on a rejection too, so `steam_id_added`
+        // alone can't mean success.
+        let err = add_friend_answered(&CMsgClientAddFriendResponse {
+            eresult: Some(25), // LimitExceeded
+            steam_id_added: Some(333),
+            persona_name_added: Some("stranger".into()),
+        })
+        .await
+        .expect_err("a rejection must not read as success");
+        match err {
+            Error::Remote(text) => assert!(text.contains("eresult 25"), "{text}"),
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_friend_rejects_ok_without_a_steam_id() {
+        let err = add_friend_answered(&CMsgClientAddFriendResponse {
+            eresult: Some(eresult::OK),
+            steam_id_added: None,
+            persona_name_added: None,
+        })
+        .await
+        .expect_err("no target id is not a usable success");
+        assert!(matches!(err, Error::Remote(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn add_friend_defaults_a_missing_eresult_to_fail() {
+        // proto2 default for this field is 2 (Fail), not 0.
+        let err = add_friend_answered(&CMsgClientAddFriendResponse {
+            eresult: None,
+            steam_id_added: Some(444),
+            persona_name_added: None,
+        })
+        .await
+        .expect_err("missing eresult is Fail");
+        match err {
+            Error::Remote(text) => assert!(text.contains("eresult 2"), "{text}"),
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    async fn create_group_answered(
+        response: &CMsgClientCreateFriendsGroupResponse,
+    ) -> Result<NewFriendsGroup> {
+        answer_one(
+            response.encode_to_vec(),
+            EMSG_AM_CLIENT_CREATE_FRIENDS_GROUP,
+            |h| async move { create_friends_group(&h, "squad", &[]).await },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn create_friends_group_keeps_a_zero_group_id() {
+        let group = create_group_answered(&CMsgClientCreateFriendsGroupResponse {
+            eresult: Some(1),
+            groupid: Some(0),
+        })
+        .await
+        .expect("0 is a valid group id");
+        assert_eq!(group.group_id, 0);
+        assert_eq!(group.name, "squad");
+    }
+
+    #[tokio::test]
+    async fn create_friends_group_rejects_a_missing_group_id() {
+        let err = create_group_answered(&CMsgClientCreateFriendsGroupResponse {
+            eresult: Some(1),
+            groupid: None,
+        })
+        .await
+        .expect_err("no group id is not a success");
+        assert!(matches!(err, Error::Remote(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn send_message_tags_the_frame_from_chat_entry_type() {
+        let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let task = tokio::spawn(async move { send_message(&handle, 111, "gg").await });
+        match commands.recv().await.expect("notify queued") {
+            Command::Notify { emsg, body, ack } => {
+                assert_eq!(emsg, EMSG_CLIENT_FRIEND_MSG);
+                let sent = CMsgClientFriendMsg::decode(body.as_slice()).expect("decodes");
+                assert_eq!(sent.chat_entry_type, Some(ChatEntryType::Text.raw()));
+                assert_eq!(sent.message.as_deref(), Some(b"gg".as_slice()));
+                ack.send(Ok(())).expect("ack delivered");
+            }
+            _ => panic!("expected a Notify"),
+        }
+        task.await.expect("send task").expect("sent");
+    }
+
+    #[tokio::test]
+    async fn send_typing_tags_the_frame_from_chat_entry_type() {
+        let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let task = tokio::spawn(async move { send_typing(&handle, 111).await });
+        match commands.recv().await.expect("notify queued") {
+            Command::Notify { body, ack, .. } => {
+                let sent = CMsgClientFriendMsg::decode(body.as_slice()).expect("decodes");
+                assert_eq!(sent.chat_entry_type, Some(ChatEntryType::Typing.raw()));
+                assert!(sent.message.is_none());
+                ack.send(Ok(())).expect("ack delivered");
+            }
+            _ => panic!("expected a Notify"),
+        }
+        task.await.expect("typing task").expect("sent");
+    }
+
+    #[test]
+    fn chat_entry_type_round_trips_wire_values() {
+        assert_eq!(ChatEntryType::Text.raw(), 1);
+        assert_eq!(ChatEntryType::Typing.raw(), 2);
+        assert_eq!(ChatEntryType::InviteGame.raw(), 3);
+        for entry in [
+            ChatEntryType::Text,
+            ChatEntryType::Typing,
+            ChatEntryType::InviteGame,
+            ChatEntryType::Unknown(11),
+        ] {
+            assert_eq!(ChatEntryType::from_raw(entry.raw()), entry);
+        }
+    }
+
+    fn nickname_list(
+        removal: Option<bool>,
+        incremental: Option<bool>,
+    ) -> CMsgClientPlayerNicknameList {
+        CMsgClientPlayerNicknameList {
+            removal,
+            incremental,
+            nicknames: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn full_nickname_list_excludes_deltas_and_removals() {
+        assert!(is_full_nicknames(&nickname_list(Some(false), Some(false))));
+        assert!(is_full_nicknames(&nickname_list(None, None)));
+        assert!(
+            !is_full_nicknames(&nickname_list(Some(true), Some(false))),
+            "a removal push is not the post-login list"
+        );
+        assert!(!is_full_nicknames(&nickname_list(Some(false), Some(true))));
+    }
+
+    fn groups_list(
+        bremoval: Option<bool>,
+        bincremental: Option<bool>,
+    ) -> CMsgClientFriendsGroupsList {
+        CMsgClientFriendsGroupsList {
+            bremoval,
+            bincremental,
+            friend_groups: Vec::new(),
+            memberships: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn full_groups_list_excludes_deltas_and_removals() {
+        assert!(is_full_groups(&groups_list(Some(false), Some(false))));
+        assert!(is_full_groups(&groups_list(None, None)));
+        assert!(
+            !is_full_groups(&groups_list(Some(true), Some(false))),
+            "a removal push is not the post-login list"
+        );
+        assert!(!is_full_groups(&groups_list(Some(false), Some(true))));
     }
 }

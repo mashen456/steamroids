@@ -91,11 +91,16 @@ pub struct PlayerProfile {
 /// [`account_id_from_steam_id`] to convert. The coordinator must be attached to
 /// [`APP_ID`] and welcomed (see [`GameCoordinator::wait_ready`]).
 ///
+/// The reply is matched on `account_id`, so a `PlayersProfile` pushed for some
+/// other player (or for a concurrent request) is never mistaken for this one.
+///
 /// # Errors
 ///
 /// [`Error::InvalidConfig`] if `gc` isn't a CS2 coordinator, [`Error::Timeout`]
-/// if the GC doesn't answer, [`Error::Network`] if it answers with no profile,
-/// or a transport / decode error.
+/// if no profile for `account_id` arrives in time (which is also how an unknown
+/// account reads, since the GC answers it with an empty, unattributable
+/// `PlayersProfile`), [`Error::Network`] if a matched reply somehow carries no
+/// such profile, or a transport / decode error.
 pub async fn request_player_profile(
     gc: &GameCoordinator,
     account_id: u32,
@@ -114,19 +119,28 @@ pub async fn request_player_profile(
     };
 
     let response: CMsgGccStrike15V2PlayersProfile = gc
-        .request(
+        .request_matching(
             GC_CLIENT_REQUEST_PLAYERS_PROFILE,
             &request,
             GC_PLAYERS_PROFILE,
             PROFILE_TIMEOUT,
+            |r: &CMsgGccStrike15V2PlayersProfile| {
+                r.account_profiles
+                    .iter()
+                    .any(|p| p.account_id == Some(account_id))
+            },
         )
         .await?;
 
     let profile = response
         .account_profiles
         .into_iter()
-        .next()
-        .ok_or_else(|| Error::Network("GC returned an empty PlayersProfile".into()))?;
+        .find(|p| p.account_id == Some(account_id))
+        .ok_or_else(|| {
+            Error::Network(format!(
+                "GC PlayersProfile carried no profile for account {account_id}"
+            ))
+        })?;
 
     let ranking = profile.ranking;
     let (medals, featured_medal) = profile
@@ -134,7 +148,7 @@ pub async fn request_player_profile(
         .map(|m| (m.display_items_defidx, m.featured_display_item_defidx))
         .unwrap_or_default();
     Ok(PlayerProfile {
-        account_id: profile.account_id.unwrap_or(account_id),
+        account_id,
         level: profile.player_level.unwrap_or(0),
         current_xp: profile.player_cur_xp.unwrap_or(0),
         competitive_rank: ranking.as_ref().and_then(|r| r.rank_id),
@@ -156,6 +170,94 @@ pub fn account_id_from_steam_id(steam_id: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
+
+    use crate::gc::GcMessage;
+    use crate::proto::gc::{
+        CMsgGccStrike15V2MatchmakingGc2ClientHello, CMsgProtoBufHeader as GcHeader,
+    };
+    use crate::session::driver::Command;
+
+    /// A `PlayersProfile` reply carrying one profile per account id.
+    fn profiles_reply(ids: &[u32]) -> GcMessage {
+        GcMessage {
+            appid: APP_ID,
+            msgtype: GC_PLAYERS_PROFILE,
+            header: GcHeader::default(),
+            body: CMsgGccStrike15V2PlayersProfile {
+                account_profiles: ids
+                    .iter()
+                    .map(|&id| CMsgGccStrike15V2MatchmakingGc2ClientHello {
+                        account_id: Some(id),
+                        player_level: Some(40),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        }
+    }
+
+    /// Ack the outbound `ClientToGC`, then push `replies` back at the caller.
+    fn fake_gc(
+        mut commands: tokio::sync::mpsc::Receiver<Command>,
+        replies: tokio::sync::broadcast::Sender<GcMessage>,
+        queued: Vec<GcMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            match commands.recv().await.expect("request sent") {
+                Command::Notify { ack, .. } => ack.send(Ok(())).expect("ack delivered"),
+                _ => panic!("expected a Notify"),
+            }
+            for msg in queued {
+                let _ = replies.send(msg);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn profile_request_picks_the_requested_account() {
+        const WANTED: u32 = 742_504_693;
+        let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        let fake = fake_gc(
+            commands,
+            replies,
+            vec![profiles_reply(&[1]), profiles_reply(&[2, WANTED])],
+        );
+
+        let profile = request_player_profile(&gc, WANTED).await.expect("profile");
+
+        assert_eq!(profile.account_id, WANTED);
+        assert_eq!(profile.level, 40);
+        fake.await.expect("fake GC");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn profile_request_never_returns_another_account_as_ours() {
+        const WANTED: u32 = 5;
+        let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        let fake = fake_gc(commands, replies, vec![profiles_reply(&[9])]);
+
+        let err = request_player_profile(&gc, WANTED)
+            .await
+            .expect_err("no profile for WANTED");
+
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        fake.await.expect("fake GC");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn profile_request_rejects_a_non_cs2_coordinator() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let (gc, _replies, _ready) = GameCoordinator::for_test(session, 570);
+
+        let err = request_player_profile(&gc, 1).await.expect_err("wrong app");
+
+        assert!(matches!(err, Error::InvalidConfig(_)), "{err:?}");
+    }
 
     #[test]
     fn account_id_takes_low_32_bits() {

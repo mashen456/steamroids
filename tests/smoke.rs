@@ -27,7 +27,7 @@ fn proxy_url_parses_with_creds() {
 
 #[test]
 fn session_state_label_is_consistent() {
-    assert_eq!(SessionState::Disconnected.label(), "disconnected");
+    assert_eq!(SessionState::Connecting.label(), "connecting");
     assert_eq!(SessionState::LoggedOn { steam_id: 1 }.label(), "logged_on");
 }
 

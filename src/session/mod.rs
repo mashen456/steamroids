@@ -1,9 +1,13 @@
-//! Session-level state and (later) the typestate FSM.
+//! Live Connection Manager session: discovery, connection, driver, state.
 //!
-//! `0.0.x` ships the plain enum that downstream services can read for
-//! observability. The full `Session<S>` typestate machine — where `S` is
-//! `Disconnected | LoggingOn | LoggedOn | LoggedOff` — lands with the actual
-//! login flow in `0.1.x`.
+//! - [`discover_cm_servers`]: the current [`CmServer`] endpoints to dial.
+//! - [`CmConnection`]: one CM socket with the [`codec`](crate::codec) framing
+//!   on top; `logon` turns it into a [`LoggedOn`] session.
+//! - [`spawn_session`] is the usual entry point: it moves a logged-on connection
+//!   onto a background task that heartbeats, multiplexes `request` / `notify` /
+//!   `subscribe` by job id, and reconnects on transport failure, handing back a
+//!   cloneable [`SessionHandle`].
+//! - [`SessionState`]: the session's lifecycle as an outside observer sees it.
 
 pub mod connection;
 pub mod discovery;

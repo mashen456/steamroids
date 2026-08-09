@@ -90,15 +90,36 @@ mod tests {
     /// deterministic tests without a real Steam shared secret.
     const ZERO_SECRET_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
+    /// Known-answer vectors for a 20-byte zero key, derived from an
+    /// independent implementation of the algorithm (HMAC-SHA1 over the
+    /// big-endian step, RFC 4226 §5.3 truncation, base-26 over
+    /// `STEAM_ALPHABET`). Any change here means the derivation drifted.
+    const ZERO_SECRET_VECTORS: &[(u64, &str)] = &[
+        (0, "RYH4D"),
+        (1, "DR2DK"),
+        (2, "2BYG9"),
+        (42, "HWCM5"),
+        (1000, "R55XV"),
+        (56_000_000, "3F9QW"),
+    ];
+
     #[test]
-    fn known_zero_secret_step_one_is_stable() {
-        // Pin the output of `generate_with_step(&[0u8; 20], 1)` as a
-        // regression check. If this changes, the algorithm has drifted.
+    fn matches_known_answer_vectors() {
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(ZERO_SECRET_B64)
+            .unwrap();
+        assert_eq!(secret, vec![0u8; 20], "test vector key is 20 zero bytes");
+        for &(step, expected) in ZERO_SECRET_VECTORS {
+            assert_eq!(generate_with_step(&secret, step), expected, "step {step}");
+        }
+    }
+
+    #[test]
+    fn code_is_five_chars_from_the_steam_alphabet() {
         let secret = base64::engine::general_purpose::STANDARD
             .decode(ZERO_SECRET_B64)
             .unwrap();
         let code = generate_with_step(&secret, 1);
-        // First time captured here — locking in to detect future drift.
         assert_eq!(code.len(), 5);
         for ch in code.chars() {
             assert!(
@@ -106,6 +127,25 @@ mod tests {
                 "char {ch} outside Steam alphabet",
             );
         }
+    }
+
+    #[test]
+    fn generate_auth_code_uses_the_30s_time_step() {
+        // A timestamp anywhere in step N must produce step N's code.
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(ZERO_SECRET_B64)
+            .unwrap();
+        let expected = generate_with_step(&secret, 42);
+        for ts in [42 * TIME_STEP_SECS, 42 * TIME_STEP_SECS + 29] {
+            assert_eq!(
+                generate_auth_code(ZERO_SECRET_B64, Some(ts)).unwrap(),
+                expected
+            );
+        }
+        assert_ne!(
+            generate_auth_code(ZERO_SECRET_B64, Some(43 * TIME_STEP_SECS)).unwrap(),
+            expected
+        );
     }
 
     #[test]

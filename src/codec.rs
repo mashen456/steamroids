@@ -4,10 +4,10 @@
 //! messages are protobuf-encoded and laid out little-endian as:
 //!
 //! ```text
-//! ┌─────────────────┬───────────────┬────────────────────┬───────────┐
+//! ┌─────────────────┬───────────────┬─────────────────────┬───────────┐
 //! │ msg:  u32 LE    │ hdr_len: u32  │ CMsgProtoBufHeader  │ body      │
 //! │ (EMsg | proto)  │ LE            │ (protobuf)          │ (protobuf)│
-//! └─────────────────┴───────────────┴────────────────────┴───────────┘
+//! └─────────────────┴───────────────┴─────────────────────┴───────────┘
 //! ```
 //!
 //! The top bit of `msg` ([`PROTO_MASK`]) flags protobuf encoding; the remaining
