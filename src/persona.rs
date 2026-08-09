@@ -28,6 +28,7 @@ use tokio::sync::broadcast;
 use tokio::time::timeout;
 
 use crate::codec::SteamMessage;
+use crate::error::eresult;
 use crate::proto::{
     CMsgClientFriendProfileInfo, CMsgClientPersonaState, CMsgClientRequestFriendData,
 };
@@ -43,6 +44,15 @@ const EMSG_CLIENT_FRIEND_PROFILE_INFO: u32 = 5535;
 /// `EClientPersonaStateFlag` bits we ask for: Status | `PlayerName` | Presence |
 /// `LastSeen` | `GameExtraInfo`. `PlayerName` carries the avatar hash too.
 const PERSONA_FLAGS: u32 = 1 | 2 | 16 | 64 | 256;
+
+/// The one `status_flags` bit a `CMsgClientPersonaState` must carry before it
+/// counts as an answer to our request: `PlayerName`, which backs the persona
+/// name and avatar hash. Steam pushes unsolicited partial updates too (a bare
+/// Status "went online", say), and those carry no name. Status itself is *not*
+/// required: a non-friend, privacy-restricted or offline account is often
+/// answered with a name and avatar and no Status bit, which
+/// [`PersonaState::Offline`] covers.
+const REQUIRED_SUMMARY_FLAGS: u32 = 2;
 
 /// How long to wait for the persona-state reply.
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -163,20 +173,29 @@ pub fn profile_url(steam_id: u64) -> String {
 /// Steam's community site echoes the `SteamID` in the XML view of a vanity
 /// profile (`https://steamcommunity.com/id/{name}?xml=1`), so no `WebAPI` key is
 /// needed. `name` is the bare vanity (the part after `/id/`), e.g.
-/// `"gabelogannewell"`. Returns `Ok(None)` if no such vanity exists. The request
-/// goes through `proxy` when given.
+/// `"gabelogannewell"`. `Ok(None)` means the site answered 200 with no
+/// `steamID64` in the document, i.e. no such vanity exists. The request goes
+/// through `proxy` when given.
 ///
 /// # Errors
 ///
-/// [`Error::Network`] if the community site is unreachable, plus client-build
-/// errors.
+/// [`Error::Network`] if the community site is unreachable or answers with a
+/// non-success status (rate limiting and 5xx are common behind rotating
+/// proxies), plus client-build errors.
 pub async fn resolve_vanity_url(name: &str, proxy: Option<&ProxyConfig>) -> Result<Option<u64>> {
     let url = format!("https://steamcommunity.com/id/{name}?xml=1");
-    let body = crate::http::client(proxy)?
+    let response = crate::http::client(proxy)?
         .get(&url)
         .send()
         .await
-        .map_err(|e| Error::Network(format!("vanity lookup: {e}")))?
+        .map_err(|e| Error::Network(format!("vanity lookup: {e}")))?;
+    if !response.status().is_success() {
+        return Err(Error::Network(format!(
+            "vanity lookup: HTTP {}",
+            response.status()
+        )));
+    }
+    let body = response
         .text()
         .await
         .map_err(|e| Error::Network(format!("vanity lookup body: {e}")))?;
@@ -274,7 +293,7 @@ fn hash_to_hex(hash: &[u8]) -> String {
 /// # Errors
 ///
 /// [`Error::Timeout`] if no persona state arrives, [`Error::WebSocket`] if the
-/// session stopped, or a transport / decode error.
+/// session stopped or the write failed, or a transport / decode error.
 pub async fn request_player_summary(
     session: &SessionHandle,
     steam_id: u64,
@@ -313,10 +332,17 @@ pub async fn request_player_summary(
         .map_err(|_| Error::Timeout("persona state"))?
 }
 
-/// Decode a `CMsgClientPersonaState` and pull out `steam_id`'s entry, if present.
+/// Decode a `CMsgClientPersonaState` and pull out `steam_id`'s entry, if the
+/// message both carries [`REQUIRED_SUMMARY_FLAGS`] and mentions `steam_id`.
+///
+/// `Ok(None)` means "not our answer, keep waiting".
 fn summary_from_persona_state(msg: &SteamMessage, steam_id: u64) -> Result<Option<PlayerSummary>> {
     let state = CMsgClientPersonaState::decode(msg.body.as_slice())
         .map_err(|e| Error::Codec(format!("decode persona state: {e}")))?;
+    // partial push, not a full summary
+    if state.status_flags.unwrap_or(0) & REQUIRED_SUMMARY_FLAGS != REQUIRED_SUMMARY_FLAGS {
+        return Ok(None);
+    }
     let Some(friend) = state
         .friends
         .into_iter()
@@ -356,8 +382,9 @@ fn summary_from_persona_state(msg: &SteamMessage, steam_id: u64) -> Result<Optio
 ///
 /// # Errors
 ///
-/// [`Error::WebSocket`] if the session stopped, plus any transport / decode
-/// error.
+/// [`Error::Remote`] if Steam answered with a non-OK `EResult` (a private or
+/// otherwise refused profile), [`Error::WebSocket`] if the session stopped, plus
+/// any transport / decode error.
 pub async fn request_profile_info(session: &SessionHandle, steam_id: u64) -> Result<ProfileInfo> {
     let request = CMsgClientFriendProfileInfo {
         steamid_friend: Some(steam_id),
@@ -365,6 +392,20 @@ pub async fn request_profile_info(session: &SessionHandle, steam_id: u64) -> Res
     let response: crate::proto::CMsgClientFriendProfileInfoResponse = session
         .request(EMSG_CLIENT_FRIEND_PROFILE_INFO, &request)
         .await?;
+    profile_info_from_response(response, steam_id)
+}
+
+/// Convert a profile-info response into a [`ProfileInfo`], rejecting a non-OK
+/// `EResult` so a refused profile can't pass for an empty one.
+fn profile_info_from_response(
+    response: crate::proto::CMsgClientFriendProfileInfoResponse,
+    steam_id: u64,
+) -> Result<ProfileInfo> {
+    // proto2 default is Fail
+    let code = response.eresult.unwrap_or(eresult::FAIL);
+    if code != eresult::OK {
+        return Err(Error::Remote(format!("profile info: eresult {code}")));
+    }
 
     // Empty strings mean "not shared"; normalize them to `None`.
     let some_if_set = |s: Option<String>| s.filter(|v| !v.is_empty());
@@ -482,13 +523,116 @@ mod tests {
     }
 
     #[test]
+    fn summary_absent_when_the_player_name_bit_is_missing() {
+        use crate::proto::c_msg_client_persona_state::Friend;
+        use crate::proto::{CMsgClientPersonaState, CMsgProtoBufHeader};
+
+        // Status only: a "went online" push, no player_name in it.
+        let state = CMsgClientPersonaState {
+            status_flags: Some(1),
+            friends: vec![Friend {
+                friendid: Some(STEAM_ID),
+                persona_state: Some(1),
+                ..Default::default()
+            }],
+        };
+        let msg = SteamMessage {
+            emsg: EMSG_CLIENT_PERSONA_STATE,
+            header: CMsgProtoBufHeader::default(),
+            body: state.encode_to_vec(),
+        };
+        assert!(summary_from_persona_state(&msg, STEAM_ID)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn summary_accepts_a_player_name_only_reply() {
+        use crate::proto::c_msg_client_persona_state::Friend;
+        use crate::proto::{CMsgClientPersonaState, CMsgProtoBufHeader};
+
+        // PlayerName without Status: what a non-friend / restricted / offline
+        // account answers with.
+        let state = CMsgClientPersonaState {
+            status_flags: Some(2),
+            friends: vec![Friend {
+                friendid: Some(STEAM_ID),
+                player_name: Some("stranger".into()),
+                avatar_hash: Some(vec![0xde, 0xad, 0xbe, 0xef]),
+                ..Default::default()
+            }],
+        };
+        let msg = SteamMessage {
+            emsg: EMSG_CLIENT_PERSONA_STATE,
+            header: CMsgProtoBufHeader::default(),
+            body: state.encode_to_vec(),
+        };
+
+        let summary = summary_from_persona_state(&msg, STEAM_ID)
+            .unwrap()
+            .expect("a name and avatar is the answer we asked for");
+        assert_eq!(summary.persona_name, "stranger");
+        assert_eq!(summary.avatar_hash, "deadbeef");
+        // no Status bit: absent persona_state reads as Offline
+        assert_eq!(summary.state, PersonaState::Offline);
+        assert!(summary.current_game.is_none());
+    }
+
+    #[test]
+    fn profile_info_rejects_non_ok_eresult() {
+        use crate::proto::CMsgClientFriendProfileInfoResponse;
+
+        // EResult::Blocked.
+        let response = CMsgClientFriendProfileInfoResponse {
+            eresult: Some(40),
+            ..Default::default()
+        };
+        let err = profile_info_from_response(response, STEAM_ID).unwrap_err();
+        assert!(
+            matches!(err, Error::Remote(ref m) if m.contains("eresult 40")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn profile_info_missing_eresult_is_the_proto2_fail_default() {
+        use crate::proto::CMsgClientFriendProfileInfoResponse;
+
+        let response = CMsgClientFriendProfileInfoResponse::default();
+        assert_eq!(response.eresult, None);
+        let err = profile_info_from_response(response, STEAM_ID).unwrap_err();
+        assert!(
+            matches!(err, Error::Remote(ref m) if m.contains("eresult 2")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn profile_info_normalizes_empty_strings() {
+        use crate::proto::CMsgClientFriendProfileInfoResponse;
+
+        let response = CMsgClientFriendProfileInfoResponse {
+            eresult: Some(eresult::OK),
+            real_name: Some("Gabe".into()),
+            city_name: Some(String::new()),
+            time_created: Some(0),
+            ..Default::default()
+        };
+        let info = profile_info_from_response(response, STEAM_ID).unwrap();
+        assert_eq!(info.steam_id, STEAM_ID);
+        assert_eq!(info.real_name.as_deref(), Some("Gabe"));
+        assert_eq!(info.city, None);
+        assert_eq!(info.created_at, None);
+    }
+
+    #[test]
     fn summary_absent_when_friend_missing() {
         use crate::proto::{CMsgClientPersonaState, CMsgProtoBufHeader};
         let msg = SteamMessage {
             emsg: EMSG_CLIENT_PERSONA_STATE,
             header: CMsgProtoBufHeader::default(),
             body: CMsgClientPersonaState {
-                status_flags: Some(0),
+                status_flags: Some(PERSONA_FLAGS),
                 friends: vec![],
             }
             .encode_to_vec(),
