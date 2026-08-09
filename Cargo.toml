@@ -13,6 +13,11 @@ readme = "README.md"
 
 [features]
 default = []
+# Exposes the offline test seams (`SessionHandle::for_test`,
+# `GameCoordinator::for_test`, `session::driver::Command`) to out-of-crate
+# tests. Unsupported API; off in a normal build. Distinct from tokio's own
+# `test-util` feature, which the dev-dependencies enable for time control.
+test-seam = []
 
 [dependencies]
 # Async runtime

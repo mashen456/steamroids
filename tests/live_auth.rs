@@ -7,6 +7,10 @@
 //! instead of failing, so the normal `cargo test` run, contributor machines,
 //! and fork PRs stay green without credentials.
 //!
+//! Set `STEAM_LIVE_REQUIRED=1` to turn every one of those soft-skips into a
+//! panic. CI's live job sets it, so a missing secret fails the job instead of
+//! passing having tested nothing.
+//!
 //! # Accounts under test
 //!
 //! - **2FA account** (`STEAM_TEST_2FA_*`) — password plus a mobile
@@ -44,6 +48,7 @@
 //! - `STEAM_TEST_CS2_TARGET_ID` (optional) — scan this `SteamID64` instead of self
 //! - `STEAM_TEST_REFRESH_TOKEN` (optional)
 //! - `STEAM_TEST_PROXY_URL` (optional) — routes every call through a proxy
+//! - `STEAM_LIVE_REQUIRED` (optional) — any value but `0` makes a skip a panic
 
 use std::time::Duration;
 
@@ -96,6 +101,28 @@ fn env_opt(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Whether live coverage is mandatory. `STEAM_LIVE_REQUIRED` set to anything
+/// but `0` means the caller wants real coverage, so a skip is a failure.
+fn live_required() -> bool {
+    env_opt("STEAM_LIVE_REQUIRED").is_some_and(|v| v != "0")
+}
+
+/// Print a `SKIP` notice, or panic when `required`. Split from `skip` so the
+/// decision is testable without touching the environment.
+fn note_skip(required: bool, reason: &str) {
+    assert!(
+        !required,
+        "STEAM_LIVE_REQUIRED is set but the live test skipped: {reason}"
+    );
+    eprintln!("SKIP {reason}");
+}
+
+/// Print a `SKIP` notice, or panic when `STEAM_LIVE_REQUIRED` is set. Callers
+/// still `return` afterwards; this only decides skip-vs-fail.
+fn skip(reason: &str) {
+    note_skip(live_required(), reason);
 }
 
 /// Route the builder through `STEAM_TEST_PROXY_URL` if it is set. A malformed
@@ -193,11 +220,13 @@ async fn sign_in_for_session(
             Some(refresh_token)
         }
         SignInOutcome::NeedsEmailGuardCode { email_domain } => {
-            eprintln!("SKIP [{label}]: account still has email Steam Guard (domain {email_domain}); disable Steam Guard for a real login test");
+            skip(&format!("[{label}]: account still has email Steam Guard (domain {email_domain}); disable Steam Guard for a real login test"));
             None
         }
         SignInOutcome::RateLimited { retry_hint } => {
-            eprintln!("SKIP [{label}]: Steam rate-limited (retry {retry_hint:?})");
+            skip(&format!(
+                "[{label}]: Steam rate-limited (retry {retry_hint:?})"
+            ));
             None
         }
         SignInOutcome::NeedsMobileGuardCode => panic!(
@@ -230,8 +259,8 @@ async fn cs2_profile_scan() {
     // (which usually lacks a CS2 license, so the GC won't welcome and we
     // soft-skip below).
     let Some(acc) = load_account("CS2").or_else(|| load_account("PLAIN")) else {
-        eprintln!(
-            "SKIP cs2_profile_scan: set STEAM_TEST_CS2_ACCOUNT / _PASSWORD (a CS2-licensed account) or STEAM_TEST_PLAIN_*"
+        skip(
+            "cs2_profile_scan: set STEAM_TEST_CS2_ACCOUNT / _PASSWORD (a CS2-licensed account) or STEAM_TEST_PLAIN_*",
         );
         return;
     };
@@ -258,13 +287,15 @@ async fn cs2_profile_scan() {
     if let Err(e) = gc.wait_ready(Duration::from_secs(25)).await {
         // Report the session state too: a `logged_off (eresult 6)` here means the
         // account is logged in elsewhere, not that it lacks a CS2 license.
-        eprintln!(
-            "SKIP cs2_profile_scan: CS2 GC never became ready ({e}); session state = {:?}. \
+        let reason = format!(
+            "cs2_profile_scan: CS2 GC never became ready ({e}); session state = {:?}. \
              Causes: account lacks a CS2 license, or it's logged in elsewhere (eresult 6).",
             handle.state()
         );
+        // logoff before skip: skip panics when live coverage is required
         handle.logoff().await.ok();
         let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+        skip(&reason);
         return;
     }
     eprintln!("OK cs2: GC welcomed us");
@@ -278,7 +309,7 @@ async fn cs2_profile_scan() {
         ),
         None => cs2::account_id_from_steam_id(steam_id),
     };
-    match cs2::request_player_profile(&gc, account_id).await {
+    let no_profile = match cs2::request_player_profile(&gc, account_id).await {
         Ok(profile) => {
             assert_eq!(
                 profile.account_id, account_id,
@@ -288,15 +319,16 @@ async fn cs2_profile_scan() {
                 "OK cs2: profile account={} level={} xp={} rank={:?}",
                 profile.account_id, profile.level, profile.current_xp, profile.competitive_rank
             );
+            None
         }
         // The GC answered the handshake but had no profile row for us (e.g. a
         // brand-new account that has never played a match). The plumbing works;
         // there's just nothing to assert on.
-        Err(Error::Network(msg)) => {
-            eprintln!("SKIP cs2_profile_scan: GC returned no profile data ({msg})");
-        }
+        Err(Error::Network(msg)) => Some(format!(
+            "cs2_profile_scan: GC returned no profile data ({msg})"
+        )),
         Err(e) => panic!("cs2 profile request failed: {e}"),
-    }
+    };
 
     // 4. Clean shutdown.
     handle.logoff().await.expect("clean logoff");
@@ -305,6 +337,11 @@ async fn cs2_profile_scan() {
         .expect("driver ends after logoff")
         .expect("driver did not panic")
         .expect("clean driver shutdown");
+
+    // deferred so shutdown still runs when skip panics
+    if let Some(reason) = no_profile {
+        skip(&reason);
+    }
 }
 
 /// CM server discovery against the public Steam directory (no credentials).
@@ -353,9 +390,7 @@ async fn cm_logon_over_wss() {
     use steamroids::session::{spawn_session, SessionConfig, SessionState};
 
     let Some(acc) = load_account("2FA") else {
-        eprintln!(
-            "SKIP cm_logon_over_wss: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET"
-        );
+        skip("cm_logon_over_wss: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET");
         return;
     };
     let proxy = env_opt("STEAM_TEST_PROXY_URL")
@@ -441,7 +476,7 @@ async fn cm_logon_over_wss() {
 #[tokio::test]
 async fn refresh_token_flow_validates_token() {
     let Some(token) = env_opt("STEAM_TEST_REFRESH_TOKEN") else {
-        eprintln!("SKIP refresh_token_flow: set STEAM_TEST_REFRESH_TOKEN to run");
+        skip("refresh_token_flow: set STEAM_TEST_REFRESH_TOKEN to run");
         return;
     };
 
@@ -468,5 +503,21 @@ async fn refresh_token_flow_validates_token() {
             panic!("STEAM_TEST_REFRESH_TOKEN is expired — rotate the secret");
         }
         other => panic!("unexpected outcome for refresh-token flow: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::note_skip;
+
+    #[test]
+    fn note_skip_is_quiet_when_live_coverage_is_optional() {
+        note_skip(false, "no secrets configured");
+    }
+
+    #[test]
+    #[should_panic(expected = "STEAM_LIVE_REQUIRED is set but the live test skipped")]
+    fn note_skip_panics_when_live_coverage_is_required() {
+        note_skip(true, "no secrets configured");
     }
 }
