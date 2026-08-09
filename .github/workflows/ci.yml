@@ -60,10 +60,17 @@ jobs:
   # rather than leaving it green having tested nothing — configure the secrets
   # under Settings > Secrets and variables > Actions. For a real CS2 profile
   # scan, set STEAM_TEST_CS2_* to an account that owns CS2 (distinct from the
-  # 2FA account). Because nothing may skip, every secret below except
-  # STEAM_TEST_PROXY_URL and STEAM_TEST_CS2_TARGET_ID is now mandatory —
-  # including STEAM_TEST_REFRESH_TOKEN, which the tests used to treat as
-  # optional. Rotate it when refresh_token_flow reports it expired.
+  # 2FA account) — unset, cs2_profile_scan falls back to the plain account,
+  # which still gets a GC welcome because CS2 is free-to-play. So the mandatory
+  # secrets are the 2FA and plain account credentials; STEAM_TEST_CS2_*,
+  # STEAM_TEST_CS2_TARGET_ID and STEAM_TEST_PROXY_URL stay optional.
+  #
+  # STEAM_TEST_REFRESH_TOKEN is deliberately NOT a secret: Steam rotates a
+  # refresh token on every successful use, so a stored one is stale the moment
+  # anything redeems it. The mint step below issues a fresh one per run from the
+  # plain account instead, which also makes refresh_token_flow prove something
+  # better — that a just-issued token is accepted, not merely that an old JWT
+  # has not expired yet.
   #
   # The two live steps run in order on the same runner: live_auth logs Account A
   # (2FA) in once and parks its refresh token at target/refresh_token_a.txt, then
@@ -86,12 +93,31 @@ jobs:
       STEAM_TEST_CS2_PASSWORD: ${{ secrets.STEAM_TEST_CS2_PASSWORD }}
       STEAM_TEST_CS2_SHARED_SECRET: ${{ secrets.STEAM_TEST_CS2_SHARED_SECRET }}
       STEAM_TEST_CS2_TARGET_ID: ${{ secrets.STEAM_TEST_CS2_TARGET_ID }}
-      STEAM_TEST_REFRESH_TOKEN: ${{ secrets.STEAM_TEST_REFRESH_TOKEN }}
       STEAM_TEST_PROXY_URL: ${{ secrets.STEAM_TEST_PROXY_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Issue the token refresh_token_flow reuses. The plain account has no 2FA,
+      # so this cannot collide with the 2FA account's TOTP window the way a
+      # second Account A login would. Example 04 reads STEAM_ACCOUNT /
+      # STEAM_PASSWORD / PROXY_URL, hence the rename. The token is captured by
+      # command substitution (so it never reaches the log) and masked before it
+      # is written anywhere. An empty capture is a hard failure: a silently
+      # unset token would put us straight back to a test that skips itself.
+      - name: mint a fresh refresh token
+        run: |
+          token=$(STEAM_ACCOUNT="$STEAM_TEST_PLAIN_ACCOUNT" \
+                  STEAM_PASSWORD="$STEAM_TEST_PLAIN_PASSWORD" \
+                  PROXY_URL="$STEAM_TEST_PROXY_URL" \
+                  cargo run --quiet --example 04_signin_credentials \
+                  | sed -n 's/^ *refresh_token *: *//p')
+          if [ -z "$token" ]; then
+            echo "::error::could not mint a refresh token from the plain account"
+            exit 1
+          fi
+          echo "::add-mask::$token"
+          echo "STEAM_TEST_REFRESH_TOKEN=$token" >> "$GITHUB_ENV"
       - name: live auth logins
         run: cargo test --test live_auth -- --include-ignored --nocapture
       - name: live friends api
