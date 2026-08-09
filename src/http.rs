@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use reqwest::{Client, Proxy};
 
+use crate::transport::authority;
 use crate::transport::proxy::{ProxyConfig, ProxyCredentials, ProxyKind};
 use crate::{Error, Result};
 
@@ -43,7 +44,7 @@ pub(crate) fn build_proxy(cfg: &ProxyConfig) -> Result<Proxy> {
         ProxyKind::HttpConnect if cfg.tls_to_proxy => "https",
         ProxyKind::HttpConnect => "http",
     };
-    let url = format!("{scheme}://{}:{}", cfg.host, cfg.port);
+    let url = format!("{scheme}://{}", authority(&cfg.host, cfg.port));
 
     let mut proxy = Proxy::all(&url).map_err(|e| Error::InvalidConfig(format!("proxy: {e}")))?;
     if let Some(ProxyCredentials { username, password }) = cfg.credentials.as_ref() {
@@ -72,6 +73,15 @@ mod tests {
     fn build_proxy_accepts_https_to_proxy() {
         // reqwest handles TLS-to-proxy natively; this must build.
         let cfg = ProxyConfig::parse("https://u:p@host:8443").unwrap();
+        build_proxy(&cfg).unwrap();
+    }
+
+    #[test]
+    fn build_proxy_rebrackets_ipv6_host() {
+        // ProxyConfig stores the host bare, so the URL handed to reqwest has to
+        // put the brackets back or it is not a parseable authority.
+        let cfg = ProxyConfig::parse("socks5://[2001:db8::1]:1080").unwrap();
+        assert_eq!(cfg.host, "2001:db8::1");
         build_proxy(&cfg).unwrap();
     }
 
