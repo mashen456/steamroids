@@ -22,8 +22,28 @@
 //!   expiry) locally and hand it back for a CM `ClientLogon`. `SteamClient`
 //!   tokens can't be redeemed over the `WebAPI`, so no access token is minted.
 //!
-//! No Connection Manager / `ClientLogon` WSS connection is established here —
-//! that lands in `0.2.x` once we have the `EMsg` envelope codec.
+//! # Limitation: the refresh-token flow is offline-only
+//!
+//! Nothing in this module opens a Connection Manager socket, so **no sign-in
+//! here proves a refresh token is still live**. The refresh flow checks the
+//! JWT's shape and its `exp` claim and nothing else. A token that Steam has
+//! *revoked* (password change, "deauthorise all devices", a session the user
+//! killed from the mobile app) is indistinguishable from a good one until it is
+//! actually presented to a CM.
+//!
+//! In practice that means:
+//!
+//! - [`SignInOutcome::TokenRejected`] is only ever returned for a token this
+//!   crate could reject locally, i.e. an expired one.
+//! - A revoked-but-unexpired token yields [`SignInOutcome::Success`], and the
+//!   rejection surfaces later from
+//!   [`spawn_session`](crate::session::spawn_session) as
+//!   [`Error::AuthRejected`] (as opposed to [`Error::LogonRetryable`], which
+//!   means the CM was merely busy and the token is fine).
+//! - So a fleet that persists tokens must treat an `AuthRejected` out of
+//!   `spawn_session` as "discard the stored token and re-run the password
+//!   flow". [`SignIn::execute_with_store`] cannot do that for you: by the time
+//!   the CM says no, `execute_with_store` has already returned.
 //!
 //! # Example
 //!
@@ -45,7 +65,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tracing::debug;
 
 use crate::auth::jwt::{refresh_token_claims, steam_id_from_refresh_token};
@@ -83,7 +103,10 @@ const TOKEN_EXPIRY_SLACK_SECS: u64 = 60;
 // Polling defaults — Steam returns a per-session `interval` (seconds) but
 // some responses leave it zero. Anchor on the bounds steam-user uses.
 const POLL_DEFAULT_INTERVAL_SECS: u64 = 5;
-const POLL_MAX_ATTEMPTS: usize = 24;
+// Wall-clock budget for the whole poll phase. Bounding attempts instead would
+// scale with whatever interval Steam hands out, so the timeout message could
+// name a duration that never elapsed.
+const POLL_BUDGET: Duration = Duration::from_secs(120);
 
 /// Outcome of a [`SignIn::execute`] call.
 ///
@@ -112,6 +135,11 @@ pub enum SignInOutcome {
     /// 2FA required and no `shared_secret` was supplied. Caller must add one
     /// (mobile authenticator) or fall back to email-Guard handling.
     NeedsMobileGuardCode,
+    /// Steam saw the Steam Guard code we submitted and refused it
+    /// (`EResult::TwoFactorCodeMismatch`). The usual causes are a wrong
+    /// `shared_secret` or a host clock more than a time-step out of sync,
+    /// not a missing secret, so re-running with the same inputs won't help.
+    GuardCodeRejected,
     /// Email-based Steam Guard is required. The two-letter domain is what
     /// Steam reveals about the recipient address.
     NeedsEmailGuardCode {
@@ -121,12 +149,19 @@ pub enum SignInOutcome {
     /// Username/password rejected. Permanent — no point retrying with the
     /// same input.
     InvalidCredentials,
-    /// Refresh token was rejected by Steam (expired or revoked). Re-run the
-    /// password flow.
+    /// The refresh token is unusable and the password flow should be re-run.
+    ///
+    /// Only reachable from checks this crate can make without a CM round-trip:
+    /// the token is expired, or it doesn't decode as a JWT at all. Steam-side
+    /// revocation is **not** detected here; see the [module docs](self#limitation-the-refresh-token-flow-is-offline-only).
     TokenRejected,
-    /// Steam threw a transient rate limit. Caller should back off.
+    /// Steam threw a transient rate limit or login throttle. Caller should
+    /// back off.
     RateLimited {
-        /// Steam's hint at when to retry, if it provided one.
+        /// Suggested backoff before retrying. Steam's auth responses carry no
+        /// retry-after field, so this is this crate's own fixed default rather
+        /// than anything Steam told us. `None` means "back off, we have no
+        /// suggestion".
         retry_hint: Option<std::time::Duration>,
     },
 }
@@ -147,6 +182,7 @@ impl fmt::Debug for SignInOutcome {
                 .field("access_token", &access_token.as_ref().map(|_| "<redacted>"))
                 .finish(),
             Self::NeedsMobileGuardCode => f.write_str("NeedsMobileGuardCode"),
+            Self::GuardCodeRejected => f.write_str("GuardCodeRejected"),
             Self::NeedsEmailGuardCode { email_domain } => f
                 .debug_struct("NeedsEmailGuardCode")
                 .field("email_domain", email_domain)
@@ -185,10 +221,14 @@ impl SignIn {
 
     /// Start a sign-in with a previously-obtained refresh token. Skips 2FA.
     ///
-    /// `execute` validates the token locally (decodes the JWT, checks it isn't
-    /// expired) and returns it for use with
+    /// `execute` validates the token **locally only** (decodes the JWT, checks
+    /// it isn't expired) and returns it for use with
     /// [`spawn_session`](crate::session::spawn_session), which logs on over the
-    /// CM. It does **not** mint a web access token: Steam only redeems these
+    /// CM. `Success` here therefore means "this token is well-formed and not
+    /// yet expired", not "Steam still honours it"; see the
+    /// [module docs](self#limitation-the-refresh-token-flow-is-offline-only).
+    ///
+    /// It does **not** mint a web access token: Steam only redeems these
     /// `SteamClient` tokens over an authenticated CM session, not the `WebAPI`,
     /// so [`SignInOutcome::Success::access_token`] is `None` for this flow.
     pub fn with_refresh_token(token: impl Into<String>) -> Self {
@@ -213,6 +253,12 @@ impl SignIn {
     /// Route the connection (and any HTTP-bearing handshake steps) through a
     /// SOCKS5 or HTTP-CONNECT proxy. Parse via
     /// [`ProxyConfig::parse`](crate::transport::proxy::ProxyConfig::parse).
+    ///
+    /// No-op for [`Self::with_refresh_token`] flows: that flow validates the
+    /// token offline and opens no socket, so there is nothing to route. As with
+    /// [`Self::shared_secret`] the configuration is accepted rather than
+    /// rejected, since [`Self::execute_with_store`] still needs it for the
+    /// password-flow fallback.
     pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
         self.proxy = Some(proxy);
         self
@@ -246,11 +292,19 @@ impl SignIn {
     ///    refresh flow with it.
     /// 2. On success, [`TokenStore::save`] whatever token came back (Steam may
     ///    rotate it) and return.
-    /// 3. If the stored token was rejected (expired / revoked) or none existed,
-    ///    run the full password flow, then save the freshly issued token.
+    /// 3. If no token existed, or the stored one was unusable (expired, or not
+    ///    a decodable JWT, from a truncated or corrupted store entry), run the
+    ///    full password flow, then save the freshly issued token. A bad store
+    ///    entry is never fatal: it is treated as "no token".
     ///
     /// A [`SignIn::with_refresh_token`] builder has no account key to persist
     /// under, so it bypasses the store and behaves like [`Self::execute`].
+    ///
+    /// Note the fallback can only fire on failures this crate detects offline.
+    /// A stored token Steam has *revoked* still looks valid here and is
+    /// returned as `Success`; see the
+    /// [module docs](self#limitation-the-refresh-token-flow-is-offline-only)
+    /// for what the caller has to do about that.
     ///
     /// # Errors
     ///
@@ -277,7 +331,21 @@ impl SignIn {
             if let Some(p) = proxy {
                 attempt = attempt.proxy(p);
             }
-            match attempt.execute().await? {
+            // A stored token that won't even decode is a bad store entry, not
+            // a caller input error: treat it as stale and re-auth.
+            let outcome = match attempt.execute().await {
+                Ok(o) => o,
+                Err(Error::AuthRejected(reason)) => {
+                    debug!(
+                        target: "steamroids::auth::signin",
+                        %reason,
+                        "stored refresh token undecodable, falling back to password flow"
+                    );
+                    SignInOutcome::TokenRejected
+                }
+                Err(e) => return Err(e),
+            };
+            match outcome {
                 SignInOutcome::Success {
                     steam_id,
                     refresh_token,
@@ -357,6 +425,10 @@ impl SignIn {
     /// decode and sanity-check the JWT (Steam ID present, not expired) and
     /// return the token unchanged. No web access token is minted — `Success`
     /// carries `access_token: None`.
+    ///
+    /// The corollary is that revocation is invisible to this function: only
+    /// the CM knows whether Steam still honours the token. `TokenRejected`
+    /// here means "expired", never "revoked".
     fn execute_refresh_token_flow(self) -> Result<SignInOutcome> {
         let Credentials::RefreshToken(token) = &self.credentials else {
             unreachable!("dispatched by execute()");
@@ -574,17 +646,24 @@ async fn resolve_guard(
 }
 
 async fn poll_for_token(client: &WebApiClient, begin: &BeginSession) -> Result<SignInOutcome> {
-    let req = CAuthenticationPollAuthSessionStatusRequest {
+    let mut req = CAuthenticationPollAuthSessionStatusRequest {
         client_id: Some(begin.client_id),
         request_id: Some(begin.request_id.clone()),
         ..Default::default()
     };
-    for attempt in 0..POLL_MAX_ATTEMPTS {
+    let deadline = Instant::now() + POLL_BUDGET;
+    let mut first = true;
+    loop {
         // Poll immediately on the first try; sleep between retries only.
         // Saves a guaranteed `poll_interval` of latency on every successful
         // login when Steam already has our token ready.
-        if attempt > 0 {
+        if first {
+            first = false;
+        } else {
             sleep(begin.poll_interval).await;
+            if Instant::now() >= deadline {
+                break;
+            }
         }
 
         let (er, resp): (_, CAuthenticationPollAuthSessionStatusResponse) = client
@@ -600,6 +679,12 @@ async fn poll_for_token(client: &WebApiClient, begin: &BeginSession) -> Result<S
             )));
         }
 
+        // Steam may rotate the auth session mid-poll; keep polling the new one.
+        req.client_id = Some(rotate_client_id(
+            req.client_id.unwrap_or(begin.client_id),
+            resp.new_client_id,
+        ));
+
         if let Some(rt) = resp.refresh_token.filter(|s| !s.is_empty()) {
             let steam_id = steam_id_from_refresh_token(&rt).unwrap_or(begin.session_steamid);
             let access_token = resp.access_token.filter(|s| !s.is_empty());
@@ -612,6 +697,12 @@ async fn poll_for_token(client: &WebApiClient, begin: &BeginSession) -> Result<S
     }
 
     Err(Error::Timeout("auth poll exceeded 120s"))
+}
+
+/// Apply Steam's `new_client_id` rotation hint, keeping `current` when the
+/// field is absent or zero.
+fn rotate_client_id(current: u64, hint: Option<u64>) -> u64 {
+    hint.filter(|id| *id != 0).unwrap_or(current)
 }
 
 /// Translate Steam's poll-interval hint (seconds, as `f32`) into a real
@@ -778,6 +869,63 @@ mod tests {
         ) -> std::result::Result<(), crate::auth::TokenStoreError> {
             panic!("store must not be saved for a refresh-token builder");
         }
+    }
+
+    /// A store holding one corrupted entry, recording whether `save` ran.
+    struct CorruptStore {
+        saved: std::sync::Mutex<Option<String>>,
+    }
+
+    impl TokenStore for CorruptStore {
+        async fn load(
+            &self,
+            _account: &str,
+        ) -> std::result::Result<Option<String>, crate::auth::TokenStoreError> {
+            Ok(Some("this-is-not-a-jwt".into()))
+        }
+        async fn save(
+            &self,
+            _account: &str,
+            token: &str,
+        ) -> std::result::Result<(), crate::auth::TokenStoreError> {
+            *self.saved.lock().unwrap() = Some(token.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_with_store_falls_back_when_stored_token_is_corrupt() {
+        // A garbage store entry must not propagate as Err; it has to fall
+        // through to the password flow. Route through a dead local proxy so
+        // the fallback fails at the first HTTP hop instead of reaching Steam.
+        let store = CorruptStore {
+            saved: std::sync::Mutex::new(None),
+        };
+        let err = SignIn::with_password("bot01", "pw")
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .execute_with_store(&store)
+            .await
+            .unwrap_err();
+        // Network, not AuthRejected: we got past the token stage.
+        assert!(
+            matches!(err, Error::Network(_)),
+            "expected the password flow to run, got {err:?}"
+        );
+        assert!(
+            store.saved.lock().unwrap().is_none(),
+            "a corrupt token must never be written back"
+        );
+    }
+
+    #[test]
+    fn rotate_client_id_keeps_current_without_a_hint() {
+        assert_eq!(rotate_client_id(7, None), 7);
+        assert_eq!(rotate_client_id(7, Some(0)), 7);
+    }
+
+    #[test]
+    fn rotate_client_id_follows_steams_rotation() {
+        assert_eq!(rotate_client_id(7, Some(9)), 9);
     }
 
     #[tokio::test]
