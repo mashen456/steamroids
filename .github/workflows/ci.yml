@@ -107,10 +107,16 @@ jobs:
       # unset token would put us straight back to a test that skips itself.
       - name: mint a fresh refresh token
         run: |
-          token=$(STEAM_ACCOUNT="$STEAM_TEST_PLAIN_ACCOUNT" \
-                  STEAM_PASSWORD="$STEAM_TEST_PLAIN_PASSWORD" \
-                  PROXY_URL="$STEAM_TEST_PROXY_URL" \
-                  cargo run --quiet --example 04_signin_credentials \
+          # the default shell is `bash -e` without pipefail, so a failing
+          # `cargo run` would otherwise be masked by sed's exit status
+          set -o pipefail
+          export STEAM_ACCOUNT="$STEAM_TEST_PLAIN_ACCOUNT"
+          export STEAM_PASSWORD="$STEAM_TEST_PLAIN_PASSWORD"
+          # only when configured: an unset secret arrives as an empty string
+          if [ -n "$STEAM_TEST_PROXY_URL" ]; then
+            export PROXY_URL="$STEAM_TEST_PROXY_URL"
+          fi
+          token=$(cargo run --quiet --example 04_signin_credentials \
                   | sed -n 's/^ *refresh_token *: *//p')
           if [ -z "$token" ]; then
             echo "::error::could not mint a refresh token from the plain account"

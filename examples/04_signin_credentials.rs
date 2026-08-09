@@ -33,8 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let account = env::var("STEAM_ACCOUNT").map_err(|_| "STEAM_ACCOUNT env var not set")?;
     let password = env::var("STEAM_PASSWORD").map_err(|_| "STEAM_PASSWORD env var not set")?;
-    let shared_secret = env::var("SHARED_SECRET").ok();
-    let proxy_url = env::var("PROXY_URL").ok();
+    // Empty counts as unset: CI passes an unconfigured secret through as an
+    // empty string, and an empty PROXY_URL would otherwise reach the parser as
+    // a URL and fail with `RelativeUrlWithoutBase`.
+    let shared_secret = env::var("SHARED_SECRET").ok().filter(|s| !s.is_empty());
+    let proxy_url = env::var("PROXY_URL").ok().filter(|s| !s.is_empty());
 
     // Builder: required → optional. Chaining only the fields that are set
     // keeps the call site readable when the optional inputs vary.
