@@ -16,21 +16,50 @@ the build has no submodule or network dependency.
 
 ## Currently vendored
 
-Minimal subset needed for `0.1.x` (login + heartbeat).
+18 files: 11 Steam, 6 CS2 Game Coordinator, and `descriptor.proto` for imports.
+`build.rs` compiles the first 17; `descriptor.proto` is resolved via the include
+path only.
+
+### `steam/`: Connection Manager
+
+Compiled into the flat [`proto`](../src/proto.rs) module.
 
 | File | Used for |
 |---|---|
-| `steam/steammessages_base.proto` | `CMsgProtoBufHeader` (header on every EMsg) |
-| `steam/enums.proto` | `EResult`, `EUniverse`, etc. |
-| `steam/enums_clientserver.proto` | the `EMsg` enum |
-| `steam/steammessages_unified_base.steamclient.proto` | base for service-style messages |
-| `steam/steammessages_auth.steamclient.proto` | `BeginAuthSessionViaCredentials`, `Poll`, `GenerateAccessTokenForApp` |
-| `steam/steammessages_credentials.steamclient.proto` | credential exchange types |
-| `steam/steammessages_clientserver_login.proto` | `CMsgClientLogon`, `CMsgClientLogonResponse`, `CMsgClientHeartBeat` |
-| `google/protobuf/descriptor.proto` | resolved via include path so `extend google.protobuf.MessageOptions` parses; not compiled (prost ships `prost-types` for it) |
+| `steammessages_base.proto` | `CMsgProtoBufHeader` (header on every EMsg), `CMsgMulti` |
+| `enums.proto` | `EResult`, `EUniverse`, etc. |
+| `enums_clientserver.proto` | the `EMsg` enum |
+| `steammessages_unified_base.steamclient.proto` | base for service-style messages |
+| `steammessages_auth.steamclient.proto` | `BeginAuthSessionViaCredentials`, `PollAuthSessionStatus`, `GenerateAccessTokenForApp` |
+| `steammessages_credentials.steamclient.proto` | credential exchange types |
+| `steammessages_clientserver_login.proto` | `CMsgClientLogon`, `CMsgClientLogonResponse`, `CMsgClientHeartBeat`, `CMsgClientLoggedOff` |
+| `steammessages_clientserver.proto` | `CMsgClientGamesPlayed` (launch an app so its GC routes to us) |
+| `steammessages_clientserver_2.proto` | the `CMsgGCClient` client↔GC relay envelope |
+| `steammessages_clientserver_friends.proto` | friends, nicknames, groups, chat, `CMsgClientPersonaState`, `CMsgClientFriendProfileInfo` |
+| `encrypted_app_ticket.proto` | `EncryptedAppTicket`; imported by `steammessages_clientserver.proto` |
 
-For `0.2.x` (CS2 Game Coordinator) we'll add at least `csgo/gcsystemmsgs.proto`
-and `csgo/cstrike15_gcmessages.proto`.
+### `csgo/`: CS2 Game Coordinator
+
+Compiled into a separate [`proto::gc`](../src/proto.rs) module (its own
+`OUT_DIR/gc` output). These files are package-less like the Steam set and
+several names collide (`CMsgProtoBufHeader`, `CMsgClientHello`,
+`ECommunityItemClass`) while being *different* messages, so a shared flat
+namespace would clash.
+
+| File | Used for |
+|---|---|
+| `steammessages.proto` | the GC's own `CMsgProtoBufHeader` (its own field layout, not the CM one) |
+| `gcsystemmsgs.proto` | `EGCBaseClientMsg`: `k_EMsgGCClientHello` / `…Welcome` / `…ConnectionStatus` |
+| `gcsdk_gcmessages.proto` | `CMsgClientHello` / `CMsgClientWelcome`, `GCConnectionStatus` |
+| `cstrike15_gcmessages.proto` | `ECsgoGCMsg`, `CMsgGCCStrike15_v2_ClientRequestPlayersProfile` / `…PlayersProfile` |
+| `base_gcmessages.proto` | GC base types imported by the CS2 messages |
+| `engine_gcmessages.proto` | `CEngineGotvSyncPacket`; imported by the CS2 messages |
+
+### `google/`
+
+| File | Used for |
+|---|---|
+| `google/protobuf/descriptor.proto` | resolved via include path so `extend google.protobuf.MessageOptions` parses; not compiled (prost ships `prost-types` for it) |
 
 ## Re-vendoring upstream changes
 
@@ -45,6 +74,16 @@ for f in \
   steam/steammessages_auth.steamclient.proto \
   steam/steammessages_credentials.steamclient.proto \
   steam/steammessages_clientserver_login.proto \
+  steam/steammessages_clientserver.proto \
+  steam/steammessages_clientserver_2.proto \
+  steam/steammessages_clientserver_friends.proto \
+  steam/encrypted_app_ticket.proto \
+  csgo/steammessages.proto \
+  csgo/gcsystemmsgs.proto \
+  csgo/gcsdk_gcmessages.proto \
+  csgo/cstrike15_gcmessages.proto \
+  csgo/base_gcmessages.proto \
+  csgo/engine_gcmessages.proto \
   google/protobuf/descriptor.proto
 do
   curl -sSf -o "protos/$f" "$BASE/$f"
