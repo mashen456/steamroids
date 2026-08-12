@@ -47,6 +47,8 @@
 //! - [`friends`]: friends list, add / remove, nicknames, visibility, chat,
 //!   groups
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
+//! - [`gcpd`]: CS2 competitive cooldown extraction from GCPD html
+//!   ([`gcpd::parse_cooldown`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 //! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
 //! - [`web`]: mint a `steamcommunity.com` web access token over the session
@@ -60,6 +62,7 @@ pub mod cs2;
 pub mod error;
 pub mod friends;
 pub mod gc;
+pub mod gcpd;
 pub mod persona;
 pub mod pool;
 pub mod proto;
