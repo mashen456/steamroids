@@ -65,8 +65,8 @@ pub fn generate_auth_code(
 ///
 /// `offset_secs` corrects for drift between the local clock and Steam's own,
 /// as reported by [`query_server_time_offset`]: `local_time + offset_secs`
-/// approximates Steam's clock. Pass `0` for plain local-clock generation —
-/// that is exactly what [`generate_auth_code`] does.
+/// approximates Steam's clock. Pass `0` for plain local-clock generation,
+/// which is exactly what [`generate_auth_code`] does.
 ///
 /// The offset is applied with saturating arithmetic, so an absurd value
 /// clamps to the unix epoch rather than underflowing.
@@ -124,7 +124,7 @@ pub fn generate_with_step(secret: &[u8], step: u64) -> String {
 ///
 /// The offset only changes if the local machine's clock is re-synced or
 /// drifts, so it is stable over the lifetime of a process. **Fetch it once
-/// and reuse it** — do not call this before every code generation. There is
+/// and reuse it**: do not call this before every code generation. There is
 /// no caching or refresh built in here; that policy is the caller's.
 ///
 /// # Errors
@@ -136,7 +136,7 @@ pub async fn query_server_time_offset(proxy: Option<&ProxyConfig>) -> Result<i64
     let client = crate::http::client(proxy)?;
     let response = client
         .post(QUERY_TIME_URL)
-        // Akamai 411s a bodyless POST — send an explicit empty body.
+        // Akamai 411s a bodyless POST, so send an explicit empty body.
         .body(Vec::new())
         .send()
         .await
@@ -163,8 +163,8 @@ pub async fn query_server_time_offset(proxy: Option<&ProxyConfig>) -> Result<i64
     Ok(server_time.saturating_sub(local))
 }
 
-/// JSON shape of `ITwoFactorService/QueryTime/v0001`'s response — only the
-/// field this crate uses. Verified against a live call: `server_time` comes
+/// JSON shape of `ITwoFactorService/QueryTime/v0001`'s response (only the
+/// field this crate uses). Verified against a live call: `server_time` comes
 /// back as a **json string**, not a number.
 #[derive(Deserialize)]
 struct QueryTimeResponse {
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn parses_query_time_response_shape() {
-        // captured from a live call to ITwoFactorService/QueryTime/v0001 —
+        // captured from a live call to ITwoFactorService/QueryTime/v0001:
         // server_time is a json string, not a number.
         let body = r#"{"response":{"server_time":"1786573085","skew_tolerance_seconds":"60","large_time_jink":"86400","probe_frequency_seconds":3600,"adjusted_time_probe_frequency_seconds":300,"hint_probe_frequency_seconds":60,"sync_timeout":60,"try_again_seconds":900,"max_attempts":3}}"#;
         assert_eq!(parse_server_time(body).unwrap(), 1_786_573_085);
