@@ -53,6 +53,8 @@
 //! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
 //! - [`ratelimit`]: a shareable request pacer for fleets behind proxies
 //!   ([`ratelimit::RateLimiter`])
+//! - [`wallet`]: the account's wallet balance, read from Steam's unprompted
+//!   post-login/on-change push ([`wallet::wallet`])
 //! - [`web`]: mint a `steamcommunity.com` web access token over the session
 //!   ([`web::request_web_token`])
 
@@ -71,6 +73,7 @@ pub mod proto;
 pub mod ratelimit;
 pub mod session;
 pub mod transport;
+pub mod wallet;
 pub mod web;
 
 // Crate-private: shared reqwest client setup for the WebAPI auth flow and CM

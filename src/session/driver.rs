@@ -90,11 +90,25 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 // comes up, only to find the push already broadcast and gone.
 const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 3] = [767, 5553, 5587];
 
-/// First-wins-per-emsg cache of the [`POST_LOGIN_SNAPSHOT_EMSGS`] bodies for the
-/// current logon. Shared between the driver (the only writer) and every
+// Emsgs Steam re-pushes on every change, not just once after logon: the
+// wallet balance (`k_EMsgClientWalletInfoUpdate` = 5528). First-wins would be
+// wrong here: a later push is the current balance, not a stale delta to
+// ignore, so the driver overwrites the cached body every time instead (see
+// [`SnapshotCache`]). Kept as its own list, deliberately never merged into
+// [`POST_LOGIN_SNAPSHOT_EMSGS`], so that list's first-wins policy (load-bearing
+// for the friends snapshot) can never be perturbed by adding an emsg here.
+const LAST_WINS_CACHE_EMSGS: [u32; 1] = [5528];
+
+/// Cache of unsolicited-push bodies for the current logon, keyed by emsg. Two
+/// write policies share the map: [`POST_LOGIN_SNAPSHOT_EMSGS`] are first-wins
+/// (a one-shot snapshot that a later delta must never overwrite),
+/// [`LAST_WINS_CACHE_EMSGS`] are last-wins (a value that keeps changing, where
+/// only the latest push is useful). [`SessionHandle::cached_snapshot`] is a
+/// single reader oblivious to which policy filled a given entry: the emsg
+/// alone decides. Shared between the driver (the only writer) and every
 /// [`SessionHandle`] (readers); cleared on every (re)logon because Steam
-/// re-pushes the snapshots. Critical sections are a single map op — never held
-/// across an `.await` — so a blocking `std::sync::Mutex` is the right fit.
+/// re-pushes both kinds. Critical sections are a single map op, never held
+/// across an `.await`, so a blocking `std::sync::Mutex` is the right fit.
 type SnapshotCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
 
 /// Everything the driver needs to establish — and re-establish — a session.
@@ -372,15 +386,21 @@ impl SessionHandle {
         self.events.subscribe()
     }
 
-    /// The cached body of a one-shot post-login snapshot Steam pushes once after
-    /// logon (the full friends list, friends-groups list or player-nickname
-    /// list), or `None` if that snapshot hasn't arrived yet on this logon.
+    /// The cached body of the most recent unsolicited push Steam sent this
+    /// logon for `emsg`, or `None` if none has arrived yet.
     ///
-    /// Lets a caller read a snapshot it may have missed on [`Self::subscribe`]
-    /// without racing the post-login push. To stay race-free, **subscribe
-    /// first, then read the cache**: any snapshot not yet cached is still
-    /// guaranteed to reach the subscription. The cache is cleared and repopulated
-    /// on every reconnect. Only the post-login snapshot emsgs are cached.
+    /// Two kinds of emsg are cached, with different overwrite policies: the
+    /// post-login snapshots (full friends list, friends-groups list,
+    /// player-nickname list) are first-wins, so a later incremental delta on
+    /// the same emsg never overwrites the full snapshot already cached;
+    /// wallet-balance updates are last-wins, so a later push always replaces
+    /// the previous balance. Any other emsg is never cached, so this returns
+    /// `None` for it even after a matching push reached [`Self::subscribe`].
+    ///
+    /// For a first-wins emsg, to stay race-free **subscribe first, then read
+    /// the cache**: any snapshot not yet cached is still guaranteed to reach
+    /// the subscription. The cache is cleared and repopulated on every
+    /// reconnect.
     pub fn cached_snapshot(&self, emsg: u32) -> Option<Vec<u8>> {
         self.snapshots
             .lock()
@@ -409,13 +429,13 @@ impl SessionHandle {
 
     /// **Test-only.** Build a handle with no driver behind it, returning the
     /// pieces a fake driver needs: the command receiver, the event sender and
-    /// the post-login snapshot cache.
+    /// the snapshot cache.
     ///
-    /// This exists so `friends` / `persona` / `cs2` / `gc` request builders can
-    /// be covered offline: a test drives the returned receiver and answers
-    /// commands itself. Not part of the supported API: it may change or vanish
-    /// in any release, and it is useless in production code. Compiled only
-    /// under `cfg(test)` or the `test-seam` feature.
+    /// This exists so `friends` / `persona` / `cs2` / `gc` / `wallet` request
+    /// builders can be covered offline: a test drives the returned receiver
+    /// and answers commands itself. Not part of the supported API: it may
+    /// change or vanish in any release, and it is useless in production code.
+    /// Compiled only under `cfg(test)` or the `test-seam` feature.
     #[cfg(any(test, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn for_test(
@@ -920,6 +940,14 @@ fn dispatch(
             .entry(msg.emsg)
             .or_insert_with(|| msg.body.clone());
     }
+    // Wallet balance changes repeatedly, so cache the latest body seen instead
+    // (last-wins), the opposite policy from the post-login snapshots above.
+    if LAST_WINS_CACHE_EMSGS.contains(&msg.emsg) {
+        snapshots
+            .lock()
+            .expect("snapshot cache mutex poisoned")
+            .insert(msg.emsg, msg.body.clone());
+    }
     // Unsolicited, or no waiter — broadcast (ignored if there are no subscribers).
     let _ = events.send(msg);
 }
@@ -961,6 +989,45 @@ mod tests {
 
     fn empty_snapshots() -> SnapshotCache {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn dispatch_caches_the_latest_wallet_push_last_wins() {
+        let mut pending: HashMap<u64, Pending> = HashMap::new();
+        let (events, _keep) = broadcast::channel(8);
+        let snapshots = empty_snapshots();
+        let wallet_emsg = LAST_WINS_CACHE_EMSGS[0];
+
+        // A balance push arrives, then the balance changes and a second push
+        // arrives. Unlike the post-login snapshots, the second push must win.
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(wallet_emsg, None, vec![1, 1]),
+        );
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(wallet_emsg, None, vec![2, 2]),
+        );
+
+        let cached = snapshots.lock().unwrap().get(&wallet_emsg).cloned();
+        assert_eq!(cached, Some(vec![2, 2]), "latest push must win");
+    }
+
+    #[test]
+    fn last_wins_and_post_login_snapshot_emsgs_are_disjoint() {
+        // Guards the exact trap this cache design has to avoid: an emsg must
+        // never be first-wins (post-login snapshot) and last-wins (wallet-style
+        // repeated push) at once, or one policy silently shadows the other.
+        for emsg in LAST_WINS_CACHE_EMSGS {
+            assert!(
+                !POST_LOGIN_SNAPSHOT_EMSGS.contains(&emsg),
+                "emsg {emsg} cannot be both first-wins and last-wins"
+            );
+        }
     }
 
     fn pending_entry(deadline: Instant) -> (Pending, oneshot::Receiver<Result<SteamMessage>>) {
