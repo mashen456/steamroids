@@ -51,6 +51,8 @@
 //!   GCPD page ([`gcpd::request_cs2_cooldown`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 //! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
+//! - [`ratelimit`]: a shareable request pacer for fleets behind proxies
+//!   ([`ratelimit::RateLimiter`])
 //! - [`web`]: mint a `steamcommunity.com` web access token over the session
 //!   ([`web::request_web_token`])
 
@@ -66,6 +68,7 @@ pub mod gcpd;
 pub mod persona;
 pub mod pool;
 pub mod proto;
+pub mod ratelimit;
 pub mod session;
 pub mod transport;
 pub mod web;
