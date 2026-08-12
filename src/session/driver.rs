@@ -53,8 +53,6 @@ const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
 // k_EMsgClientLogOff, from protos/steam/enums_clientserver.proto.
 const EMSG_CLIENT_LOGOFF: u32 = 706;
 // enums_clientserver.proto: k_EMsgServiceMethodCallFromClient
-// wired into call_service in a later task
-#[allow(dead_code)]
 pub(crate) const EMSG_SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
 // enums_clientserver.proto: k_EMsgServiceMethodResponse
 // wired into call_service in a later task
@@ -237,6 +235,55 @@ impl SessionHandle {
         Resp: prost::Message + Default,
     {
         self.dispatch_request(emsg, req, None, timeout, true).await
+    }
+
+    /// Call a Steam unified service method over this session.
+    ///
+    /// Unified services are addressed by name rather than by `EMsg`: the frame
+    /// goes out as `ServiceMethodCallFromClient` with a header naming
+    /// `Interface.Method#Version`. The reply is correlated by job id exactly like
+    /// [`Self::request`], so the usual deadline applies.
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &steamroids::session::SessionHandle) -> steamroids::Result<()> {
+    /// # use steamroids::proto::{
+    /// #     CAuthenticationAccessTokenGenerateForAppRequest,
+    /// #     CAuthenticationAccessTokenGenerateForAppResponse,
+    /// # };
+    /// let req = CAuthenticationAccessTokenGenerateForAppRequest::default();
+    /// let resp: CAuthenticationAccessTokenGenerateForAppResponse = session
+    ///     .call_service("Authentication", "GenerateAccessTokenForApp", 1, &req)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Remote`] if the reply header carries a non-OK `EResult`,
+    /// [`Error::Timeout`] if no reply arrives before the deadline,
+    /// [`Error::WebSocket`] if the session stopped, or [`Error::Codec`] if the
+    /// body does not decode as `Resp`.
+    pub async fn call_service<Req, Resp>(
+        &self,
+        interface: &str,
+        method: &str,
+        version: u32,
+        req: &Req,
+    ) -> Result<Resp>
+    where
+        Req: prost::Message,
+        Resp: prost::Message + Default,
+    {
+        let job_name = format!("{interface}.{method}#{version}");
+        self.dispatch_request(
+            EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
+            req,
+            Some(job_name),
+            DEFAULT_REQUEST_TIMEOUT,
+            true,
+        )
+        .await
     }
 
     /// [`Self::request`] **without** the reply-header `EResult` check, for
@@ -1314,5 +1361,53 @@ mod tests {
         }
         task.await.expect("notify task");
         assert!(snapshots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_service_sends_a_named_job_and_decodes_the_reply() {
+        let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(77);
+
+        let task = tokio::spawn(async move {
+            handle
+                .call_service::<_, CMsgProtoBufHeader>(
+                    "Authentication",
+                    "GenerateAccessTokenForApp",
+                    1,
+                    &CMsgProtoBufHeader::default(),
+                )
+                .await
+        });
+
+        let Some(Command::Request {
+            emsg,
+            job_name,
+            reply,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected a Request command");
+        };
+        assert_eq!(emsg, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT);
+        assert_eq!(
+            job_name.as_deref(),
+            Some("Authentication.GenerateAccessTokenForApp#1")
+        );
+
+        // answer with a body that decodes as the response type
+        let body = CMsgProtoBufHeader {
+            steamid: Some(99),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        reply
+            .send(Ok(SteamMessage {
+                emsg: EMSG_SERVICE_METHOD_RESPONSE,
+                header: CMsgProtoBufHeader::default(),
+                body,
+            }))
+            .expect("send reply");
+
+        let resp = task.await.expect("task").expect("call_service");
+        assert_eq!(resp.steamid, Some(99));
     }
 }
