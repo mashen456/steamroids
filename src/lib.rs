@@ -49,7 +49,7 @@
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 //! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
-//! - [`web`] — mint a `steamcommunity.com` web access token over the session
+//! - [`web`]: mint a `steamcommunity.com` web access token over the session
 //!   ([`web::request_web_token`])
 
 #![doc(html_root_url = "https://docs.rs/steamroids/0.3.0")]

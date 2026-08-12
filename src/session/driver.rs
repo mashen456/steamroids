@@ -55,7 +55,7 @@ const EMSG_CLIENT_LOGOFF: u32 = 706;
 // enums_clientserver.proto: k_EMsgServiceMethodCallFromClient
 pub(crate) const EMSG_SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
 // enums_clientserver.proto: k_EMsgServiceMethodResponse
-// wired into call_service in a later task
+// call_service correlates on jobid_target, not this emsg. test-only.
 #[allow(dead_code)]
 pub(crate) const EMSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 /// Default budget for a [`SessionHandle::request`] before it fails with

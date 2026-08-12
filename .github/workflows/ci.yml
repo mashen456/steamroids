@@ -124,8 +124,15 @@ jobs:
           fi
           echo "::add-mask::$token"
           echo "STEAM_TEST_REFRESH_TOKEN=$token" >> "$GITHUB_ENV"
+      # --test-threads=1: live_auth's cs2_profile_scan (falls back to the plain
+      # account when STEAM_TEST_CS2_* is unset) and
+      # web_session_authenticates_a_community_request (always plain) can both
+      # hold a CM session on the plain account. Run concurrently, a second
+      # login evicts the first and classify_logoff treats that eresult as
+      # terminal, so the test panics instead of retrying. live_friends only
+      # has one live test function per account, so it doesn't need this.
       - name: live auth logins
-        run: cargo test --test live_auth -- --include-ignored --nocapture
+        run: cargo test --test live_auth -- --include-ignored --nocapture --test-threads=1
       - name: live friends api
         run: cargo test --test live_friends -- --include-ignored --nocapture
 

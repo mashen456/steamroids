@@ -33,10 +33,11 @@
 //! logged in at most once per run, only inside `cm_logon_over_wss`, because a
 //! second concurrent login would reuse the same TOTP code inside its 30s
 //! window and Steam rejects the duplicate. The plain account logs in from two
-//! tests (`cs2_profile_scan` and `web_session_authenticates_a_community_request`),
-//! which can run concurrently under the default parallel test harness; that's
-//! fine because it carries no shared secret, so there is no one-time code for
-//! the two logins to collide on.
+//! tests (`cs2_profile_scan` and `web_session_authenticates_a_community_request`).
+//! It carries no shared secret, so there is no one-time code for the two
+//! logins to collide on, but the two logins would still open concurrent CM
+//! sessions on the same account, and Steam evicts one of them. CI serializes
+//! this binary (`--test-threads=1`) to avoid that.
 //!
 //! # Running locally
 //!

@@ -108,7 +108,10 @@ impl WebSession {
 
     /// The value for a `Cookie:` request header, authenticating as this account.
     ///
-    /// [`Self::get`] sends this header through the session's proxy for you.
+    /// [`Self::get`] sends this header through the session's proxy for you. A
+    /// caller driving its own HTTP client instead must route it through that
+    /// same proxy, or the request leaves via a different exit than the CM
+    /// session it authenticates as.
     ///
     /// ```
     /// # use steamroids::web::WebSession;
@@ -140,8 +143,9 @@ impl WebSession {
     /// the CM session it authenticates as share an exit.
     ///
     /// Returns the response body. A non-success HTTP status is an error rather
-    /// than a body, because Steam answers an unauthenticated request with a
-    /// redirect to the login page rather than a failure.
+    /// than a body. This is a transport-level guard, not a signed-out check:
+    /// `reqwest` follows redirects, so a signed-out request lands on the login
+    /// page as a normal 200 and callers who care must inspect the body.
     ///
     /// # Errors
     ///
@@ -170,9 +174,11 @@ impl WebSession {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use prost::Message;
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -299,17 +305,45 @@ mod tests {
         assert!(!format!("{web:?}").contains("super-secret"));
     }
 
-    #[test]
-    fn get_builds_its_client_through_the_session_proxy() {
-        let proxy = ProxyConfig::parse("socks5://127.0.0.1:1080").expect("parse proxy");
+    #[tokio::test]
+    async fn get_speaks_socks5_to_the_configured_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let proxy = ProxyConfig::parse(&format!("socks5://127.0.0.1:{port}")).expect("parse proxy");
         let web = WebSession {
             steam_id: 1,
             access_token: "tok".to_string(),
             session_id: None,
             proxy: Some(proxy),
         };
-        // client construction is the proxy-carrying step; a bad proxy would fail here
-        assert!(web.http_client().is_ok());
+
+        // watch what the client actually sends the "proxy": a real SOCKS5
+        // greeting opens with version byte 0x05. bounded so a dropped or
+        // never-made connection can't hang the test.
+        let observed = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                return None;
+            };
+            let mut byte = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await {
+                Ok(Ok(n)) if n > 0 => Some(byte[0]),
+                _ => None,
+            }
+        });
+
+        // this never completes: we aren't implementing a real SOCKS5 server.
+        // bounded so giving up here doesn't stall the test either.
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), web.get("http://example.invalid/")).await;
+
+        assert_eq!(
+            observed.await.expect("listener task"),
+            Some(0x05),
+            "expected a SOCKS5 greeting (version byte 0x05) through the configured proxy"
+        );
     }
 
     #[tokio::test]
