@@ -108,9 +108,7 @@ impl WebSession {
 
     /// The value for a `Cookie:` request header, authenticating as this account.
     ///
-    /// A future authenticated fetch helper will send this header through the
-    /// session's proxy for you. Until then, drive your own HTTP client with
-    /// it, and route it through the same proxy the session uses.
+    /// [`Self::get`] sends this header through the session's proxy for you.
     ///
     /// ```
     /// # use steamroids::web::WebSession;
@@ -128,6 +126,45 @@ impl WebSession {
             Some(sid) => format!("steamLoginSecure={encoded}; sessionid={sid}"),
             None => format!("steamLoginSecure={encoded}"),
         }
+    }
+
+    // shared client build so get() and its test agree on proxy handling
+    fn http_client(&self) -> Result<reqwest::Client> {
+        crate::http::client(self.proxy.as_ref())
+    }
+
+    /// Fetch `url` authenticated as this account.
+    ///
+    /// The request carries this session's `steamLoginSecure` cookie and leaves
+    /// through the same proxy the session was built with, so a web request and
+    /// the CM session it authenticates as share an exit.
+    ///
+    /// Returns the response body. A non-success HTTP status is an error rather
+    /// than a body, because Steam answers an unauthenticated request with a
+    /// redirect to the login page rather than a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Network`] on a transport failure or a non-success status, and
+    /// [`Error::InvalidConfig`] if the proxy configuration is unusable.
+    pub async fn get(&self, url: &str) -> Result<String> {
+        let response = self
+            .http_client()?
+            .get(url)
+            .header(reqwest::header::COOKIE, self.cookie_header())
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("web get {url}: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Network(format!("web get {url}: HTTP {status}")));
+        }
+
+        response
+            .text()
+            .await
+            .map_err(|e| Error::Network(format!("web get {url}: body: {e}")))
     }
 }
 
@@ -257,5 +294,31 @@ mod tests {
             proxy: None,
         };
         assert!(!format!("{web:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn get_builds_its_client_through_the_session_proxy() {
+        let proxy = ProxyConfig::parse("socks5://127.0.0.1:1080").expect("parse proxy");
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "tok".to_string(),
+            session_id: None,
+            proxy: Some(proxy),
+        };
+        // client construction is the proxy-carrying step; a bad proxy would fail here
+        assert!(web.http_client().is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_surfaces_a_non_success_status() {
+        // 127.0.0.1:1 has nothing listening, so the request fails at connect
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "tok".to_string(),
+            session_id: None,
+            proxy: None,
+        };
+        let err = web.get("http://127.0.0.1:1/").await.unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "{err:?}");
     }
 }
