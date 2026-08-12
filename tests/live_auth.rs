@@ -175,6 +175,8 @@ async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOu
     const MAX_ATTEMPTS: u32 = 4;
     // totp codes rotate every 30s; wait past the boundary for a fresh one
     const TOTP_WINDOW: Duration = Duration::from_secs(31);
+    // fallback when steam sends no retry hint
+    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
     for attempt in 1..=MAX_ATTEMPTS {
         match build().execute().await {
             // same code twice in one window: steam rejects the duplicate
@@ -184,6 +186,17 @@ async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOu
                      waiting for the next TOTP window"
                 );
                 tokio::time::sleep(TOTP_WINDOW).await;
+            }
+            // several logins of one account in a row: back off, do not skip.
+            // a skip would panic under STEAM_LIVE_REQUIRED and fail CI.
+            Ok(SignInOutcome::RateLimited { retry_hint }) if attempt < MAX_ATTEMPTS => {
+                let wait = retry_hint.unwrap_or(RATE_LIMIT_BACKOFF);
+                eprintln!(
+                    "[{label}] rate-limited (attempt {attempt}/{MAX_ATTEMPTS}), \
+                     backing off {}s",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
             }
             Ok(outcome) => return outcome,
             Err(Error::Network(msg)) if attempt < MAX_ATTEMPTS => {
