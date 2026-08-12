@@ -52,6 +52,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
 // k_EMsgClientLogOff, from protos/steam/enums_clientserver.proto.
 const EMSG_CLIENT_LOGOFF: u32 = 706;
+// enums_clientserver.proto: k_EMsgServiceMethodCallFromClient
+// wired into call_service in a later task
+#[allow(dead_code)]
+pub(crate) const EMSG_SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
+// enums_clientserver.proto: k_EMsgServiceMethodResponse
+// wired into call_service in a later task
+#[allow(dead_code)]
+pub(crate) const EMSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 /// Default budget for a [`SessionHandle::request`] before it fails with
 /// [`Error::Timeout`]. Steam answers well inside this; a job that doesn't come
 /// back at all would otherwise hang the caller forever.
@@ -126,6 +134,7 @@ mod command {
         Request {
             emsg: u32,
             body: Vec<u8>,
+            job_name: Option<String>,
             deadline: Instant,
             reply: oneshot::Sender<Result<SteamMessage>>,
         },
@@ -227,7 +236,7 @@ impl SessionHandle {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        self.dispatch_request(emsg, req, timeout, true).await
+        self.dispatch_request(emsg, req, None, timeout, true).await
     }
 
     /// [`Self::request`] **without** the reply-header `EResult` check, for
@@ -249,7 +258,7 @@ impl SessionHandle {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        self.dispatch_request(emsg, req, DEFAULT_REQUEST_TIMEOUT, false)
+        self.dispatch_request(emsg, req, None, DEFAULT_REQUEST_TIMEOUT, false)
             .await
     }
 
@@ -259,6 +268,7 @@ impl SessionHandle {
         &self,
         emsg: u32,
         req: &Req,
+        job_name: Option<String>,
         timeout: Duration,
         check_eresult: bool,
     ) -> Result<Resp>
@@ -271,6 +281,7 @@ impl SessionHandle {
             .send(Command::Request {
                 emsg,
                 body: req.encode_to_vec(),
+                job_name,
                 deadline: Instant::now() + timeout,
                 reply,
             })
@@ -593,7 +604,7 @@ impl SessionDriver {
                     match command {
                         None => return LoopExit::Shutdown,
                         Some(Command::Notify { emsg, body, ack }) => {
-                            let sent = send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, &body).await;
+                            let sent = send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, None, &body).await;
                             let failed = sent.is_err();
                             let _ = ack.send(sent);
                             if failed {
@@ -602,14 +613,14 @@ impl SessionDriver {
                         }
                         Some(Command::Logoff { ack }) => {
                             // Best-effort goodbye to Steam, then stop.
-                            let _ = send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_LOGOFF, None, &[]).await;
+                            let _ = send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_LOGOFF, None, None, &[]).await;
                             let _ = ack.send(());
                             return LoopExit::Shutdown;
                         }
-                        Some(Command::Request { emsg, body, deadline, reply }) => {
+                        Some(Command::Request { emsg, body, job_name, deadline, reply }) => {
                             let jobid = self.next_jobid;
                             self.next_jobid = self.next_jobid.checked_add(1).unwrap_or(1);
-                            if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, Some(jobid), &body).await.is_err() {
+                            if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, Some(jobid), job_name.as_deref(), &body).await.is_err() {
                                 let _ = reply.send(Err(Error::WebSocket("session reconnecting".into())));
                                 return LoopExit::Disconnected;
                             }
@@ -626,7 +637,7 @@ impl SessionDriver {
                 }
                 () = tokio::time::sleep_until(next_heartbeat) => {
                     trace!("heartbeat");
-                    if send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, &[]).await.is_err() {
+                    if send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, None, &[]).await.is_err() {
                         return LoopExit::Disconnected;
                     }
                     // Steam never acks the heartbeat, so probe the socket too:
@@ -796,12 +807,14 @@ async fn send_frame(
     session_id: i32,
     emsg: u32,
     jobid_source: Option<u64>,
+    job_name: Option<&str>,
     body: &[u8],
 ) -> Result<()> {
     let header = CMsgProtoBufHeader {
         steamid: Some(steam_id),
         client_sessionid: Some(session_id),
         jobid_source,
+        target_job_name: job_name.map(ToString::to_string),
         ..Default::default()
     };
     write_frame(write, codec::encode_raw(emsg, &header, body)).await
@@ -867,6 +880,26 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_method_frames_carry_the_target_job_name() {
+        let header = CMsgProtoBufHeader {
+            steamid: Some(7),
+            client_sessionid: Some(1),
+            jobid_source: Some(42),
+            target_job_name: Some("Authentication.GenerateAccessTokenForApp#1".to_string()),
+            ..Default::default()
+        };
+        let frame = codec::encode_raw(EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, &header, &[]);
+        let decoded = codec::try_decode(&frame).unwrap().expect("proto frame");
+
+        assert_eq!(decoded.emsg, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT);
+        assert_eq!(
+            decoded.header.target_job_name.as_deref(),
+            Some("Authentication.GenerateAccessTokenForApp#1")
+        );
+        assert_eq!(decoded.header.jobid_source, Some(42));
+    }
 
     fn msg(emsg: u32, jobid_target: Option<u64>, body: Vec<u8>) -> SteamMessage {
         SteamMessage {
@@ -1129,6 +1162,7 @@ mod tests {
         assert!(!answer_while_down(Some(Command::Request {
             emsg: 1,
             body: Vec::new(),
+            job_name: None,
             deadline: Instant::now() + Duration::from_secs(60),
             reply,
         })));
