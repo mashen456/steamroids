@@ -171,8 +171,18 @@ fn load_account(prefix: &str) -> Option<Account> {
 /// once per attempt because `execute` consumes the builder.
 async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOutcome {
     const MAX_ATTEMPTS: u32 = 4;
+    // totp codes rotate every 30s; wait past the boundary for a fresh one
+    const TOTP_WINDOW: Duration = Duration::from_secs(31);
     for attempt in 1..=MAX_ATTEMPTS {
         match build().execute().await {
+            // same code twice in one window: steam rejects the duplicate
+            Ok(SignInOutcome::GuardCodeRejected) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "[{label}] guard code rejected (attempt {attempt}/{MAX_ATTEMPTS}), \
+                     waiting for the next TOTP window"
+                );
+                tokio::time::sleep(TOTP_WINDOW).await;
+            }
             Ok(outcome) => return outcome,
             Err(Error::Network(msg)) if attempt < MAX_ATTEMPTS => {
                 eprintln!(
