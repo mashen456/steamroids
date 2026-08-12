@@ -1,26 +1,28 @@
 //! CS2 competitive matchmaking cooldown from the Steam GCPD.
 //!
-//! Pure HTML extraction, no network: [`crate::web`] fetches the page, this
-//! module reads it. GCPD renders every table on the page (cooldown, casual
-//! matchmaking stats, deathmatch stats, ...) with the same `generic_kv_table`
-//! class and no id or wrapper to tell them apart, so the cooldown table is
-//! found by matching its header row rather than by its position on the page.
+//! [`request_cs2_cooldown`] fetches an account's GCPD matchmaking page over a
+//! [`WebSession`] and hands the body to [`parse_cooldown`], which does the
+//! actual HTML extraction and touches no network itself. GCPD renders every
+//! table on the page (cooldown, casual matchmaking stats, deathmatch stats,
+//! ...) with the same `generic_kv_table` class and no id or wrapper to tell
+//! them apart, so the cooldown table is found by matching its header row
+//! rather than by its position on the page.
 
 use crate::web::WebSession;
 use crate::{Error, Result};
 
-/// The GCPD matchmaking-tab URL for an account.
-///
-/// Deliberately the `/profiles/<steamid64>/` form: the `/me/` alias is
-/// resolved browser-side and returns the Steam Community shell under HTTP
-/// 200 with no GCPD content, so it fails silently. The single source of
-/// truth for this URL: [`request_cs2_cooldown`] and the live test both call
-/// it, so a change here cannot silently drift out of sync with what the live
-/// test actually exercises.
-#[must_use]
-pub fn cooldown_url(steam_id: u64) -> String {
+// gcpd matchmaking-tab url. /profiles/<steamid64>/ form, deliberately not
+// /me/: that alias resolves browser-side and returns the steam community
+// shell under http 200 with no gcpd content, fails silently. only caller is
+// request_cs2_cooldown; the live test exercises this by calling that
+// directly, so a change here cannot drift out of sync with what it runs.
+fn cooldown_url(steam_id: u64) -> String {
     format!("https://steamcommunity.com/profiles/{steam_id}/gcpd/730?tab=matchmaking")
 }
+
+// left-nav tab label on every gcpd page. live-verified: appears twice on a
+// real gcpd page, zero times on the community shell a wrong url returns.
+const GCPD_PAGE_MARKER: &str = "Competitive Matches";
 
 /// Read this account's active CS2 competitive cooldown from its GCPD page.
 ///
@@ -29,15 +31,24 @@ pub fn cooldown_url(steam_id: u64) -> String {
 ///
 /// # Errors
 ///
-/// Any transport error from [`WebSession::get`], or [`Error::Codec`] if the
-/// cooldown table is present but its expiry does not parse.
+/// Any transport error from [`WebSession::get`]; [`Error::Remote`] if the
+/// fetched page is not actually a GCPD page (the session's web token may
+/// have expired, landing the request on the login page instead); or
+/// [`Error::Codec`] if the cooldown table is present but its expiry does not
+/// parse.
 pub async fn request_cs2_cooldown(web: &WebSession) -> Result<Option<Cs2Cooldown>> {
     let html = web.get(&cooldown_url(web.steam_id())).await?;
+    if !html.contains(GCPD_PAGE_MARKER) {
+        return Err(Error::Remote(
+            "fetched page is not a GCPD page; the web session may have expired".into(),
+        ));
+    }
     parse_cooldown(&html)
 }
 
 /// A CS2 competitive matchmaking cooldown read from a GCPD page.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Cs2Cooldown {
     /// Cooldown expiry, as a Unix timestamp (UTC).
     pub expires_at_unix: i64,
@@ -75,7 +86,11 @@ pub fn parse_cooldown(html: &str) -> Result<Option<Cs2Cooldown>> {
         return Ok(None);
     };
 
-    let cells = extract_all(table, "td");
+    // first <tr> is the header row, already matched; read only the next one
+    // so an undersized row can't borrow cells from whatever follows it
+    let rows = extract_all(table, "tr");
+    let data_row = rows.get(1).copied().unwrap_or("");
+    let cells = extract_all(data_row, "td");
 
     let raw = cells.first().copied().unwrap_or("").trim();
     let expires_at_unix = parse_gmt_timestamp(raw)?;
@@ -284,6 +299,27 @@ mod tests {
     fn rejects_a_malformed_timestamp() {
         let html = COOLDOWN.replace("2026-08-17 23:54:16 GMT", "not a date");
         assert!(parse_cooldown(&html).is_err());
+    }
+
+    #[test]
+    fn non_blank_non_numeric_level_is_a_codec_error() {
+        let html = COOLDOWN.replace("<td>&nbsp;</td>", "<td>abc</td>");
+        let err = parse_cooldown(&html).unwrap_err();
+        assert!(matches!(err, Error::Codec(_)), "{err:?}");
+    }
+
+    #[test]
+    fn header_order_mismatch_is_no_cooldown_not_an_error() {
+        // same three header texts, first two swapped: order must match too
+        let html = COOLDOWN
+            .replacen("Competitive Cooldown Expiration", "@@TMP@@", 1)
+            .replacen(
+                "Competitive Cooldown Level",
+                "Competitive Cooldown Expiration",
+                1,
+            )
+            .replacen("@@TMP@@", "Competitive Cooldown Level", 1);
+        assert!(parse_cooldown(&html).unwrap().is_none());
     }
 
     #[test]

@@ -187,8 +187,11 @@ async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOu
                 );
                 tokio::time::sleep(TOTP_WINDOW).await;
             }
-            // several logins of one account in a row: back off, do not skip.
-            // a skip would panic under STEAM_LIVE_REQUIRED and fail CI.
+            // several logins of one account in a row: back off, lowers the
+            // odds of hitting the limit again on the next attempt. does not
+            // remove it -- a rate limit that persists past MAX_ATTEMPTS
+            // still returns RateLimited, still falls through to skip, still
+            // panics under STEAM_LIVE_REQUIRED.
             Ok(SignInOutcome::RateLimited { retry_hint }) if attempt < MAX_ATTEMPTS => {
                 let wait = retry_hint.unwrap_or(RATE_LIMIT_BACKOFF);
                 eprintln!(
@@ -215,6 +218,23 @@ async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOu
 // `cm_logon_over_wss`; there is no separate `login_account_with_2fa` test, so
 // that account is never logged in twice in one run (concurrent logins reuse the
 // same TOTP code within a 30s window and Steam rejects the duplicate).
+
+/// Panic on an outcome no live test expects to see. `GuardCodeRejected` gets
+/// a dedicated message: by the time it reaches here, `execute_with_retry`
+/// already retried it across three TOTP windows (about 93s), so a rejection
+/// that still persists is not a transient blip and retrying again would not
+/// help -- the two real causes are a wrong `shared_secret` or a system clock
+/// skewed by more than one time step.
+fn panic_on_unexpected(label: &str, outcome: &SignInOutcome) -> ! {
+    match outcome {
+        SignInOutcome::GuardCodeRejected => panic!(
+            "[{label}] guard code rejected after retrying across three TOTP \
+             windows (about 93s); check the account's shared_secret and that \
+             the system clock is in sync"
+        ),
+        other => panic!("[{label}] unexpected outcome: {other:?}"),
+    }
+}
 
 /// Sign `acc` in for a refresh token, retrying on proxy blips. Returns `None`
 /// (after printing a `SKIP`) for the soft-skippable outcomes — email Guard or
@@ -268,7 +288,7 @@ async fn sign_in_for_session(
         SignInOutcome::InvalidCredentials => {
             panic!("[{label}] username/password rejected by Steam")
         }
-        other => panic!("[{label}] unexpected outcome: {other:?}"),
+        other => panic_on_unexpected(label, &other),
     }
 }
 
@@ -445,7 +465,7 @@ async fn cm_logon_over_wss() {
         .await;
         match outcome {
             SignInOutcome::Success { refresh_token, .. } => refresh_token,
-            other => panic!("expected sign-in success, got {other:?}"),
+            other => panic_on_unexpected("cm-signin", &other),
         }
     };
 
@@ -566,21 +586,19 @@ async fn web_session_authenticates_a_community_request() {
 }
 
 /// Mint a web token over a live CM session and fetch this account's GCPD
-/// competitive matchmaking cooldown through it.
+/// competitive matchmaking cooldown through `request_cs2_cooldown`.
 ///
 /// The account under test may or may not have an active cooldown, so this
 /// does not assert one exists; it asserts the fetch reached the real GCPD
-/// page and parsed cleanly. That distinction matters here specifically: the
+/// page and parsed cleanly. That distinction matters here specifically: a
 /// wrong URL (the `/me/` alias, unresolved by our client) returns the Steam
-/// Community shell under HTTP 200 with no GCPD content, which `parse_cooldown`
-/// reads as "no cooldown" -- the same `Ok(None)` a clean account produces. So
-/// the raw HTML is checked for `Competitive Matches`, a left-nav tab label
-/// present on every GCPD page regardless of cooldown state, before the page
-/// is handed to the parser. The URL itself comes from
-/// `steamroids::gcpd::cooldown_url`, the same builder `request_cs2_cooldown`
-/// calls, so a URL regression there fails this test instead of going
-/// unnoticed behind a second, independently-maintained copy. `#[ignore]`d
-/// (real login).
+/// Community shell under HTTP 200 with no GCPD content, which used to parse
+/// as "no cooldown" -- the same `Ok(None)` a clean account produces.
+/// `request_cs2_cooldown` now guards against exactly that itself, checking
+/// the fetched body for a GCPD-only marker before parsing, so this test
+/// calls it directly instead of recomposing the URL-build, fetch, and parse
+/// steps by hand. That also makes this the only place the shipped async
+/// function actually runs. `#[ignore]`d (real login).
 ///
 /// Uses the plain account for the same reason
 /// `web_session_authenticates_a_community_request` does: `cm_logon_over_wss`
@@ -621,26 +639,16 @@ async fn web_session_fetches_the_cs2_cooldown() {
         .expect("mint web token");
     eprintln!("OK gcpd-cooldown: minted web token for {}", web.steam_id());
 
-    let url = steamroids::gcpd::cooldown_url(web.steam_id());
-    let html = web.get(&url).await.expect("gcpd fetch");
-
-    // a wrong URL (e.g. the /me/ alias) returns the community shell with no
-    // GCPD content under HTTP 200, which parses to Ok(None) same as a clean
-    // account -- assert we actually reached GCPD before trusting the parse.
-    assert!(
-        html.contains("Competitive Matches"),
-        "fetched page is not the GCPD page (missing the 'Competitive Matches' tab); \
-         check the /profiles/<steamid64>/ URL form is being used"
-    );
-    eprintln!("OK gcpd-cooldown: confirmed the GCPD page rendered");
-
-    match steamroids::gcpd::parse_cooldown(&html) {
+    // request_cs2_cooldown itself now checks the fetched body actually
+    // landed on GCPD before parsing it, so this exercises the shipped path
+    // end to end instead of recomposing it from its private pieces.
+    match steamroids::gcpd::request_cs2_cooldown(&web).await {
         Ok(Some(cd)) => eprintln!(
             "OK gcpd-cooldown: cooldown until {} (level {:?}, acknowledged {})",
             cd.expires_at_raw, cd.level, cd.acknowledged
         ),
         Ok(None) => eprintln!("OK gcpd-cooldown: no active cooldown"),
-        Err(e) => panic!("gcpd cooldown parse failed: {e}"),
+        Err(e) => panic!("gcpd cooldown fetch/parse failed: {e}"),
     }
 
     handle.logoff().await.expect("clean logoff");
