@@ -387,7 +387,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn get_waits_on_an_attached_rate_limiter() {
         // burn the first slot so the next acquire must wait
-        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(30)));
+        // 45s: clearly above both http.rs's 30s TOTAL_TIMEOUT and its 10s
+        // connect_timeout, so this asserts the limiter waited, not a reqwest
+        // timeout that happened to fire first.
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
         limiter.acquire().await;
 
         let web = WebSession {
@@ -401,7 +404,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         // connect refused, but the limiter must be consulted BEFORE the request
         let _ = web.get("http://127.0.0.1:1/").await;
-        assert!(start.elapsed() >= Duration::from_secs(30));
+        assert!(start.elapsed() >= Duration::from_secs(45));
     }
 
     #[tokio::test]

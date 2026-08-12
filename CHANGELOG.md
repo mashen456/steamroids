@@ -15,7 +15,9 @@ While in `0.x.y`, **any minor version may break the API**.
 > exhaustive downstream `match` breaks (*Removed*); `SessionHandle::request` now
 > times out and turns a non-OK reply `EResult` into `Error::Remote` where it
 > used to hand back an empty response; `SessionHandle::notify` can now return
-> `Err`; `CmConnection::run` / `send_heartbeat` are gone (*Removed*).
+> `Err`; `CmConnection::run` / `send_heartbeat` are gone (*Removed*);
+> `persona::resolve_vanity_url` / `persona::fetch_avatar` each gained a
+> `rate_limiter` parameter (*Changed*).
 
 ### Added
 
@@ -46,6 +48,23 @@ While in `0.x.y`, **any minor version may break the API**.
   `request_friends_groups_list` subscribe first and then read the cache, so they
   no longer have to be called the instant `spawn_session` returns to catch the
   push.
+- **Caller-shared rate limiting (`ratelimit`)**: `ratelimit::RateLimiter` paces
+  calls to at most one `acquire()` per interval (`with_interval`, or
+  `per_minute` for a requests-per-60s shorthand), shared across callers via
+  `Arc`. Steam rate-limits by exit IP, not by account, so a fleet running one
+  proxy per account needs one limiter per proxy exit rather than a single
+  process-wide one; the limiter itself takes no view on sharing granularity,
+  the caller does. A zero interval disables pacing outright. Wired in, as
+  optional, on every outbound HTTP path that takes a proxy: the
+  `SignIn::rate_limiter` builder (paces all four `WebAPI` steps of a password
+  sign-in, `BeginAuthSessionViaCredentials` through `PollAuthSessionStatus`),
+  the `WebSession::with_rate_limiter` builder (paces `WebSession::get`), and a
+  new `rate_limiter` parameter on `persona::resolve_vanity_url` /
+  `persona::fetch_avatar`. With no limiter attached, `acquire` is never
+  called: no sleep, no lock traffic, unchanged from before this landed. CM
+  server discovery (`session::discover_cm_servers`) is deliberately not
+  paced: the session layer already backs off on transient logon failures
+  there.
 - **CS2 medals**: `cs2::PlayerProfile::medals` (displayed medal/coin item
   definition indexes, in display order) and `cs2::PlayerProfile::featured_medal`
   (the showcased one). Resolve either through the econ items manifest.
@@ -140,6 +159,11 @@ While in `0.x.y`, **any minor version may break the API**.
 - `persona::resolve_vanity_url` returns `Error::Network` for a non-success HTTP
   status (429, 5xx, …) instead of `Ok(None)`. `Ok(None)` now means only "no such
   vanity URL".
+- `persona::resolve_vanity_url` / `persona::fetch_avatar` each take a new
+  `rate_limiter: Option<&ratelimit::RateLimiter>` parameter, so a caller pacing
+  `WebSession::get` through a limiter can pace these `steamcommunity.com`
+  requests through the same one, since they leave via the same proxy exit and
+  count against the same Steam-side limit. `None` behaves exactly as before.
 - `friends::add_friend` treats only `EResult` `1` and `29` as success; every
   other result is `Error::Remote`, even when Steam still identified the target.
 - `friends::create_friends_group` errors when an OK response omits `groupid`

@@ -32,6 +32,7 @@ use crate::error::eresult;
 use crate::proto::{
     CMsgClientFriendProfileInfo, CMsgClientPersonaState, CMsgClientRequestFriendData,
 };
+use crate::ratelimit::RateLimiter;
 use crate::session::SessionHandle;
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
@@ -175,14 +176,23 @@ pub fn profile_url(steam_id: u64) -> String {
 /// needed. `name` is the bare vanity (the part after `/id/`), e.g.
 /// `"gabelogannewell"`. `Ok(None)` means the site answered 200 with no
 /// `steamID64` in the document, i.e. no such vanity exists. The request goes
-/// through `proxy` when given.
+/// through `proxy` when given, and is paced by `rate_limiter` when given.
+/// This call leaves via the same exit `proxy` names, so it should share the
+/// limiter used for other requests through that exit.
 ///
 /// # Errors
 ///
 /// [`Error::Network`] if the community site is unreachable or answers with a
 /// non-success status (rate limiting and 5xx are common behind rotating
 /// proxies), plus client-build errors.
-pub async fn resolve_vanity_url(name: &str, proxy: Option<&ProxyConfig>) -> Result<Option<u64>> {
+pub async fn resolve_vanity_url(
+    name: &str,
+    proxy: Option<&ProxyConfig>,
+    rate_limiter: Option<&RateLimiter>,
+) -> Result<Option<u64>> {
+    if let Some(limiter) = rate_limiter {
+        limiter.acquire().await;
+    }
     let url = format!("https://steamcommunity.com/id/{name}?xml=1");
     let response = crate::http::client(proxy)?
         .get(&url)
@@ -250,13 +260,21 @@ pub fn avatar_url_sized(hash: &[u8], size: AvatarSize) -> String {
 ///
 /// `url` is an avatar URL from [`PlayerSummary::avatar_url`], [`avatar_url`], or
 /// [`avatar_url_sized`] — a public Steam CDN link, so no auth is needed. The
-/// request goes through `proxy` when given. Write the bytes to a file, or decode
+/// request goes through `proxy` when given, and is paced by `rate_limiter` when
+/// given, matching [`resolve_vanity_url`]. Write the bytes to a file, or decode
 /// them with an image crate.
 ///
 /// # Errors
 ///
 /// [`Error::Network`] if the CDN is unreachable or returns a non-success status.
-pub async fn fetch_avatar(url: &str, proxy: Option<&ProxyConfig>) -> Result<Vec<u8>> {
+pub async fn fetch_avatar(
+    url: &str,
+    proxy: Option<&ProxyConfig>,
+    rate_limiter: Option<&RateLimiter>,
+) -> Result<Vec<u8>> {
+    if let Some(limiter) = rate_limiter {
+        limiter.acquire().await;
+    }
     let response = crate::http::client(proxy)?
         .get(url)
         .send()
@@ -640,5 +658,92 @@ mod tests {
         assert!(summary_from_persona_state(&msg, STEAM_ID)
             .unwrap()
             .is_none());
+    }
+
+    // rate-limiter wiring: mirrors WebSession::get's tests in web.rs.
+    // resolve_vanity_url's URL is fixed (steamcommunity.com), so a dead proxy
+    // -- not a fake url -- is what keeps these off the real network.
+    mod rate_limiter_wiring {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        use super::*;
+
+        // nothing listens here, so connect fails immediately (refused), not
+        // via a timeout -- keeps the "no limiter" tests fast without pausing.
+        const DEAD_PROXY: &str = "socks5://127.0.0.1:1";
+        const DEAD_URL: &str = "http://127.0.0.1:1/";
+
+        #[tokio::test(start_paused = true)]
+        async fn resolve_vanity_url_waits_on_an_attached_rate_limiter() {
+            // burn the first slot so the next acquire must wait
+            let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
+            limiter.acquire().await;
+
+            let proxy = ProxyConfig::parse(DEAD_PROXY).expect("parse proxy");
+            let start = tokio::time::Instant::now();
+            // dead proxy: fails at connect, but the limiter must be consulted first
+            let _ = resolve_vanity_url("someone", Some(&proxy), Some(&limiter)).await;
+            assert!(start.elapsed() >= Duration::from_secs(45));
+        }
+
+        #[tokio::test]
+        async fn resolve_vanity_url_without_a_limiter_does_not_wait() {
+            // real time, no start_paused: connect-refused timing through a
+            // proxy is os-dependent, so this bound is loose -- 20s is above
+            // http.rs's 10s connect timeout, well below the 45s floor a
+            // limiter would force. no limiter means no sleep either way.
+            let proxy = ProxyConfig::parse(DEAD_PROXY).expect("parse proxy");
+            let start = std::time::Instant::now();
+            let _ = resolve_vanity_url("someone", Some(&proxy), None).await;
+            assert!(start.elapsed() < Duration::from_secs(20));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn fetch_avatar_waits_on_an_attached_rate_limiter() {
+            let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
+            limiter.acquire().await;
+
+            let start = tokio::time::Instant::now();
+            let _ = fetch_avatar(DEAD_URL, None, Some(&limiter)).await;
+            assert!(start.elapsed() >= Duration::from_secs(45));
+        }
+
+        #[tokio::test]
+        async fn fetch_avatar_without_a_limiter_does_not_wait() {
+            // real bound listener, not "connect refused": refusal timing is
+            // os-dependent. no pause needed: no limiter means no sleep.
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let port = listener.local_addr().expect("local addr").port();
+
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let read = reader.read_line(&mut line).await.expect("read request");
+                        assert_ne!(read, 0, "request ended without a blank line");
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .expect("write reply");
+                stream.flush().await.expect("flush");
+            });
+
+            let start = std::time::Instant::now();
+            let _ = fetch_avatar(&format!("http://127.0.0.1:{port}/"), None, None).await;
+            assert!(start.elapsed() < Duration::from_secs(1));
+            server.await.expect("server task");
+        }
     }
 }

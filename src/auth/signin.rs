@@ -284,6 +284,14 @@ impl SignIn {
     }
 
     /// Pace this sign-in's `WebAPI` requests through a shared limiter.
+    ///
+    /// Every poll of `PollAuthSessionStatus` acquires a slot too, and the
+    /// whole poll phase is itself bounded by a 120s wall-clock budget. A
+    /// limiter interval that is coarse relative to that budget (tens of
+    /// seconds, shared across a fleet behind one exit) can eat enough of it
+    /// that a healthy login times out instead of completing, so pick an
+    /// interval with that budget in mind, not just the steady-state request
+    /// rate you want.
     pub fn rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
         self.rate_limiter = Some(limiter);
         self
@@ -945,7 +953,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn execute_waits_on_an_attached_rate_limiter() {
         // burn the first slot so the next acquire must wait
-        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(30)));
+        // 45s: clearly above both http.rs's 30s TOTAL_TIMEOUT and its 10s
+        // connect_timeout, so this asserts the limiter waited, not a reqwest
+        // timeout that happened to fire first.
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
         limiter.acquire().await;
 
         let start = Instant::now();
@@ -955,14 +966,14 @@ mod tests {
             .rate_limiter(Arc::clone(&limiter))
             .execute()
             .await;
-        assert!(start.elapsed() >= Duration::from_secs(30));
+        assert!(start.elapsed() >= Duration::from_secs(45));
     }
 
     #[tokio::test]
     async fn execute_without_a_limiter_does_not_wait() {
         // real time, no start_paused: connect-refused timing is os-dependent,
         // fine for the paired test's lower bound but not this upper bound.
-        // 20s: above http.rs's 10s connect timeout, below the 30s floor a
+        // 20s: above http.rs's 10s connect timeout, below the 45s floor a
         // limiter would force.
         let start = std::time::Instant::now();
         let _ = SignIn::with_password("bot01", "pw")

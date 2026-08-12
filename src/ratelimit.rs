@@ -88,6 +88,15 @@ impl RateLimiter {
     /// after that waits until `interval` has passed since the last slot
     /// taken. An idle gap does not bank credit: after a long pause the
     /// next call is immediate, not owed extra slots.
+    ///
+    /// Internally, the `std::sync::Mutex` guard that computes the next slot
+    /// is dropped before the `await` that actually sleeps. That ordering is
+    /// load-bearing: a `std::sync::MutexGuard` is `!Send`, so holding one
+    /// across an `.await` would make this future `!Send`, and a `!Send`
+    /// future fails to compile only where something actually requires
+    /// `Send` (`tokio::spawn`, not a bare `.await`), which is why the
+    /// [module example](self) spawns each `acquire` call instead of joining
+    /// them inline.
     pub async fn acquire(&self) {
         if self.interval.is_zero() {
             return;

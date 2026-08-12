@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Vanity → SteamID is keyless and needs no session.
     if let Ok(vanity) = env::var("RESOLVE_VANITY") {
-        match persona::resolve_vanity_url(&vanity, proxy.as_ref()).await? {
+        match persona::resolve_vanity_url(&vanity, proxy.as_ref(), None).await? {
             Some(id) => println!(
                 "vanity '{vanity}' → SteamID {id} ({})",
                 persona::profile_url(id)
