@@ -16,12 +16,15 @@ use crate::{Error, Result};
 // shell under http 200 with no gcpd content, fails silently. only caller is
 // request_cs2_cooldown; the live test exercises this by calling that
 // directly, so a change here cannot drift out of sync with what it runs.
+// l=english pins the ui language: steam renders nav labels in the account's
+// own preference otherwise, and GCPD_PAGE_MARKER is an english literal.
 fn cooldown_url(steam_id: u64) -> String {
-    format!("https://steamcommunity.com/profiles/{steam_id}/gcpd/730?tab=matchmaking")
+    format!("https://steamcommunity.com/profiles/{steam_id}/gcpd/730?tab=matchmaking&l=english")
 }
 
 // left-nav tab label on every gcpd page. live-verified: appears twice on a
 // real gcpd page, zero times on the community shell a wrong url returns.
+// only reliable because cooldown_url pins l=english.
 const GCPD_PAGE_MARKER: &str = "Competitive Matches";
 
 /// Read this account's active CS2 competitive cooldown from its GCPD page.
@@ -240,8 +243,15 @@ mod tests {
     fn cooldown_url_uses_the_profiles_form_not_me() {
         assert_eq!(
             cooldown_url(76_561_198_000_000_001),
-            "https://steamcommunity.com/profiles/76561198000000001/gcpd/730?tab=matchmaking"
+            "https://steamcommunity.com/profiles/76561198000000001/gcpd/730?tab=matchmaking&l=english"
         );
+    }
+
+    #[test]
+    fn cooldown_url_pins_the_ui_language() {
+        // GCPD_PAGE_MARKER is an english literal; without this the guard
+        // would reject a real page on a non-english account
+        assert!(cooldown_url(1).contains("l=english"));
     }
 
     #[test]
