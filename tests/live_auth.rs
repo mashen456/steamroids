@@ -19,7 +19,8 @@
 //!   `login OK` this account must have Steam Guard fully disabled; if it still
 //!   has email Guard the test soft-skips (our flow can't enter an email code
 //!   yet). This account also drives the CS2 Game Coordinator scan
-//!   (`cs2_profile_scan`).
+//!   (`cs2_profile_scan`) and the web-session test
+//!   (`web_session_authenticates_a_community_request`).
 //! - **CS2 account** (`STEAM_TEST_CS2_*`, optional) — an account that owns / has
 //!   launched CS2, so its Game Coordinator welcomes us. Drives the real profile
 //!   scan; if unset, `cs2_profile_scan` falls back to the plain account and
@@ -28,9 +29,14 @@
 //!   token-reuse path.
 //!
 //! The real-login tests are `#[ignore]`d so a stray `cargo test` never fires
-//! live logins; CI opts in with `-- --include-ignored`. Each account is logged
-//! in at most once per run: the 2FA login happens only inside `cm_logon_over_wss`,
-//! and the plain login only inside `cs2_profile_scan`.
+//! live logins; CI opts in with `-- --include-ignored`. The 2FA account is
+//! logged in at most once per run, only inside `cm_logon_over_wss`, because a
+//! second concurrent login would reuse the same TOTP code inside its 30s
+//! window and Steam rejects the duplicate. The plain account logs in from two
+//! tests (`cs2_profile_scan` and `web_session_authenticates_a_community_request`),
+//! which can run concurrently under the default parallel test harness; that's
+//! fine because it carries no shared secret, so there is no one-time code for
+//! the two logins to collide on.
 //!
 //! # Running locally
 //!
@@ -474,13 +480,18 @@ async fn cm_logon_over_wss() {
 /// First unified `ServiceMethod` call this crate has ever sent, so the
 /// offline tests can't show Steam actually accepts the frame. `#[ignore]`d
 /// (real login).
+///
+/// Uses the plain account, not the 2FA one: `cm_logon_over_wss` already logs
+/// the 2FA account in, and a second concurrent login would reuse the same
+/// TOTP code inside its 30s window and get rejected. The plain account has no
+/// shared secret to collide on.
 #[tokio::test]
-#[ignore = "live: needs STEAM_TEST_2FA_* and talks to real Steam"]
+#[ignore = "live: needs STEAM_TEST_PLAIN_* and talks to real Steam"]
 async fn web_session_authenticates_a_community_request() {
     use steamroids::session::{spawn_session, SessionConfig};
 
-    let Some(acc) = load_account("2FA") else {
-        skip("web_session: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET");
+    let Some(acc) = load_account("PLAIN") else {
+        skip("web_session: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
         return;
     };
     let proxy = env_opt("STEAM_TEST_PROXY_URL")
