@@ -1,0 +1,181 @@
+//! Steam web session support.
+//!
+//! A logged-on CM session can mint a web access token for the same account,
+//! which authenticates requests to `steamcommunity.com` and the store without
+//! a second login. This is what the Steam client itself does so its embedded
+//! browser is signed in.
+//!
+//! The exchange must ride the CM session: Steam refuses
+//! `GenerateAccessTokenForApp` over the plain `WebAPI` for the
+//! `SteamClient`-platform refresh tokens this crate issues, answering
+//! `AccessDenied`. See [`crate::auth`] for the platform split.
+
+use crate::auth::RefreshToken;
+use crate::proto::{
+    CAuthenticationAccessTokenGenerateForAppRequest,
+    CAuthenticationAccessTokenGenerateForAppResponse,
+};
+use crate::session::SessionHandle;
+use crate::transport::proxy::ProxyConfig;
+use crate::{Error, Result};
+
+// k_ETokenRenewalType_None: leave the refresh token as it is
+const TOKEN_RENEWAL_NONE: i32 = 0;
+
+/// Exchange this session's refresh token for a web access token.
+///
+/// `refresh_token` must be the token this session logged on with. Pass the
+/// same `proxy` the session was spawned with: web requests made through the
+/// returned [`WebSession`] then leave via the same exit as the CM session they
+/// authenticate as, which is what a per-account proxy deployment needs.
+///
+/// # Errors
+///
+/// [`Error::Remote`] if Steam rejects the exchange or returns no token, plus
+/// any transport error from the underlying session call.
+pub async fn request_web_token(
+    session: &SessionHandle,
+    refresh_token: &RefreshToken,
+    proxy: Option<&ProxyConfig>,
+) -> Result<WebSession> {
+    let req = CAuthenticationAccessTokenGenerateForAppRequest {
+        refresh_token: Some(refresh_token.expose().to_string()),
+        steamid: Some(session.steam_id()),
+        renewal_type: Some(TOKEN_RENEWAL_NONE),
+    };
+    let resp: CAuthenticationAccessTokenGenerateForAppResponse = session
+        .call_service("Authentication", "GenerateAccessTokenForApp", 1, &req)
+        .await?;
+
+    let access_token = resp.access_token.filter(|t| !t.is_empty()).ok_or_else(|| {
+        Error::Remote("GenerateAccessTokenForApp returned no access token".into())
+    })?;
+
+    Ok(WebSession {
+        steam_id: session.steam_id(),
+        access_token,
+        proxy: proxy.cloned(),
+    })
+}
+
+/// An authenticated Steam web session.
+///
+/// `Debug` is implemented by hand to keep the access token out of logs and
+/// traces, matching [`RefreshToken`]'s redaction.
+#[derive(Clone)]
+pub struct WebSession {
+    steam_id: u64,
+    access_token: String,
+    proxy: Option<ProxyConfig>,
+}
+
+impl std::fmt::Debug for WebSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSession")
+            .field("steam_id", &self.steam_id)
+            .field("access_token", &"<redacted>")
+            .field("proxy", &self.proxy)
+            .finish()
+    }
+}
+
+impl WebSession {
+    /// The account this session authenticates as.
+    pub fn steam_id(&self) -> u64 {
+        self.steam_id
+    }
+
+    /// The minted web access token.
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+    use crate::codec::SteamMessage;
+    use crate::proto::CMsgProtoBufHeader;
+    use crate::session::driver::{Command, EMSG_SERVICE_METHOD_RESPONSE};
+
+    #[tokio::test]
+    async fn request_web_token_calls_generate_access_token_for_app() {
+        let (handle, mut commands, _events, _snapshots) =
+            SessionHandle::for_test(76_561_198_000_000_001);
+
+        let task = tokio::spawn(async move {
+            request_web_token(
+                &handle,
+                &RefreshToken::new("stored-refresh-token".to_string()),
+                None,
+            )
+            .await
+        });
+
+        let Some(Command::Request {
+            job_name,
+            body,
+            reply,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected a Request command");
+        };
+        assert_eq!(
+            job_name.as_deref(),
+            Some("Authentication.GenerateAccessTokenForApp#1")
+        );
+
+        let sent = CAuthenticationAccessTokenGenerateForAppRequest::decode(body.as_slice())
+            .expect("decode request");
+        assert_eq!(sent.refresh_token.as_deref(), Some("stored-refresh-token"));
+        assert_eq!(sent.steamid, Some(76_561_198_000_000_001));
+        // k_ETokenRenewalType_None: do not rotate the refresh token
+        assert_eq!(sent.renewal_type, Some(0));
+
+        let resp = CAuthenticationAccessTokenGenerateForAppResponse {
+            access_token: Some("minted-access-token".to_string()),
+            refresh_token: None,
+        };
+        reply
+            .send(Ok(SteamMessage {
+                emsg: EMSG_SERVICE_METHOD_RESPONSE,
+                header: CMsgProtoBufHeader::default(),
+                body: resp.encode_to_vec(),
+            }))
+            .expect("send reply");
+
+        let web = task.await.expect("task").expect("request_web_token");
+        assert_eq!(web.access_token(), "minted-access-token");
+        assert_eq!(web.steam_id(), 76_561_198_000_000_001);
+    }
+
+    #[tokio::test]
+    async fn request_web_token_errors_when_steam_returns_no_token() {
+        let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(5);
+
+        let task = tokio::spawn(async move {
+            request_web_token(&handle, &RefreshToken::new("t".to_string()), None).await
+        });
+
+        let Some(Command::Request { reply, .. }) = commands.recv().await else {
+            panic!("expected a Request command");
+        };
+        let resp = CAuthenticationAccessTokenGenerateForAppResponse {
+            access_token: None,
+            refresh_token: None,
+        };
+        reply
+            .send(Ok(SteamMessage {
+                emsg: EMSG_SERVICE_METHOD_RESPONSE,
+                header: CMsgProtoBufHeader::default(),
+                body: resp.encode_to_vec(),
+            }))
+            .expect("send reply");
+
+        let err = task.await.expect("task").unwrap_err();
+        assert!(matches!(err, Error::Remote(_)), "{err:?}");
+    }
+}
