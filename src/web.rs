@@ -172,6 +172,9 @@ impl WebSession {
 mod tests {
     use prost::Message;
 
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
     use super::*;
     use crate::codec::SteamMessage;
     use crate::proto::CMsgProtoBufHeader;
@@ -310,7 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_surfaces_a_non_success_status() {
+    async fn get_surfaces_a_transport_failure() {
         // 127.0.0.1:1 has nothing listening, so the request fails at connect
         let web = WebSession {
             steam_id: 1,
@@ -320,5 +323,50 @@ mod tests {
         };
         let err = web.get("http://127.0.0.1:1/").await.unwrap_err();
         assert!(matches!(err, Error::Network(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_surfaces_a_non_success_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            {
+                // drain full request head, not just the line: unread bytes at
+                // close can rst the reply away
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let read = reader.read_line(&mut line).await.expect("read request");
+                    assert_ne!(read, 0, "request ended without a blank line");
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write reply");
+            stream.flush().await.expect("flush");
+        });
+
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "tok".to_string(),
+            session_id: None,
+            proxy: None,
+        };
+        let err = web
+            .get(&format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap_err();
+        match err {
+            Error::Network(text) => assert!(text.contains("404"), "{text}"),
+            other => panic!("expected Network, got {other:?}"),
+        }
+        server.await.expect("server task");
     }
 }
