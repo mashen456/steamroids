@@ -54,6 +54,7 @@ pub async fn request_web_token(
     Ok(WebSession {
         steam_id: session.steam_id(),
         access_token,
+        session_id: None,
         proxy: proxy.cloned(),
     })
 }
@@ -66,6 +67,7 @@ pub async fn request_web_token(
 pub struct WebSession {
     steam_id: u64,
     access_token: String,
+    session_id: Option<String>,
     proxy: Option<ProxyConfig>,
 }
 
@@ -74,6 +76,7 @@ impl std::fmt::Debug for WebSession {
         f.debug_struct("WebSession")
             .field("steam_id", &self.steam_id)
             .field("access_token", &"<redacted>")
+            .field("session_id", &self.session_id)
             .field("proxy", &self.proxy)
             .finish()
     }
@@ -88,6 +91,43 @@ impl WebSession {
     /// The minted web access token.
     pub fn access_token(&self) -> &str {
         &self.access_token
+    }
+
+    /// Attach a `sessionid` cookie.
+    ///
+    /// Only needed for state-changing POSTs, which Steam guards with a CSRF
+    /// token that must match this cookie. Plain GETs (profile pages, GCPD)
+    /// authenticate on `steamLoginSecure` alone. The value is caller-supplied
+    /// so this crate takes no random-number dependency; any opaque string
+    /// works as long as the same value goes in the form field.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// The value for a `Cookie:` request header, authenticating as this account.
+    ///
+    /// A future authenticated fetch helper will send this header through the
+    /// session's proxy for you. Until then, drive your own HTTP client with
+    /// it, and route it through the same proxy the session uses.
+    ///
+    /// ```
+    /// # use steamroids::web::WebSession;
+    /// # fn demo(web: &WebSession) {
+    /// let cookie = web.cookie_header();
+    /// assert!(cookie.starts_with("steamLoginSecure="));
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn cookie_header(&self) -> String {
+        // steamLoginSecure is "<steamid64>||<access token>", url-encoded
+        let raw = format!("{}||{}", self.steam_id, self.access_token);
+        let encoded: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
+        match &self.session_id {
+            Some(sid) => format!("steamLoginSecure={encoded}; sessionid={sid}"),
+            None => format!("steamLoginSecure={encoded}"),
+        }
     }
 }
 
@@ -177,5 +217,45 @@ mod tests {
 
         let err = task.await.expect("task").unwrap_err();
         assert!(matches!(err, Error::Remote(_)), "{err:?}");
+    }
+
+    #[test]
+    fn cookie_header_encodes_the_pipe_separator() {
+        let web = WebSession {
+            steam_id: 76_561_198_000_000_001,
+            access_token: "eyJhbGci.eyJzdWIi.sig-part_x".to_string(),
+            session_id: None,
+            proxy: None,
+        };
+        assert_eq!(
+            web.cookie_header(),
+            "steamLoginSecure=76561198000000001%7C%7CeyJhbGci.eyJzdWIi.sig-part_x"
+        );
+    }
+
+    #[test]
+    fn cookie_header_appends_a_session_id_when_set() {
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "tok".to_string(),
+            session_id: None,
+            proxy: None,
+        }
+        .with_session_id("abc123");
+        assert_eq!(
+            web.cookie_header(),
+            "steamLoginSecure=1%7C%7Ctok; sessionid=abc123"
+        );
+    }
+
+    #[test]
+    fn debug_does_not_leak_the_access_token() {
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "super-secret".to_string(),
+            session_id: None,
+            proxy: None,
+        };
+        assert!(!format!("{web:?}").contains("super-secret"));
     }
 }
