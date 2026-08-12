@@ -81,14 +81,18 @@ const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // One-shot snapshots Steam pushes exactly once after each logon: the full
-// friends list (`k_EMsgClientFriendsList` = 767), friends-groups list (5553)
-// and player-nickname list (5587). The full snapshot always precedes any
+// friends list (`k_EMsgClientFriendsList` = 767), friends-groups list (5553),
+// player-nickname list (5587), and the package license list
+// (`k_EMsgClientLicenseList` = 780). The full snapshot always precedes any
 // incremental delta on the same emsg, so the driver caches the **first** body
 // it sees per emsg since the last logon (see [`SnapshotCache`]) — a later delta
 // never overwrites it. This lets [`crate::friends`]'s `request_*` read the
 // snapshot race-free instead of having to subscribe the instant the session
-// comes up, only to find the push already broadcast and gone.
-const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 3] = [767, 5553, 5587];
+// comes up, only to find the push already broadcast and gone. The license list
+// fits the same policy for the same reason (a one-shot post-login push, not
+// repeated on change within a session, unlike wallet below), so
+// [`crate::licenses`] reads it the same way.
+const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 4] = [767, 5553, 5587, 780];
 
 // Emsgs Steam re-pushes on every change, not just once after logon: the
 // wallet balance (`k_EMsgClientWalletInfoUpdate` = 5528). First-wins would be
@@ -110,6 +114,18 @@ const LAST_WINS_CACHE_EMSGS: [u32; 1] = [5528];
 /// re-pushes both kinds. Critical sections are a single map op, never held
 /// across an `.await`, so a blocking `std::sync::Mutex` is the right fit.
 type SnapshotCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
+
+/// Raw Game Coordinator `SharedObject` blobs from a GC's most recent
+/// `ClientWelcome`, keyed by `(appid, so type_id)`. Unlike [`SnapshotCache`]
+/// this holds no CM-level data at all: it exists so a GC-scoped push (the
+/// welcome's `outofdate_subscribed_caches`) can still answer through a plain
+/// [`SessionHandle`], the way [`crate::cs2::has_prime`] needs, without
+/// [`crate::session`] depending on [`crate::gc`] to decode it: the GC pump
+/// decodes the welcome and writes here via [`SessionHandle::replace_so_cache`];
+/// this module never looks inside the blobs. A welcome is a full inventory,
+/// not a delta, so each one wholesale-replaces the prior entries for its
+/// `appid` (see [`SessionHandle::replace_so_cache`]) rather than merging.
+type GcSoCache = Arc<Mutex<HashMap<(u32, i32), Vec<Vec<u8>>>>>;
 
 /// Everything the driver needs to establish — and re-establish — a session.
 #[derive(Debug, Clone)]
@@ -190,6 +206,7 @@ pub struct SessionHandle {
     events: broadcast::Sender<SteamMessage>,
     state: watch::Receiver<SessionState>,
     snapshots: SnapshotCache,
+    so_cache: GcSoCache,
     steam_id: u64,
 }
 
@@ -391,11 +408,12 @@ impl SessionHandle {
     ///
     /// Two kinds of emsg are cached, with different overwrite policies: the
     /// post-login snapshots (full friends list, friends-groups list,
-    /// player-nickname list) are first-wins, so a later incremental delta on
-    /// the same emsg never overwrites the full snapshot already cached;
-    /// wallet-balance updates are last-wins, so a later push always replaces
-    /// the previous balance. Any other emsg is never cached, so this returns
-    /// `None` for it even after a matching push reached [`Self::subscribe`].
+    /// player-nickname list, license list) are first-wins, so a later
+    /// incremental delta on the same emsg never overwrites the full snapshot
+    /// already cached; wallet-balance updates are last-wins, so a later push
+    /// always replaces the previous balance. Any other emsg is never cached,
+    /// so this returns `None` for it even after a matching push reached
+    /// [`Self::subscribe`].
     ///
     /// For a first-wins emsg, to stay race-free **subscribe first, then read
     /// the cache**: any snapshot not yet cached is still guaranteed to reach
@@ -407,6 +425,36 @@ impl SessionHandle {
             .expect("snapshot cache mutex poisoned")
             .get(&emsg)
             .cloned()
+    }
+
+    /// The cached `SharedObject` blobs for `type_id` under `appid`'s Game
+    /// Coordinator, from its most recent `ClientWelcome`, or `None` if no
+    /// welcome carrying this type has arrived yet this GC session (including:
+    /// no [`crate::gc::GameCoordinator`] for `appid` has ever been attached).
+    ///
+    /// Populated by the GC pump via `Self::replace_so_cache` (crate-private),
+    /// not by this module. [`crate::cs2::has_prime`] is the first reader.
+    pub fn cached_so_objects(&self, appid: u32, type_id: i32) -> Option<Vec<Vec<u8>>> {
+        self.so_cache
+            .lock()
+            .expect("so cache mutex poisoned")
+            .get(&(appid, type_id))
+            .cloned()
+    }
+
+    /// Replace every cached `SharedObject` blob for `appid` with `objects`
+    /// (keyed by SO `type_id`), as reported by a fresh GC `ClientWelcome`.
+    ///
+    /// Not part of the public API: called by [`crate::gc::GameCoordinator`]'s
+    /// pump when it decodes a welcome, since the welcome is a full inventory
+    /// of subscribed caches rather than a delta, so a `type_id` from a prior
+    /// welcome that the new one omits must not linger.
+    pub(crate) fn replace_so_cache(&self, appid: u32, objects: HashMap<i32, Vec<Vec<u8>>>) {
+        let mut cache = self.so_cache.lock().expect("so cache mutex poisoned");
+        cache.retain(|&(a, _), _| a != appid);
+        for (type_id, blobs) in objects {
+            cache.insert((appid, type_id), blobs);
+        }
     }
 
     /// Cleanly log the session off: send `CMsgClientLogOff` to Steam and tear
@@ -431,11 +479,12 @@ impl SessionHandle {
     /// pieces a fake driver needs: the command receiver, the event sender and
     /// the snapshot cache.
     ///
-    /// This exists so `friends` / `persona` / `cs2` / `gc` / `wallet` request
-    /// builders can be covered offline: a test drives the returned receiver
-    /// and answers commands itself. Not part of the supported API: it may
-    /// change or vanish in any release, and it is useless in production code.
-    /// Compiled only under `cfg(test)` or the `test-seam` feature.
+    /// This exists so `friends` / `persona` / `cs2` / `gc` / `wallet` /
+    /// `licenses` request builders can be covered offline: a test drives the
+    /// returned receiver and answers commands itself. Not part of the
+    /// supported API: it may change or vanish in any release, and it is
+    /// useless in production code. Compiled only under `cfg(test)` or the
+    /// `test-seam` feature.
     #[cfg(any(test, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn for_test(
@@ -456,12 +505,24 @@ impl SessionHandle {
                 events: evt_tx.clone(),
                 state: state_rx,
                 snapshots: snapshots.clone(),
+                so_cache: Arc::new(Mutex::new(HashMap::new())),
                 steam_id,
             },
             cmd_rx,
             evt_tx,
             snapshots,
         )
+    }
+
+    /// **Test-only.** The raw SO cache backing this handle, for a test to
+    /// seed directly (mirroring how [`Self::for_test`] hands out the raw
+    /// snapshot cache), since the GC pump that normally populates it doesn't
+    /// run in a driverless test. Not part of the supported API. Compiled only
+    /// under `cfg(test)` or the `test-seam` feature.
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn so_cache_for_test(&self) -> GcSoCache {
+        self.so_cache.clone()
     }
 }
 
@@ -535,6 +596,7 @@ pub async fn spawn_session(
             events: evt_tx,
             state: state_rx,
             snapshots,
+            so_cache: Arc::new(Mutex::new(HashMap::new())),
             steam_id,
         },
         join,
@@ -1118,6 +1180,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_caches_the_license_list_first_wins() {
+        // The license list (780) joined POST_LOGIN_SNAPSHOT_EMSGS as a
+        // one-shot post-login push, same policy as the friends snapshot above,
+        // not LAST_WINS_CACHE_EMSGS, which is wallet's policy.
+        let mut pending: HashMap<u64, Pending> = HashMap::new();
+        let (events, _keep) = broadcast::channel(8);
+        let snapshots = empty_snapshots();
+        let license_list = 780;
+        assert!(POST_LOGIN_SNAPSHOT_EMSGS.contains(&license_list));
+
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(license_list, None, vec![1]),
+        );
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(license_list, None, vec![2]),
+        );
+
+        let cached = snapshots.lock().unwrap().get(&license_list).cloned();
+        assert_eq!(cached, Some(vec![1]), "first license list body wins");
+    }
+
+    #[tokio::test]
     async fn dispatch_does_not_cache_unlisted_emsg() {
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let (events, _keep) = broadcast::channel(8);
@@ -1428,6 +1518,57 @@ mod tests {
         }
         task.await.expect("notify task");
         assert!(snapshots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_so_objects_is_none_before_any_welcome() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        assert!(handle.cached_so_objects(730, 7).is_none());
+    }
+
+    #[test]
+    fn replace_so_cache_is_readable_back() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        let mut objects = HashMap::new();
+        objects.insert(7, vec![vec![1, 2, 3]]);
+        handle.replace_so_cache(730, objects);
+
+        assert_eq!(handle.cached_so_objects(730, 7), Some(vec![vec![1, 2, 3]]));
+        // A different appid's cache must stay untouched.
+        assert!(handle.cached_so_objects(570, 7).is_none());
+    }
+
+    #[test]
+    fn replace_so_cache_drops_a_type_the_new_welcome_omits() {
+        // A welcome is a full inventory, not a delta: a type_id present in an
+        // earlier welcome but absent from a later one must not linger.
+        let (handle, ..) = SessionHandle::for_test(7);
+        let mut first = HashMap::new();
+        first.insert(2, vec![vec![9]]);
+        first.insert(7, vec![vec![1]]);
+        handle.replace_so_cache(730, first);
+
+        let mut second = HashMap::new();
+        second.insert(7, vec![vec![2]]);
+        handle.replace_so_cache(730, second);
+
+        assert_eq!(handle.cached_so_objects(730, 7), Some(vec![vec![2]]));
+        assert!(
+            handle.cached_so_objects(730, 2).is_none(),
+            "type_id 2 was not in the second welcome, so it must be gone"
+        );
+    }
+
+    #[test]
+    fn so_cache_for_test_shares_the_handles_own_cache() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        let raw = handle.so_cache_for_test();
+        raw.lock().unwrap().insert((730, 7), vec![vec![0xde, 0xad]]);
+
+        assert_eq!(
+            handle.cached_so_objects(730, 7),
+            Some(vec![vec![0xde, 0xad]])
+        );
     }
 
     #[tokio::test]

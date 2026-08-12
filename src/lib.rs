@@ -49,6 +49,8 @@
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
 //! - [`gcpd`]: fetch and parse an account's CS2 competitive cooldown from its
 //!   GCPD page ([`gcpd::request_cs2_cooldown`])
+//! - [`licenses`]: the account's package licenses, read from Steam's
+//!   unprompted post-login push ([`licenses::licenses`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 //! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
 //! - [`ratelimit`]: a shareable request pacer for fleets behind proxies
@@ -67,6 +69,7 @@ pub mod error;
 pub mod friends;
 pub mod gc;
 pub mod gcpd;
+pub mod licenses;
 pub mod persona;
 pub mod pool;
 pub mod proto;

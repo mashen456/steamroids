@@ -1,10 +1,11 @@
-//! Offline coverage for the `friends` / `persona` / `wallet` handlers.
+//! Offline coverage for the `friends` / `persona` / `wallet` / `licenses`
+//! handlers.
 //!
 //! Each test drives the real public function against a driverless
 //! `SessionHandle::for_test`, answering its command with a synthesized
 //! `CMsgClient*` reply. That covers the parts a live test can't reach on
 //! demand: rejections, partial pushes, and the snapshot cache (first-wins for
-//! the post-login snapshots, last-wins for wallet).
+//! the post-login snapshots, friends and licenses; last-wins for wallet).
 //!
 //! Needs the unsupported `test-seam` feature (CI runs `--all-features`):
 //!
@@ -21,13 +22,15 @@ use tokio::sync::broadcast;
 
 use steamroids::codec::SteamMessage;
 use steamroids::friends;
+use steamroids::licenses;
 use steamroids::persona;
 use steamroids::proto::{
     c_msg_client_friends_list::Friend as ProtoFriend,
+    c_msg_client_license_list::License as ProtoLicense,
     c_msg_client_persona_state::Friend as Persona, CMsgClientAddFriendToGroupResponse,
     CMsgClientDeleteFriendsGroupResponse, CMsgClientFriendProfileInfoResponse,
-    CMsgClientFriendsList, CMsgClientManageFriendsGroupResponse, CMsgClientPersonaState,
-    CMsgClientRemoveFriendFromGroupResponse, CMsgClientRequestFriendData,
+    CMsgClientFriendsList, CMsgClientLicenseList, CMsgClientManageFriendsGroupResponse,
+    CMsgClientPersonaState, CMsgClientRemoveFriendFromGroupResponse, CMsgClientRequestFriendData,
     CMsgClientSetPlayerNicknameResponse, CMsgClientWalletInfoUpdate, CMsgProtoBufHeader,
 };
 use steamroids::session::driver::Command;
@@ -49,6 +52,7 @@ const EMSG_AM_CLIENT_DELETE_FRIENDS_GROUP: u32 = 5562;
 const EMSG_AM_CLIENT_ADD_FRIEND_TO_GROUP: u32 = 5566;
 const EMSG_AM_CLIENT_REMOVE_FRIEND_FROM_GROUP: u32 = 5568;
 const EMSG_CLIENT_WALLET_INFO_UPDATE: u32 = 5528;
+const EMSG_CLIENT_LICENSE_LIST: u32 = 780;
 
 /// `EResult::LimitExceeded`, a plausible Steam-side rejection.
 const ERESULT_LIMIT_EXCEEDED: u32 = 25;
@@ -331,6 +335,40 @@ async fn request_friends_list_skips_an_incremental_cached_delta() {
         list[0].steam_id, OTHER_ID,
         "the incremental delta must not answer the request"
     );
+}
+
+// ---- licenses: the post-login snapshot cache -------------------------------
+
+#[tokio::test]
+async fn licenses_reads_the_cached_snapshot() {
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+    let body = CMsgClientLicenseList {
+        licenses: vec![ProtoLicense {
+            package_id: Some(730),
+            time_created: Some(1_700_000_000),
+            payment_method: Some(1),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec();
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_LICENSE_LIST, body);
+
+    let list = licenses::licenses(&handle).expect("the cached snapshot answers without a push");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].package_id, 730);
+    assert_eq!(licenses::owns_package(&handle, 730), Some(true));
+    assert_eq!(licenses::owns_package(&handle, 999), Some(false));
+}
+
+#[tokio::test]
+async fn licenses_is_none_before_any_push() {
+    let (handle, _commands, _events, _snapshots) = SessionHandle::for_test(SELF_ID);
+    assert!(licenses::licenses(&handle).is_none());
+    assert!(licenses::owns_package(&handle, 730).is_none());
 }
 
 // ---- persona --------------------------------------------------------------

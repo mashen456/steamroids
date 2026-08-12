@@ -22,9 +22,12 @@
 
 use std::time::Duration;
 
+use prost::Message as _;
+
 use crate::gc::GameCoordinator;
 use crate::proto::gc::{
     CMsgGccStrike15V2ClientRequestPlayersProfile, CMsgGccStrike15V2PlayersProfile,
+    CsoEconGameAccountClient,
 };
 use crate::session::SessionHandle;
 use crate::{Error, Result};
@@ -167,10 +170,47 @@ pub fn account_id_from_steam_id(steam_id: u64) -> u32 {
     }
 }
 
+/// SO `type_id` for `CSOEconGameAccountClient`
+/// (`protos/csgo/base_gcmessages.proto:101`), the GC `SharedObject` that
+/// carries `elevated_state`, Valve's internal name for CS2 Prime.
+///
+/// Determined live on 2026-08-13 against a CS2-owning test account: of the 8
+/// distinct SO `type_id`s the account's `ClientWelcome` carried, only
+/// `type_id` 7 held a single blob whose wire-level field numbers
+/// (1, 12, 13, 14, 15) with matching wire types (varint, fixed32, varint,
+/// varint, varint) exactly fingerprint this message's six-field layout, and
+/// no other `type_id` observed carried fields 14 or 15 at all. Field 12
+/// (`bonus_xp_timestamp_refresh`) decoded to a plausible recent Unix
+/// timestamp, confirming the byte boundaries; the sibling public flag,
+/// `CSOPersonaDataPublic.elevated_state` at `type_id` 2, independently agreed
+/// the account was elevated. See the commit that introduced this constant for
+/// the raw probe output.
+const SO_TYPE_ECON_GAME_ACCOUNT_CLIENT: i32 = 7;
+
+/// Whether the account has CS2 Prime status ("elevated" in Valve's own field
+/// naming), read from the CS2 Game Coordinator's `SharedObject` cache.
+///
+/// Prime is `CSOEconGameAccountClient.elevated_state`
+/// (`protos/csgo/base_gcmessages.proto:106`), a per-account `SharedObject`
+/// the GC's `ClientWelcome` delivers unprompted once [`attach`] has been welcomed
+/// (see [`GameCoordinator::wait_ready`]). This is a method, not a
+/// subscription: it reads the cache [`SessionHandle::cached_so_objects`] keeps
+/// from that welcome and returns immediately. It never asks the GC for
+/// anything and never blocks.
+///
+/// Returns `None` if no welcome carrying this `SharedObject` has arrived yet
+/// this GC session, including if [`attach`] was never called at all.
+pub fn has_prime(session: &SessionHandle) -> Option<bool> {
+    let blobs = session.cached_so_objects(APP_ID, SO_TYPE_ECON_GAME_ACCOUNT_CLIENT)?;
+    let blob = blobs.first()?;
+    let account = CsoEconGameAccountClient::decode(blob.as_slice()).ok()?;
+    Some(account.elevated_state.unwrap_or(0) != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message as _;
+    use std::collections::HashMap;
 
     use crate::gc::GcMessage;
     use crate::proto::gc::{
@@ -277,5 +317,65 @@ mod tests {
         // Guards against an accidental edit drifting from cstrike15_gcmessages.proto.
         assert_eq!(GC_CLIENT_REQUEST_PLAYERS_PROFILE, 9127);
         assert_eq!(GC_PLAYERS_PROFILE, 9128);
+    }
+
+    fn seed_econ_game_account(session: &SessionHandle, account: CsoEconGameAccountClient) {
+        let mut objects = HashMap::new();
+        objects.insert(
+            SO_TYPE_ECON_GAME_ACCOUNT_CLIENT,
+            vec![account.encode_to_vec()],
+        );
+        session.replace_so_cache(APP_ID, objects);
+    }
+
+    #[test]
+    fn has_prime_is_none_before_any_welcome() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        assert!(has_prime(&session).is_none());
+    }
+
+    #[test]
+    fn has_prime_true_when_elevated_state_is_nonzero() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        seed_econ_game_account(
+            &session,
+            CsoEconGameAccountClient {
+                elevated_state: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(has_prime(&session), Some(true));
+    }
+
+    #[test]
+    fn has_prime_false_when_elevated_state_is_absent_or_zero() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        seed_econ_game_account(&session, CsoEconGameAccountClient::default());
+        assert_eq!(has_prime(&session), Some(false));
+    }
+
+    #[test]
+    fn has_prime_is_none_for_a_different_app() {
+        // A welcome for some other app's GC must not answer CS2's Prime check.
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let mut objects = HashMap::new();
+        objects.insert(
+            SO_TYPE_ECON_GAME_ACCOUNT_CLIENT,
+            vec![CsoEconGameAccountClient {
+                elevated_state: Some(1),
+                ..Default::default()
+            }
+            .encode_to_vec()],
+        );
+        session.replace_so_cache(570, objects);
+
+        assert!(has_prime(&session).is_none());
+    }
+
+    #[test]
+    fn so_type_econ_game_account_client_matches_the_live_probe() {
+        // Guards against an accidental edit drifting from the live-determined
+        // value (see the constant's doc comment for how it was established).
+        assert_eq!(SO_TYPE_ECON_GAME_ACCOUNT_CLIENT, 7);
     }
 }

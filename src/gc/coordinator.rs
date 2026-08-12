@@ -1,5 +1,6 @@
 //! A Game Coordinator client multiplexed over a CM [`SessionHandle`].
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use prost::Message;
@@ -11,7 +12,8 @@ use crate::gc::envelope::{self, GcMessage, EMSG_CLIENT_FROM_GC, EMSG_CLIENT_TO_G
 use crate::gc::{GC_CLIENT_CONNECTION_STATUS, GC_CLIENT_HELLO, GC_CLIENT_WELCOME};
 use crate::proto::c_msg_client_games_played::GamePlayed;
 use crate::proto::gc::{
-    CMsgClientHello, CMsgConnectionStatus, CMsgProtoBufHeader as GcHeader, GcConnectionStatus,
+    CMsgClientHello, CMsgClientWelcome, CMsgConnectionStatus, CMsgProtoBufHeader as GcHeader,
+    GcConnectionStatus,
 };
 use crate::proto::CMsgClientGamesPlayed;
 use crate::session::{SessionHandle, SessionState};
@@ -336,6 +338,24 @@ fn has_gc_session(body: &[u8]) -> bool {
     }
 }
 
+/// Flatten a `ClientWelcome`'s `outofdate_subscribed_caches` into
+/// `type_id -> blobs`, or `None` if the body doesn't decode as a welcome at
+/// all. A `type_id` absent from the welcome is simply absent from the map,
+/// not an entry with an empty `Vec`.
+fn so_objects_from_welcome(body: &[u8]) -> Option<HashMap<i32, Vec<Vec<u8>>>> {
+    let welcome = CMsgClientWelcome::decode(body).ok()?;
+    let mut objects: HashMap<i32, Vec<Vec<u8>>> = HashMap::new();
+    for subscribed in welcome.outofdate_subscribed_caches {
+        for obj in subscribed.objects {
+            let Some(type_id) = obj.type_id else {
+                continue;
+            };
+            objects.entry(type_id).or_default().extend(obj.object_data);
+        }
+    }
+    Some(objects)
+}
+
 /// Background pump: relays `ClientFromGC` traffic into GC events, tracks
 /// readiness, and re-launches the app when the session reconnects. Ends when the
 /// session does, or when the last [`GameCoordinator`] clone is dropped (holding
@@ -401,6 +421,13 @@ async fn pump(
                                 match gc_msg.msgtype {
                                     GC_CLIENT_WELCOME => {
                                         ready = true;
+                                        // The welcome carries the account's
+                                        // SO caches (Prime state among them);
+                                        // an undecodable body just skips the
+                                        // cache update, not readiness.
+                                        if let Some(objects) = so_objects_from_welcome(&gc_msg.body) {
+                                            session.replace_so_cache(appid, objects);
+                                        }
                                         info!("GC welcomed");
                                         let _ = ready_tx.send(true);
                                     }
@@ -435,6 +462,7 @@ async fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::gc::{c_msg_so_cache_subscribed::SubscribedType, CMsgSoCacheSubscribed};
     use crate::session::driver::Command;
 
     const APPID: u32 = 730;
@@ -488,6 +516,55 @@ mod tests {
     fn undecodable_connection_status_is_not_a_session() {
         // 0xff is not a valid protobuf tag.
         assert!(!has_gc_session(&[0xff, 0xff]));
+    }
+
+    fn subscribed(type_id: i32, blobs: Vec<Vec<u8>>) -> CMsgSoCacheSubscribed {
+        CMsgSoCacheSubscribed {
+            objects: vec![SubscribedType {
+                type_id: Some(type_id),
+                object_data: blobs,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn so_objects_from_welcome_flattens_across_caches() {
+        // Two subscribed caches both carrying type_id 7 must merge into one
+        // entry, not overwrite each other.
+        let welcome = CMsgClientWelcome {
+            outofdate_subscribed_caches: vec![
+                subscribed(7, vec![vec![1]]),
+                subscribed(2, vec![vec![9]]),
+                subscribed(7, vec![vec![2]]),
+            ],
+            ..Default::default()
+        };
+        let objects = so_objects_from_welcome(&welcome.encode_to_vec()).expect("decodes");
+        assert_eq!(objects.get(&7), Some(&vec![vec![1], vec![2]]));
+        assert_eq!(objects.get(&2), Some(&vec![vec![9]]));
+    }
+
+    #[test]
+    fn so_objects_from_welcome_skips_a_blob_with_no_type_id() {
+        let welcome = CMsgClientWelcome {
+            outofdate_subscribed_caches: vec![CMsgSoCacheSubscribed {
+                objects: vec![SubscribedType {
+                    type_id: None,
+                    object_data: vec![vec![1]],
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let objects = so_objects_from_welcome(&welcome.encode_to_vec()).expect("decodes");
+        assert!(objects.is_empty());
+    }
+
+    #[test]
+    fn so_objects_from_welcome_is_none_on_garbage() {
+        // 0xff is not a valid protobuf tag.
+        assert!(so_objects_from_welcome(&[0xff, 0xff]).is_none());
     }
 
     #[tokio::test]
@@ -617,5 +694,63 @@ mod tests {
             commands.recv().await.is_none(),
             "pump dropped its session handle"
         );
+    }
+
+    #[tokio::test]
+    async fn pump_caches_so_objects_from_a_real_welcome() {
+        use crate::codec::SteamMessage;
+        use crate::proto::CMsgProtoBufHeader as SteamHeader;
+
+        let (session, _commands, events_in, _snapshots) = SessionHandle::for_test(7);
+        let readback = session.clone();
+        let (_state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id: 7 });
+        let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+
+        let running = tokio::spawn(pump(
+            APPID,
+            1,
+            session,
+            events_in.subscribe(),
+            state_rx,
+            events_out,
+            ready_tx,
+        ));
+
+        // A real ClientWelcome, framed exactly as the CM would deliver it
+        // (EMSG_CLIENT_FROM_GC -> CMsgGcClient -> the inner GC frame).
+        let welcome = CMsgClientWelcome {
+            outofdate_subscribed_caches: vec![subscribed(7, vec![vec![1, 2, 3]])],
+            ..Default::default()
+        };
+        let client = envelope::wrap(
+            APPID,
+            GC_CLIENT_WELCOME,
+            &GcHeader::default(),
+            &welcome.encode_to_vec(),
+        );
+        events_in
+            .send(SteamMessage {
+                emsg: EMSG_CLIENT_FROM_GC,
+                header: SteamHeader::default(),
+                body: client.encode_to_vec(),
+            })
+            .expect("welcome delivered");
+
+        // Readiness only flips after the welcome is processed, so waiting for
+        // it also proves the cache write happened first.
+        while !*ready_rx.borrow() {
+            ready_rx.changed().await.expect("pump running");
+        }
+        assert_eq!(
+            readback.cached_so_objects(APPID, 7),
+            Some(vec![vec![1, 2, 3]])
+        );
+
+        drop(ready_rx);
+        timeout(Duration::from_secs(5), running)
+            .await
+            .expect("pump exits")
+            .expect("pump task");
     }
 }
