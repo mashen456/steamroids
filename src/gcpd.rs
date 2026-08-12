@@ -9,25 +9,30 @@
 use crate::web::WebSession;
 use crate::{Error, Result};
 
+/// The GCPD matchmaking-tab URL for an account.
+///
+/// Deliberately the `/profiles/<steamid64>/` form: the `/me/` alias is
+/// resolved browser-side and returns the Steam Community shell under HTTP
+/// 200 with no GCPD content, so it fails silently. The single source of
+/// truth for this URL: [`request_cs2_cooldown`] and the live test both call
+/// it, so a change here cannot silently drift out of sync with what the live
+/// test actually exercises.
+#[must_use]
+pub fn cooldown_url(steam_id: u64) -> String {
+    format!("https://steamcommunity.com/profiles/{steam_id}/gcpd/730?tab=matchmaking")
+}
+
 /// Read this account's active CS2 competitive cooldown from its GCPD page.
 ///
 /// `Ok(None)` means no cooldown is active: Steam omits the table entirely
 /// rather than rendering an empty one.
-///
-/// Uses the `/profiles/<steamid64>/` URL form deliberately. The `/me/` alias
-/// is resolved browser-side and returns the Steam Community shell with no
-/// GCPD content, under HTTP 200, so it fails silently.
 ///
 /// # Errors
 ///
 /// Any transport error from [`WebSession::get`], or [`Error::Codec`] if the
 /// cooldown table is present but its expiry does not parse.
 pub async fn request_cs2_cooldown(web: &WebSession) -> Result<Option<Cs2Cooldown>> {
-    let url = format!(
-        "https://steamcommunity.com/profiles/{}/gcpd/730?tab=matchmaking",
-        web.steam_id()
-    );
-    let html = web.get(&url).await?;
+    let html = web.get(&cooldown_url(web.steam_id())).await?;
     parse_cooldown(&html)
 }
 
@@ -214,6 +219,14 @@ mod tests {
     fn days_from_civil_matches_known_dates() {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 3, 1), 11017);
+    }
+
+    #[test]
+    fn cooldown_url_uses_the_profiles_form_not_me() {
+        assert_eq!(
+            cooldown_url(76_561_198_000_000_001),
+            "https://steamcommunity.com/profiles/76561198000000001/gcpd/730?tab=matchmaking"
+        );
     }
 
     #[test]

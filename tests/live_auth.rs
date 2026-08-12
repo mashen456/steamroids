@@ -563,7 +563,11 @@ async fn web_session_authenticates_a_community_request() {
 /// reads as "no cooldown" -- the same `Ok(None)` a clean account produces. So
 /// the raw HTML is checked for `Competitive Matches`, a left-nav tab label
 /// present on every GCPD page regardless of cooldown state, before the page
-/// is handed to the parser. `#[ignore]`d (real login).
+/// is handed to the parser. The URL itself comes from
+/// `steamroids::gcpd::cooldown_url`, the same builder `request_cs2_cooldown`
+/// calls, so a URL regression there fails this test instead of going
+/// unnoticed behind a second, independently-maintained copy. `#[ignore]`d
+/// (real login).
 ///
 /// Uses the plain account for the same reason
 /// `web_session_authenticates_a_community_request` does: `cm_logon_over_wss`
@@ -604,10 +608,7 @@ async fn web_session_fetches_the_cs2_cooldown() {
         .expect("mint web token");
     eprintln!("OK gcpd-cooldown: minted web token for {}", web.steam_id());
 
-    let url = format!(
-        "https://steamcommunity.com/profiles/{}/gcpd/730?tab=matchmaking",
-        web.steam_id()
-    );
+    let url = steamroids::gcpd::cooldown_url(web.steam_id());
     let html = web.get(&url).await.expect("gcpd fetch");
 
     // a wrong URL (e.g. the /me/ alias) returns the community shell with no
