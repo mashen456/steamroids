@@ -468,6 +468,66 @@ async fn cm_logon_over_wss() {
     );
 }
 
+/// Mint a web token over a live CM session and use it to fetch a page that
+/// only renders for a signed-in account.
+///
+/// First unified `ServiceMethod` call this crate has ever sent, so the
+/// offline tests can't show Steam actually accepts the frame. `#[ignore]`d
+/// (real login).
+#[tokio::test]
+#[ignore = "live: needs STEAM_TEST_2FA_* and talks to real Steam"]
+async fn web_session_authenticates_a_community_request() {
+    use steamroids::session::{spawn_session, SessionConfig};
+
+    let Some(acc) = load_account("2FA") else {
+        skip("web_session: set STEAM_TEST_2FA_ACCOUNT / _PASSWORD / _SHARED_SECRET");
+        return;
+    };
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    let Some(refresh_token) = sign_in_for_session("web-session", &acc, proxy.as_ref()).await else {
+        return;
+    };
+
+    let (handle, join) = spawn_session(SessionConfig {
+        account_name: acc.username.clone(),
+        refresh_token: refresh_token.clone(),
+        proxy: proxy.clone(),
+    })
+    .await
+    .expect("establish CM session");
+    assert!(handle.steam_id() > 0, "expected a real SteamID");
+    eprintln!(
+        "OK web-session: CM session up for steam_id {}",
+        handle.steam_id()
+    );
+
+    let web = steamroids::web::request_web_token(&handle, &refresh_token, proxy.as_ref())
+        .await
+        .expect("mint web token");
+    eprintln!("OK web-session: minted web token for {}", web.steam_id());
+
+    let body = web
+        .get("https://steamcommunity.com/my/gcpd/730")
+        .await
+        .expect("gcpd fetch");
+
+    // a signed-out fetch redirects to the login page instead
+    assert!(
+        !body.contains("g_steamID = false"),
+        "GCPD returned a signed-out page, the cookie did not authenticate"
+    );
+    eprintln!("OK web-session: GCPD rendered signed-in");
+
+    handle.logoff().await.expect("clean logoff");
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("driver task ends after logoff")
+        .expect("driver task did not panic")
+        .expect("clean driver shutdown");
+}
+
 /// The refresh-token flow validates the token locally (no WebAPI call) and
 /// hands it back for a CM logon. `SteamClient` tokens can't be redeemed over
 /// the WebAPI, so this flow mints **no** access token — it only asserts the
