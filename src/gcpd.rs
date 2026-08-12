@@ -6,7 +6,30 @@
 //! class and no id or wrapper to tell them apart, so the cooldown table is
 //! found by matching its header row rather than by its position on the page.
 
+use crate::web::WebSession;
 use crate::{Error, Result};
+
+/// Read this account's active CS2 competitive cooldown from its GCPD page.
+///
+/// `Ok(None)` means no cooldown is active: Steam omits the table entirely
+/// rather than rendering an empty one.
+///
+/// Uses the `/profiles/<steamid64>/` URL form deliberately. The `/me/` alias
+/// is resolved browser-side and returns the Steam Community shell with no
+/// GCPD content, under HTTP 200, so it fails silently.
+///
+/// # Errors
+///
+/// Any transport error from [`WebSession::get`], or [`Error::Codec`] if the
+/// cooldown table is present but its expiry does not parse.
+pub async fn request_cs2_cooldown(web: &WebSession) -> Result<Option<Cs2Cooldown>> {
+    let url = format!(
+        "https://steamcommunity.com/profiles/{}/gcpd/730?tab=matchmaking",
+        web.steam_id()
+    );
+    let html = web.get(&url).await?;
+    parse_cooldown(&html)
+}
 
 /// A CS2 competitive matchmaking cooldown read from a GCPD page.
 #[derive(Debug, Clone)]

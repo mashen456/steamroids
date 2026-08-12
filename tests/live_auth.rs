@@ -19,8 +19,9 @@
 //!   `login OK` this account must have Steam Guard fully disabled; if it still
 //!   has email Guard the test soft-skips (our flow can't enter an email code
 //!   yet). This account also drives the CS2 Game Coordinator scan
-//!   (`cs2_profile_scan`) and the web-session test
-//!   (`web_session_authenticates_a_community_request`).
+//!   (`cs2_profile_scan`), the web-session test
+//!   (`web_session_authenticates_a_community_request`), and the GCPD cooldown
+//!   fetch (`web_session_fetches_the_cs2_cooldown`).
 //! - **CS2 account** (`STEAM_TEST_CS2_*`, optional) — an account that owns / has
 //!   launched CS2, so its Game Coordinator welcomes us. Drives the real profile
 //!   scan; if unset, `cs2_profile_scan` falls back to the plain account and
@@ -32,12 +33,13 @@
 //! live logins; CI opts in with `-- --include-ignored`. The 2FA account is
 //! logged in at most once per run, only inside `cm_logon_over_wss`, because a
 //! second concurrent login would reuse the same TOTP code inside its 30s
-//! window and Steam rejects the duplicate. The plain account logs in from two
-//! tests (`cs2_profile_scan` and `web_session_authenticates_a_community_request`).
-//! It carries no shared secret, so there is no one-time code for the two
-//! logins to collide on, but the two logins would still open concurrent CM
-//! sessions on the same account, and Steam evicts one of them. CI serializes
-//! this binary (`--test-threads=1`) to avoid that.
+//! window and Steam rejects the duplicate. The plain account logs in from
+//! three tests (`cs2_profile_scan`, `web_session_authenticates_a_community_request`,
+//! and `web_session_fetches_the_cs2_cooldown`). It carries no shared secret,
+//! so there is no one-time code for the logins to collide on, but concurrent
+//! logins would still open concurrent CM sessions on the same account, and
+//! Steam evicts one of them. CI serializes this binary (`--test-threads=1`)
+//! to avoid that.
 //!
 //! # Running locally
 //!
@@ -541,6 +543,91 @@ async fn web_session_authenticates_a_community_request() {
         "GCPD returned a signed-out page, the cookie did not authenticate"
     );
     eprintln!("OK web-session: GCPD rendered signed-in");
+
+    handle.logoff().await.expect("clean logoff");
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("driver task ends after logoff")
+        .expect("driver task did not panic")
+        .expect("clean driver shutdown");
+}
+
+/// Mint a web token over a live CM session and fetch this account's GCPD
+/// competitive matchmaking cooldown through it.
+///
+/// The account under test may or may not have an active cooldown, so this
+/// does not assert one exists; it asserts the fetch reached the real GCPD
+/// page and parsed cleanly. That distinction matters here specifically: the
+/// wrong URL (the `/me/` alias, unresolved by our client) returns the Steam
+/// Community shell under HTTP 200 with no GCPD content, which `parse_cooldown`
+/// reads as "no cooldown" -- the same `Ok(None)` a clean account produces. So
+/// the raw HTML is checked for `Competitive Matches`, a left-nav tab label
+/// present on every GCPD page regardless of cooldown state, before the page
+/// is handed to the parser. `#[ignore]`d (real login).
+///
+/// Uses the plain account for the same reason
+/// `web_session_authenticates_a_community_request` does: `cm_logon_over_wss`
+/// already logs the 2FA account in, and a second concurrent login would reuse
+/// the same TOTP code inside its 30s window and get rejected.
+#[tokio::test]
+#[ignore = "live: needs STEAM_TEST_PLAIN_* and talks to real Steam"]
+async fn web_session_fetches_the_cs2_cooldown() {
+    use steamroids::session::{spawn_session, SessionConfig};
+
+    let Some(acc) = load_account("PLAIN") else {
+        skip("gcpd_cooldown: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
+        return;
+    };
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    let Some(refresh_token) = sign_in_for_session("gcpd-cooldown", &acc, proxy.as_ref()).await
+    else {
+        return;
+    };
+
+    let (handle, join) = spawn_session(SessionConfig {
+        account_name: acc.username.clone(),
+        refresh_token: refresh_token.clone(),
+        proxy: proxy.clone(),
+    })
+    .await
+    .expect("establish CM session");
+    assert!(handle.steam_id() > 0, "expected a real SteamID");
+    eprintln!(
+        "OK gcpd-cooldown: CM session up for steam_id {}",
+        handle.steam_id()
+    );
+
+    let web = steamroids::web::request_web_token(&handle, &refresh_token, proxy.as_ref())
+        .await
+        .expect("mint web token");
+    eprintln!("OK gcpd-cooldown: minted web token for {}", web.steam_id());
+
+    let url = format!(
+        "https://steamcommunity.com/profiles/{}/gcpd/730?tab=matchmaking",
+        web.steam_id()
+    );
+    let html = web.get(&url).await.expect("gcpd fetch");
+
+    // a wrong URL (e.g. the /me/ alias) returns the community shell with no
+    // GCPD content under HTTP 200, which parses to Ok(None) same as a clean
+    // account -- assert we actually reached GCPD before trusting the parse.
+    assert!(
+        html.contains("Competitive Matches"),
+        "fetched page is not the GCPD page (missing the 'Competitive Matches' tab); \
+         check the /profiles/<steamid64>/ URL form is being used"
+    );
+    eprintln!("OK gcpd-cooldown: confirmed the GCPD page rendered");
+
+    match steamroids::gcpd::parse_cooldown(&html) {
+        Ok(Some(cd)) => eprintln!(
+            "OK gcpd-cooldown: cooldown until {} (level {:?}, acknowledged {})",
+            cd.expires_at_raw, cd.level, cd.acknowledged
+        ),
+        Ok(None) => eprintln!("OK gcpd-cooldown: no active cooldown"),
+        Err(e) => panic!("gcpd cooldown parse failed: {e}"),
+    }
 
     handle.logoff().await.expect("clean logoff");
     tokio::time::timeout(Duration::from_secs(5), join)
