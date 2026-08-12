@@ -17,19 +17,21 @@
 //! // one limiter per proxy exit, shared by every sign-in through it
 //! let limiter = Arc::new(RateLimiter::per_minute(12));
 //!
+//! // tokio::spawn, not tokio::join!: spawn is the pattern the compiler can
+//! // actually enforce !Send-across-await on. see acquire()'s docs.
 //! let a = Arc::clone(&limiter);
-//! let sign_in_a = async move {
+//! let sign_in_a = tokio::spawn(async move {
 //!     a.acquire().await;
 //!     // ... sign in account A through this proxy ...
-//! };
+//! });
 //!
 //! let b = Arc::clone(&limiter);
-//! let sign_in_b = async move {
+//! let sign_in_b = tokio::spawn(async move {
 //!     b.acquire().await;
 //!     // ... sign in account B through the same proxy ...
-//! };
+//! });
 //!
-//! tokio::join!(sign_in_a, sign_in_b);
+//! let _ = tokio::join!(sign_in_a, sign_in_b);
 //! # }
 //! ```
 
@@ -46,6 +48,9 @@ use tokio::time::Instant;
 pub struct RateLimiter {
     interval: Duration,
     // next free slot, none until the first acquire
+    // must stay std::sync::Mutex, not tokio's: !send guard is what stops the
+    // guard being held across the await in acquire(). no runtime test can
+    // catch a regression here, see acquire() below.
     next: Mutex<Option<Instant>>,
 }
 
@@ -94,6 +99,7 @@ impl RateLimiter {
             let at = next.map_or(now, |n| if n > now { n } else { now });
             *next = Some(at + self.interval);
             at
+            // guard drops here, before the await below -- must stay that way
         };
         tokio::time::sleep_until(at).await;
     }

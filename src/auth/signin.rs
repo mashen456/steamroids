@@ -63,6 +63,7 @@
 //! ```
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::{sleep, Instant};
@@ -81,6 +82,7 @@ use crate::proto::{
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeRequest,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeResponse,
 };
+use crate::ratelimit::RateLimiter;
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
@@ -201,11 +203,26 @@ impl fmt::Debug for SignInOutcome {
 ///
 /// Construct via [`SignIn::with_password`] or [`SignIn::with_refresh_token`],
 /// add optional config, then call [`SignIn::execute`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand: `credentials` already redacts secrets, and
+/// `rate_limiter` is shown only as a presence marker rather than trying to
+/// format the limiter itself.
+#[derive(Clone)]
 #[must_use = "SignIn does nothing until .execute() is awaited"]
 pub struct SignIn {
     credentials: Credentials,
     proxy: Option<ProxyConfig>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+}
+
+impl fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignIn")
+            .field("credentials", &self.credentials)
+            .field("proxy", &self.proxy)
+            .field("rate_limiter", &self.rate_limiter.is_some())
+            .finish()
+    }
 }
 
 impl SignIn {
@@ -216,6 +233,7 @@ impl SignIn {
         Self {
             credentials: Credentials::password(account, password, None),
             proxy: None,
+            rate_limiter: None,
         }
     }
 
@@ -235,6 +253,7 @@ impl SignIn {
         Self {
             credentials: Credentials::refresh_token(token),
             proxy: None,
+            rate_limiter: None,
         }
     }
 
@@ -261,6 +280,12 @@ impl SignIn {
     /// password-flow fallback.
     pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Pace this sign-in's `WebAPI` requests through a shared limiter.
+    pub fn rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -384,7 +409,7 @@ impl SignIn {
             unreachable!("dispatched by execute()");
         };
 
-        let client = WebApiClient::new(self.proxy.as_ref())?;
+        let client = WebApiClient::new(self.proxy.as_ref(), self.rate_limiter.clone())?;
 
         // 1. Fetch the RSA public key + RSA-encrypt the password.
         let RsaKeyResponse {
@@ -843,7 +868,7 @@ mod tests {
 
     #[test]
     fn signin_builder_debug_redacts_password() {
-        // SignIn derives Debug; it must not leak via its embedded credentials.
+        // SignIn's Debug must not leak via its embedded credentials.
         let dbg = format!("{:?}", SignIn::with_password("bot01", "leak-me"));
         assert!(
             !dbg.contains("leak-me"),
@@ -915,6 +940,36 @@ mod tests {
             store.saved.lock().unwrap().is_none(),
             "a corrupt token must never be written back"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_waits_on_an_attached_rate_limiter() {
+        // burn the first slot so the next acquire must wait
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(30)));
+        limiter.acquire().await;
+
+        let start = Instant::now();
+        // dead proxy: fails at connect, but the limiter must be consulted first
+        let _ = SignIn::with_password("bot01", "pw")
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .rate_limiter(Arc::clone(&limiter))
+            .execute()
+            .await;
+        assert!(start.elapsed() >= Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn execute_without_a_limiter_does_not_wait() {
+        // real time, no start_paused: connect-refused timing is os-dependent,
+        // fine for the paired test's lower bound but not this upper bound.
+        // 20s: above http.rs's 10s connect timeout, below the 30s floor a
+        // limiter would force.
+        let start = std::time::Instant::now();
+        let _ = SignIn::with_password("bot01", "pw")
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .execute()
+            .await;
+        assert!(start.elapsed() < Duration::from_secs(20));
     }
 
     #[test]

@@ -10,11 +10,14 @@
 //! `SteamClient`-platform refresh tokens this crate issues, answering
 //! `AccessDenied`. See [`crate::auth`] for the platform split.
 
+use std::sync::Arc;
+
 use crate::auth::RefreshToken;
 use crate::proto::{
     CAuthenticationAccessTokenGenerateForAppRequest,
     CAuthenticationAccessTokenGenerateForAppResponse,
 };
+use crate::ratelimit::RateLimiter;
 use crate::session::SessionHandle;
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
@@ -56,6 +59,7 @@ pub async fn request_web_token(
         access_token,
         session_id: None,
         proxy: proxy.cloned(),
+        rate_limiter: None,
     })
 }
 
@@ -69,6 +73,7 @@ pub struct WebSession {
     access_token: String,
     session_id: Option<String>,
     proxy: Option<ProxyConfig>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl std::fmt::Debug for WebSession {
@@ -78,6 +83,7 @@ impl std::fmt::Debug for WebSession {
             .field("access_token", &"<redacted>")
             .field("session_id", &self.session_id)
             .field("proxy", &self.proxy)
+            .field("rate_limiter", &self.rate_limiter.is_some())
             .finish()
     }
 }
@@ -103,6 +109,16 @@ impl WebSession {
     #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Pace requests from this session through a shared limiter.
+    ///
+    /// Steam rate-limits by exit IP, so share one limiter across every session
+    /// that leaves through the same proxy.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -152,6 +168,10 @@ impl WebSession {
     /// [`Error::Network`] on a transport failure or a non-success status, and
     /// [`Error::InvalidConfig`] if the proxy configuration is unusable.
     pub async fn get(&self, url: &str) -> Result<String> {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.acquire().await;
+        }
+
         let response = self
             .http_client()?
             .get(url)
@@ -272,6 +292,7 @@ mod tests {
             access_token: "eyJhbGci.eyJzdWIi.sig-part_x".to_string(),
             session_id: None,
             proxy: None,
+            rate_limiter: None,
         };
         assert_eq!(
             web.cookie_header(),
@@ -286,6 +307,7 @@ mod tests {
             access_token: "tok".to_string(),
             session_id: None,
             proxy: None,
+            rate_limiter: None,
         }
         .with_session_id("abc123");
         assert_eq!(
@@ -301,6 +323,7 @@ mod tests {
             access_token: "super-secret".to_string(),
             session_id: None,
             proxy: None,
+            rate_limiter: None,
         };
         assert!(!format!("{web:?}").contains("super-secret"));
     }
@@ -316,6 +339,7 @@ mod tests {
             access_token: "tok".to_string(),
             session_id: None,
             proxy: Some(proxy),
+            rate_limiter: None,
         };
 
         // watch what the client actually sends the "proxy": a real SOCKS5
@@ -354,9 +378,73 @@ mod tests {
             access_token: "tok".to_string(),
             session_id: None,
             proxy: None,
+            rate_limiter: None,
         };
         let err = web.get("http://127.0.0.1:1/").await.unwrap_err();
         assert!(matches!(err, Error::Network(_)), "{err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_waits_on_an_attached_rate_limiter() {
+        // burn the first slot so the next acquire must wait
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(30)));
+        limiter.acquire().await;
+
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "tok".to_string(),
+            session_id: None,
+            proxy: None,
+            rate_limiter: Some(Arc::clone(&limiter)),
+        };
+
+        let start = tokio::time::Instant::now();
+        // connect refused, but the limiter must be consulted BEFORE the request
+        let _ = web.get("http://127.0.0.1:1/").await;
+        assert!(start.elapsed() >= Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn get_without_a_limiter_does_not_wait() {
+        // real bound listener, not "connect refused" -- refusal timing is
+        // os-dependent and under start_paused races reqwest's own connect
+        // timeout. no pause needed: no limiter means no sleep, so real
+        // wall-clock time must stay fast regardless.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            {
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let read = reader.read_line(&mut line).await.expect("read request");
+                    assert_ne!(read, 0, "request ended without a blank line");
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .expect("write reply");
+            stream.flush().await.expect("flush");
+        });
+
+        let web = WebSession {
+            steam_id: 1,
+            access_token: "tok".to_string(),
+            session_id: None,
+            proxy: None,
+            rate_limiter: None,
+        };
+        let start = std::time::Instant::now();
+        let _ = web.get(&format!("http://127.0.0.1:{port}/")).await;
+        assert!(start.elapsed() < Duration::from_secs(1));
+        server.await.expect("server task");
     }
 
     #[tokio::test]
@@ -392,6 +480,7 @@ mod tests {
             access_token: "tok".to_string(),
             session_id: None,
             proxy: None,
+            rate_limiter: None,
         };
         let err = web
             .get(&format!("http://127.0.0.1:{port}/"))

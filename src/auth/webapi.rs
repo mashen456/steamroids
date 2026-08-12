@@ -6,6 +6,7 @@
 //! binary protobufs. Steam carries the result code in an `x-eresult` header
 //! rather than in the protobuf payload.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -17,6 +18,7 @@ use url::Url;
 
 use crate::auth::signin::SignInOutcome;
 use crate::error::eresult;
+use crate::ratelimit::RateLimiter;
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
@@ -91,13 +93,19 @@ pub(crate) fn url_for(method: &str) -> Result<Url> {
 /// HTTP client pre-configured for the Steam `WebAPI`.
 pub(crate) struct WebApiClient {
     http: Client,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl WebApiClient {
-    /// Construct a fresh client, optionally routed through `proxy`.
-    pub(crate) fn new(proxy: Option<&ProxyConfig>) -> Result<Self> {
+    /// Construct a fresh client, optionally routed through `proxy` and paced
+    /// by `rate_limiter`.
+    pub(crate) fn new(
+        proxy: Option<&ProxyConfig>,
+        rate_limiter: Option<Arc<RateLimiter>>,
+    ) -> Result<Self> {
         Ok(Self {
             http: crate::http::client(proxy)?,
+            rate_limiter,
         })
     }
 
@@ -106,6 +114,10 @@ impl WebApiClient {
     ///
     /// On non-200 HTTP statuses we still try to read the body — Steam returns
     /// non-200 with a meaningful `x-eresult` for some failures.
+    ///
+    /// This is the single choke point for every request this flow sends, so
+    /// acquiring the rate limiter here paces all four steps of a password
+    /// sign-in, not just the first.
     pub(crate) async fn call<Req, Resp>(
         &self,
         method: &str,
@@ -116,6 +128,10 @@ impl WebApiClient {
         Req: Message,
         Resp: Message + Default,
     {
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.acquire().await;
+        }
+
         let url = url_for(method)?;
         let payload_b64 = B64.encode(req.encode_to_vec());
 
