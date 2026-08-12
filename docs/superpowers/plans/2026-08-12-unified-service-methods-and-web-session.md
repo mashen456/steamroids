@@ -26,7 +26,9 @@ Verified before writing this plan, so implementers do not re-litigate it:
 
 - Rust edition 2021, `rust-version` 1.86, pinned by `rust-toolchain.toml`.
 - `#![forbid(unsafe_code)]`; `clippy::all` and `clippy::pedantic` are `warn`; `missing_docs` is `warn`. CI runs `cargo clippy --all-features --all-targets -- -D warnings`, so any warning fails the build.
-- **Add no new dependencies.** Everything needed is present. Use `url::form_urlencoded` for percent-encoding.
+- **Add no new dependencies.** Everything needed is present. Use `url::form_urlencoded` for percent-encoding, and the crate's existing `crate::http::client()` for HTTP.
+- **`reqwest` is a regular dependency, not a dev-dependency, and the crate does not re-export it.** Integration tests and doctests link only against the crate plus dev-dependencies, so they **cannot name `reqwest`**. Every test and doctest must go through crate API only. This is why `WebSession` owns its fetch rather than handing callers a cookie to use with their own client.
+- **Proxy parity is a hard requirement.** A web request that authenticates as a session must leave through the same proxy exit as that session. Fleet deployments route one proxy per account, and a GCPD fetch escaping to the host IP while its CM session rides a proxy is a correlation leak, not a cosmetic inconsistency.
 - Comments are CAVEMAN-MINIMAL: terse lowercase fragments, no prose, no articles, no rationale. Example: `// unified call rides emsg 151`. Rustdoc on public items is the exception and should be proper prose matching the existing voice.
 - **No em-dashes anywhere**, in code, comments, rustdoc, commit messages or this plan's output.
 - Minimal diff. Do not reformat unrelated code or add stray comments.
@@ -353,8 +355,18 @@ dispatch path, so deadlines and header-eresult checks apply unchanged."
 - Test: `src/web.rs` tests module
 
 **Interfaces:**
-- Consumes: `SessionHandle::call_service` from Task 2; `SessionHandle::steam_id()` (already exists); `crate::auth::RefreshToken` (already exists).
-- Produces: `pub async fn request_web_token(session: &SessionHandle, refresh_token: &RefreshToken) -> Result<WebSession>` and `pub struct WebSession` (fields defined in Task 4).
+- Consumes: `SessionHandle::call_service` from Task 2; `SessionHandle::steam_id()` (already exists); `crate::auth::RefreshToken` and `crate::transport::proxy::ProxyConfig` (already exist).
+- Produces:
+  ```rust
+  pub async fn request_web_token(
+      session: &SessionHandle,
+      refresh_token: &RefreshToken,
+      proxy: Option<&ProxyConfig>,
+  ) -> Result<WebSession>;
+  ```
+  and `pub struct WebSession` (remaining fields defined in Tasks 4 and 5).
+
+`proxy` is stored on the returned `WebSession` so Task 5's fetch can leave through the same exit as the CM session. Pass the same `ProxyConfig` the session was spawned with.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -364,7 +376,12 @@ async fn request_web_token_calls_generate_access_token_for_app() {
     let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(76_561_198_000_000_001);
 
     let task = tokio::spawn(async move {
-        request_web_token(&handle, &RefreshToken::new("stored-refresh-token".to_string())).await
+        request_web_token(
+            &handle,
+            &RefreshToken::new("stored-refresh-token".to_string()),
+            None,
+        )
+        .await
     });
 
     let Some(Command::Request { job_name, body, reply, .. }) = commands.recv().await else {
@@ -404,7 +421,7 @@ async fn request_web_token_errors_when_steam_returns_no_token() {
     let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(5);
 
     let task = tokio::spawn(async move {
-        request_web_token(&handle, &RefreshToken::new("t".to_string())).await
+        request_web_token(&handle, &RefreshToken::new("t".to_string()), None).await
     });
 
     let Some(Command::Request { reply, .. }) = commands.recv().await else {
@@ -456,6 +473,7 @@ use crate::proto::{
     CAuthenticationAccessTokenGenerateForAppResponse,
 };
 use crate::session::SessionHandle;
+use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
 // k_ETokenRenewalType_None: leave the refresh token as it is
@@ -463,9 +481,10 @@ const TOKEN_RENEWAL_NONE: i32 = 0;
 
 /// Exchange this session's refresh token for a web access token.
 ///
-/// `refresh_token` must be the token this session logged on with. The returned
-/// [`WebSession`] carries the cookie needed to authenticate web requests as
-/// this account.
+/// `refresh_token` must be the token this session logged on with. Pass the
+/// same `proxy` the session was spawned with: web requests made through the
+/// returned [`WebSession`] then leave via the same exit as the CM session they
+/// authenticate as, which is what a per-account proxy deployment needs.
 ///
 /// # Errors
 ///
@@ -474,6 +493,7 @@ const TOKEN_RENEWAL_NONE: i32 = 0;
 pub async fn request_web_token(
     session: &SessionHandle,
     refresh_token: &RefreshToken,
+    proxy: Option<&ProxyConfig>,
 ) -> Result<WebSession> {
     let req = CAuthenticationAccessTokenGenerateForAppRequest {
         refresh_token: Some(refresh_token.expose().to_string()),
@@ -491,11 +511,12 @@ pub async fn request_web_token(
     Ok(WebSession {
         steam_id: session.steam_id(),
         access_token,
+        proxy: proxy.cloned(),
     })
 }
 ```
 
-Leave `WebSession` itself for Task 4; for now add a minimal definition so this compiles:
+Leave the rest of `WebSession` for Tasks 4 and 5; for now add a minimal definition so this compiles:
 
 ```rust
 /// An authenticated Steam web session.
@@ -503,6 +524,7 @@ Leave `WebSession` itself for Task 4; for now add a minimal definition so this c
 pub struct WebSession {
     steam_id: u64,
     access_token: String,
+    proxy: Option<ProxyConfig>,
 }
 
 impl WebSession {
@@ -564,6 +586,7 @@ fn cookie_header_encodes_the_pipe_separator() {
         steam_id: 76_561_198_000_000_001,
         access_token: "eyJhbGci.eyJzdWIi.sig-part_x".to_string(),
         session_id: None,
+        proxy: None,
     };
     assert_eq!(
         web.cookie_header(),
@@ -577,6 +600,7 @@ fn cookie_header_appends_a_session_id_when_set() {
         steam_id: 1,
         access_token: "tok".to_string(),
         session_id: None,
+        proxy: None,
     }
     .with_session_id("abc123");
     assert_eq!(
@@ -613,14 +637,15 @@ impl WebSession {
 
     /// The value for a `Cookie:` request header, authenticating as this account.
     ///
+    /// Most callers want [`Self::get`] instead, which sends this header through
+    /// the session's proxy. Use this only when driving your own HTTP client,
+    /// and route it through the same proxy the session uses.
+    ///
     /// ```
     /// # use steamroids::web::WebSession;
-    /// # fn demo(web: WebSession) {
-    /// let client = reqwest::Client::new();
-    /// let request = client
-    ///     .get("https://steamcommunity.com/my/gcpd/730")
-    ///     .header(reqwest::header::COOKIE, web.cookie_header());
-    /// # let _ = request;
+    /// # fn demo(web: &WebSession) {
+    /// let cookie = web.cookie_header();
+    /// assert!(cookie.starts_with("steamLoginSecure="));
     /// # }
     /// ```
     #[must_use]
@@ -667,6 +692,7 @@ fn debug_does_not_leak_the_access_token() {
         steam_id: 1,
         access_token: "super-secret".to_string(),
         session_id: None,
+        proxy: None,
     };
     assert!(!format!("{web:?}").contains("super-secret"));
 }
@@ -693,16 +719,138 @@ of the crate. Debug redacts the token."
 
 ---
 
-### Task 5: Prove it against real Steam
+### Task 5: Authenticated fetch through the session's proxy
+
+A cookie alone is not usable output here. A per-account proxy deployment needs the web request to leave through the same exit as the CM session it authenticates as, so `WebSession` owns the fetch and builds it on the crate's existing proxy-aware client.
+
+**Files:**
+- Modify: `src/web.rs`
+- Test: `src/web.rs` tests module
+
+**Interfaces:**
+- Consumes: `WebSession` and its `proxy` field from Task 3; `cookie_header` from Task 4; `crate::http::client` (already exists, `pub(crate) fn client(proxy: Option<&ProxyConfig>) -> Result<Client>`).
+- Produces: `WebSession::get(&self, url: &str) -> Result<String>`.
+
+- [ ] **Step 1: Write the failing test**
+
+`http::client` is `pub(crate)`, so this test lives in `src/web.rs` (a unit test), not in `tests/`. It asserts the client is built with the session's proxy rather than a bare default, which is the property that actually matters. Do not assert on live network.
+
+```rust
+#[test]
+fn get_builds_its_client_through_the_session_proxy() {
+    let proxy = ProxyConfig::parse("socks5://127.0.0.1:1080").expect("parse proxy");
+    let web = WebSession {
+        steam_id: 1,
+        access_token: "tok".to_string(),
+        session_id: None,
+        proxy: Some(proxy),
+    };
+    // client construction is the proxy-carrying step; a bad proxy would fail here
+    assert!(web.http_client().is_ok());
+}
+
+#[tokio::test]
+async fn get_surfaces_a_non_success_status() {
+    // 127.0.0.1:1 has nothing listening, so the request fails at connect
+    let web = WebSession {
+        steam_id: 1,
+        access_token: "tok".to_string(),
+        session_id: None,
+        proxy: None,
+    };
+    let err = web.get("http://127.0.0.1:1/").await.unwrap_err();
+    assert!(matches!(err, Error::Network(_)), "{err:?}");
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test --lib web::`
+
+Expected: FAIL to compile, no method `http_client` and no method `get`.
+
+- [ ] **Step 3: Implement the fetch**
+
+```rust
+impl WebSession {
+    // shared client build so get() and its test agree on proxy handling
+    fn http_client(&self) -> Result<reqwest::Client> {
+        crate::http::client(self.proxy.as_ref())
+    }
+
+    /// Fetch `url` authenticated as this account.
+    ///
+    /// The request carries this session's `steamLoginSecure` cookie and leaves
+    /// through the same proxy the session was built with, so a web request and
+    /// the CM session it authenticates as share an exit.
+    ///
+    /// Returns the response body. A non-success HTTP status is an error rather
+    /// than a body, because Steam answers an unauthenticated request with a
+    /// redirect to the login page rather than a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Network`] on a transport failure or a non-success status, and
+    /// [`Error::InvalidConfig`] if the proxy configuration is unusable.
+    pub async fn get(&self, url: &str) -> Result<String> {
+        let response = self
+            .http_client()?
+            .get(url)
+            .header(reqwest::header::COOKIE, self.cookie_header())
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("web get {url}: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Network(format!("web get {url}: HTTP {status}")));
+        }
+
+        response
+            .text()
+            .await
+            .map_err(|e| Error::Network(format!("web get {url}: body: {e}")))
+    }
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test --lib web::`
+
+Expected: both PASS.
+
+- [ ] **Step 5: Run everything**
+
+Run: `cargo test --all-features && cargo clippy --all-targets --all-features -- -D warnings && cargo test --doc && cargo fmt --check`
+
+Expected: all green.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt
+git add src/web.rs
+git commit -m "feat(web): fetch authenticated pages through the session proxy
+
+A cookie on its own would leave callers to build their own client, and a
+web request escaping to the host IP while its CM session rides a proxy is a
+correlation leak. WebSession::get reuses http::client with the session's
+proxy and treats a non-success status as an error, since Steam answers an
+unauthenticated request with a redirect rather than a failure."
+```
+
+---
+
+### Task 6: Prove it against real Steam
 
 Everything above is offline. Nothing so far shows Steam actually accepts the frame, which is the whole risk: this is the first unified call the crate has ever sent.
 
 **Files:**
 - Modify: `tests/live_auth.rs`
-- Modify: `.env.example` (document nothing new, but confirm the existing 2FA account vars cover this test)
 
 **Interfaces:**
-- Consumes: `request_web_token`, `WebSession::cookie_header` from Tasks 3 and 4.
+- Consumes: `request_web_token` from Task 3, `WebSession::get` from Task 5.
 - Produces: nothing consumed by later tasks.
 
 - [ ] **Step 1: Write the live test**
@@ -732,20 +880,15 @@ async fn web_session_authenticates_a_community_request() {
         .await
         .expect("spawn session");
 
-    let web = steamroids::web::request_web_token(&handle, &refresh_token)
+    let web = steamroids::web::request_web_token(&handle, &refresh_token, proxy.as_ref())
         .await
         .expect("mint web token");
     println!("minted web token for {}", web.steam_id());
 
-    let body = reqwest::Client::new()
+    let body = web
         .get("https://steamcommunity.com/my/gcpd/730")
-        .header(reqwest::header::COOKIE, web.cookie_header())
-        .send()
         .await
-        .expect("gcpd request")
-        .text()
-        .await
-        .expect("gcpd body");
+        .expect("gcpd fetch");
 
     // a signed-out fetch redirects to the login page instead
     assert!(
