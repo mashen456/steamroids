@@ -89,12 +89,15 @@ pub struct PlayerProfile {
     /// Raw penalty countdown in seconds, from the most recent
     /// penalty-bearing GC push cached this session (a `ClientWelcome`'s
     /// `game_data2`), **never** from this `PlayersProfile` response itself,
-    /// which the GC leaves at `0` here even when a real penalty exists. `0`
-    /// if the GC has reported no penalty this session. Prefer
+    /// which the GC leaves at `0` here even when a real penalty exists. That
+    /// cached push is always the logged-in account's own hello, so this
+    /// reads `0` whenever [`Self::account_id`] isn't that account too, not
+    /// only when the GC has reported no penalty this session. Prefer
     /// [`Self::penalty`] over reading this directly.
     pub penalty_seconds: u32,
-    /// Raw penalty reason code paired with [`Self::penalty_seconds`]. `0` if
-    /// none. Prefer [`Self::penalty`] over reading this directly.
+    /// Raw penalty reason code paired with [`Self::penalty_seconds`], gated
+    /// the same way. `0` if none. Prefer [`Self::penalty`] over reading this
+    /// directly.
     pub penalty_reason: u32,
 }
 
@@ -117,6 +120,11 @@ impl PlayerProfile {
 ///
 /// The reply is matched on `account_id`, so a `PlayersProfile` pushed for some
 /// other player (or for a concurrent request) is never mistaken for this one.
+/// [`PlayerProfile::penalty_seconds`] / [`PlayerProfile::penalty_reason`] on
+/// the result are a separate matter: they come from a cache keyed to the
+/// logged-in account, not from anything tied to `account_id`, so they only
+/// read as non-zero when `account_id` happens to be that same account. See
+/// their field docs.
 ///
 /// # Errors
 ///
@@ -172,13 +180,8 @@ pub async fn request_player_profile(
         .map(|m| (m.display_items_defidx, m.featured_display_item_defidx))
         .unwrap_or_default();
 
-    // profile.penalty_seconds / profile.penalty_reason are deliberately
-    // never read here: PlayersProfile's account entry reuses the hello's
-    // message shape, but the GC leaves these at 0 in that response even when
-    // a real penalty exists. The GC pump's welcome-derived cache (see
-    // cached_penalty) is the one genuinely penalty-bearing source, and only
-    // it may set these fields.
-    let (penalty_seconds, penalty_reason) = cached_penalty(gc).unwrap_or((0, 0));
+    // never profile.penalty_seconds / penalty_reason, see cached_penalty doc.
+    let (penalty_seconds, penalty_reason) = cached_penalty(gc, account_id).unwrap_or((0, 0));
 
     Ok(PlayerProfile {
         account_id,
@@ -195,11 +198,20 @@ pub async fn request_player_profile(
 
 /// Decode the GC pump's cached penalty-bearing push (a `ClientWelcome`'s
 /// `game_data2`, cached opaquely by [`crate::gc::GameCoordinator`]'s pump)
-/// into the raw `(penalty_seconds, penalty_reason)` pair, or `None` if
-/// nothing has been cached yet this GC session, or the bytes don't decode.
-fn cached_penalty(gc: &GameCoordinator) -> Option<(u32, u32)> {
+/// into the raw `(penalty_seconds, penalty_reason)` pair for `account_id`, or
+/// `None` if nothing has been cached yet this GC session, the bytes don't
+/// decode, or the cached hello belongs to a different account.
+///
+/// That last case is the common one for [`request_player_profile`]: the
+/// cache is always the *logged-in* account's own hello (nothing else pushes
+/// `game_data2`), so a request for some other player's `account_id` must not
+/// borrow it and silently describe the wrong player's penalty.
+fn cached_penalty(gc: &GameCoordinator, account_id: u32) -> Option<(u32, u32)> {
     let bytes = gc.session().cached_gc_penalty(gc.appid())?;
     let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(bytes.as_slice()).ok()?;
+    if hello.account_id != Some(account_id) {
+        return None;
+    }
     Some((
         hello.penalty_seconds.unwrap_or(0),
         hello.penalty_reason.unwrap_or(0),
@@ -227,6 +239,9 @@ const DURATION_VS_TIMESTAMP_THRESHOLD_SECS: u32 = 10 * 365 * 24 * 3600;
 /// margin below the true `u32::MAX`: a real absolute timestamp (see
 /// [`DURATION_VS_TIMESTAMP_THRESHOLD_SECS`]) is nowhere near the year 2106
 /// that `u32::MAX` seconds since the epoch would represent.
+// 0x7FFF_FFFF (a common "forever" sentinel elsewhere) is below this
+// threshold, so it reads as Active expiring in 2038, not Permanent. unknown
+// whether the gc ever actually sends that value here. needs a live check.
 const NEAR_U32_MAX_PERMANENT_SECS: u32 = u32::MAX - 65_536;
 
 /// Penalty reason codes observed to mean "in effect with no countdown,
@@ -272,7 +287,10 @@ pub enum Cs2Penalty {
         /// Raw GC penalty reason code.
         reason: u32,
     },
-    /// Actively counting down.
+    /// Actively counting down: `expires_at_unix` is always still ahead of
+    /// the `now_unix` [`Self::from_gc`] was given. An absolute timestamp
+    /// that already passed resolves to [`Self::ExpiredUnacknowledged`]
+    /// instead, never a past-dated `Active`.
     Active {
         /// Raw GC penalty reason code.
         reason: u32,
@@ -311,7 +329,11 @@ impl Cs2Penalty {
     /// - Otherwise `seconds > 0` is [`Self::Active`]. Above
     ///   `DURATION_VS_TIMESTAMP_THRESHOLD_SECS` (roughly ten years) it's
     ///   already an absolute Unix expiry; at or below it, it's a countdown
-    ///   duration added to `now_unix`.
+    ///   duration added to `now_unix`. If the resulting expiry is already at
+    ///   or before `now_unix`, it's [`Self::ExpiredUnacknowledged`] instead:
+    ///   an absolute timestamp that already passed is the same
+    ///   expired-but-unacknowledged state `seconds == 0` reports, just
+    ///   arriving through the timestamp path rather than that one.
     #[must_use]
     pub fn from_gc(reason: u32, seconds: u32, now_unix: i64) -> Option<Self> {
         if reason == 0 && seconds == 0 {
@@ -332,6 +354,11 @@ impl Cs2Penalty {
         } else {
             now_unix + i64::from(seconds)
         };
+        // an absolute timestamp already in the past is the expired case
+        // arriving via this path instead of seconds == 0.
+        if expires_at_unix <= now_unix {
+            return Some(Self::ExpiredUnacknowledged { reason });
+        }
         Some(Self::Active {
             reason,
             expires_at_unix,
@@ -411,6 +438,47 @@ pub fn elevated_state(session: &SessionHandle) -> Option<u32> {
     let blob = blobs.first()?;
     let account = CsoEconGameAccountClient::decode(blob.as_slice()).ok()?;
     Some(account.elevated_state.unwrap_or(0))
+}
+
+/// The logged-in account's current CS2 penalty state, read from the Game
+/// Coordinator's welcome cache.
+///
+/// This is the coherent home for this data: like [`has_prime`] and
+/// [`elevated_state`], a `ClientWelcome`'s `game_data2` is inherently about
+/// the session's own account, never an arbitrary player, so unlike
+/// [`PlayerProfile::penalty`] it needs no `account_id` to get right. Reads
+/// the same cached bytes [`SessionHandle::cached_gc_penalty`] keeps; see
+/// [`Cs2Penalty::from_gc`] for the interpretation rules.
+///
+/// Returns `None` if no welcome carrying `game_data2` has arrived yet this
+/// GC session, including if [`attach`] was never called at all, or the
+/// cached bytes don't decode. Never blocks and never asks the GC for
+/// anything.
+#[must_use]
+pub fn penalty(session: &SessionHandle) -> Option<Cs2Penalty> {
+    let bytes = session.cached_gc_penalty(APP_ID)?;
+    let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(bytes.as_slice()).ok()?;
+    Cs2Penalty::from_gc(
+        hello.penalty_reason.unwrap_or(0),
+        hello.penalty_seconds.unwrap_or(0),
+        now_unix(),
+    )
+}
+
+/// Whether the logged-in account is VAC banned, read from the same cached
+/// welcome as [`penalty`] (field 6, `vac_banned`, of the same hello).
+///
+/// This settles the VAC case directly instead of inferring it from
+/// [`Cs2Penalty`]'s reason codes 22/23, which mean VAC-Live (an active
+/// competitive-integrity conviction), not a full account VAC ban.
+///
+/// Reads the same cached welcome [`penalty`] does, under the same `None`
+/// conditions.
+#[must_use]
+pub fn vac_banned(session: &SessionHandle) -> Option<bool> {
+    let bytes = session.cached_gc_penalty(APP_ID)?;
+    let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(bytes.as_slice()).ok()?;
+    Some(hello.vac_banned.unwrap_or(0) != 0)
 }
 
 #[cfg(test)]
@@ -508,8 +576,11 @@ mod tests {
         const WANTED: u32 = 100;
         let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
         // Seed the cache exactly as the GC pump would from a welcome's
-        // game_data2 (see gc::coordinator).
+        // game_data2 (see gc::coordinator): the cached hello is for the
+        // same account being requested, so the gate in cached_penalty lets
+        // it through.
         let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello {
+            account_id: Some(WANTED),
             penalty_seconds: Some(10),
             penalty_reason: Some(5),
             ..Default::default()
@@ -547,11 +618,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_penalty_is_not_borrowed_from_another_accounts_cached_welcome() {
+        // The cached welcome is always the *logged-in* account's own hello.
+        // Requesting some stranger's profile must never describe them using
+        // it, even though the profile lookup itself succeeds.
+        const LOGGED_IN_ACCOUNT: u32 = 100;
+        const OTHER_PLAYER: u32 = 200;
+        let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello {
+            account_id: Some(LOGGED_IN_ACCOUNT),
+            penalty_seconds: Some(10),
+            penalty_reason: Some(5),
+            ..Default::default()
+        };
+        session.set_cached_gc_penalty(APP_ID, Some(hello.encode_to_vec()));
+
+        let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        let fake = fake_gc(commands, replies, vec![profiles_reply(&[OTHER_PLAYER])]);
+
+        let profile = request_player_profile(&gc, OTHER_PLAYER)
+            .await
+            .expect("profile");
+
+        assert_eq!(profile.penalty_seconds, 0);
+        assert_eq!(profile.penalty_reason, 0);
+        assert!(
+            profile.penalty().is_none(),
+            "a stranger's profile must not carry the logged-in account's penalty"
+        );
+        fake.await.expect("fake GC");
+    }
+
+    #[tokio::test]
     async fn profile_penalty_is_zero_when_nothing_cached() {
         const WANTED: u32 = 55;
         let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
         let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
-        let fake = fake_gc(commands, replies, vec![profiles_reply(&[WANTED])]);
+        // The response's own account entry carries nonzero penalty fields
+        // (which the real GC never sends), so a regression that fell back
+        // to reading the response when the cache is empty would still be
+        // caught here rather than passing by coincidence.
+        let reply = GcMessage {
+            appid: APP_ID,
+            msgtype: GC_PLAYERS_PROFILE,
+            header: GcHeader::default(),
+            body: CMsgGccStrike15V2PlayersProfile {
+                account_profiles: vec![CMsgGccStrike15V2MatchmakingGc2ClientHello {
+                    account_id: Some(WANTED),
+                    player_level: Some(40),
+                    penalty_seconds: Some(777),
+                    penalty_reason: Some(88),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        };
+        let fake = fake_gc(commands, replies, vec![reply]);
 
         let profile = request_player_profile(&gc, WANTED).await.expect("profile");
 
@@ -597,6 +720,20 @@ mod tests {
         assert_eq!(
             Cs2Penalty::from_gc(5, 0, 1_000),
             Some(Cs2Penalty::ExpiredUnacknowledged { reason: 5 })
+        );
+    }
+
+    #[test]
+    fn rule1_seconds_alone_without_reason_is_still_active() {
+        // Pins the other half of the OR: replacing the guard with
+        // `if reason == 0 { return None }` would wrongly read this as "no
+        // penalty" even though seconds is set.
+        assert_eq!(
+            Cs2Penalty::from_gc(0, 3_600, 1_000_000),
+            Some(Cs2Penalty::Active {
+                reason: 0,
+                expires_at_unix: 1_003_600,
+            })
         );
     }
 
@@ -651,6 +788,44 @@ mod tests {
     }
 
     #[test]
+    fn rule3_duration_vs_timestamp_threshold_boundary() {
+        // At the threshold: still a countdown duration added to now_unix.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, DURATION_VS_TIMESTAMP_THRESHOLD_SECS, 1_000),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 1_000 + i64::from(DURATION_VS_TIMESTAMP_THRESHOLD_SECS),
+            })
+        );
+        // One second over: an absolute timestamp instead, ignoring now_unix.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, DURATION_VS_TIMESTAMP_THRESHOLD_SECS + 1, 1_000),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: i64::from(DURATION_VS_TIMESTAMP_THRESHOLD_SECS + 1),
+            })
+        );
+    }
+
+    #[test]
+    fn rule3_absolute_expiry_already_past_is_expired_unacknowledged() {
+        // seconds is an absolute timestamp (above the duration threshold)
+        // that already lies at or before now_unix. Active's own contract is
+        // an expiry still ahead, so this must resolve to
+        // ExpiredUnacknowledged instead, the same as the seconds == 0 path.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, 2_000_000_000, 2_000_000_000),
+            Some(Cs2Penalty::ExpiredUnacknowledged { reason: 1 }),
+            "exactly at now_unix"
+        );
+        assert_eq!(
+            Cs2Penalty::from_gc(1, 2_000_000_000, 2_000_000_001),
+            Some(Cs2Penalty::ExpiredUnacknowledged { reason: 1 }),
+            "before now_unix"
+        );
+    }
+
+    #[test]
     fn rule4_near_u32_max_seconds_is_permanent() {
         assert_eq!(
             Cs2Penalty::from_gc(1, u32::MAX, 1_000),
@@ -672,6 +847,24 @@ mod tests {
             Some(Cs2Penalty::Active {
                 reason: 1,
                 expires_at_unix: 2_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn rule4_near_u32_max_threshold_boundary() {
+        // At the threshold: permanent regardless of reason.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, NEAR_U32_MAX_PERMANENT_SECS, 1_000),
+            Some(Cs2Penalty::Permanent { reason: 1 })
+        );
+        // One below: falls through to the absolute-timestamp branch
+        // instead, since it's still far above DURATION_VS_TIMESTAMP_THRESHOLD_SECS.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, NEAR_U32_MAX_PERMANENT_SECS - 1, 1_000),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: i64::from(NEAR_U32_MAX_PERMANENT_SECS - 1),
             })
         );
     }
@@ -806,6 +999,72 @@ mod tests {
         let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
         seed_econ_game_account(&session, CsoEconGameAccountClient::default());
         assert_eq!(elevated_state(&session), Some(0));
+    }
+
+    #[test]
+    fn penalty_is_none_before_any_welcome() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        assert!(penalty(&session).is_none());
+    }
+
+    #[test]
+    fn penalty_reads_the_cached_welcome_for_the_logged_in_account() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello {
+            account_id: Some(7),
+            penalty_seconds: Some(2_000_000_000),
+            penalty_reason: Some(1),
+            ..Default::default()
+        };
+        session.set_cached_gc_penalty(APP_ID, Some(hello.encode_to_vec()));
+
+        assert_eq!(
+            penalty(&session),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 2_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn penalty_is_none_for_a_different_app() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello {
+            penalty_seconds: Some(10),
+            penalty_reason: Some(5),
+            ..Default::default()
+        };
+        session.set_cached_gc_penalty(570, Some(hello.encode_to_vec()));
+
+        assert!(penalty(&session).is_none());
+    }
+
+    #[test]
+    fn vac_banned_is_none_before_any_welcome() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        assert!(vac_banned(&session).is_none());
+    }
+
+    #[test]
+    fn vac_banned_true_when_flag_is_nonzero() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello {
+            vac_banned: Some(1),
+            ..Default::default()
+        };
+        session.set_cached_gc_penalty(APP_ID, Some(hello.encode_to_vec()));
+
+        assert_eq!(vac_banned(&session), Some(true));
+    }
+
+    #[test]
+    fn vac_banned_false_when_flag_is_absent_or_zero() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello::default();
+        session.set_cached_gc_penalty(APP_ID, Some(hello.encode_to_vec()));
+
+        assert_eq!(vac_banned(&session), Some(false));
     }
 
     /// Exact wire bytes of the live `CSOEconGameAccountClient` blob captured

@@ -338,50 +338,49 @@ fn has_gc_session(body: &[u8]) -> bool {
     }
 }
 
-/// Outcome of extracting `game_data2` from a `ClientWelcome` body.
-enum WelcomeGameData2 {
-    /// The body didn't decode as a welcome at all: leave any existing cache
-    /// entry alone rather than guess it away.
-    Undecodable,
-    /// The body decoded fine. `None` means it decoded but carried no
-    /// `game_data2`, a full-inventory welcome that must still wipe a stale
-    /// cache entry, the same policy [`so_objects_from_welcome`] follows for
-    /// SO objects.
-    Decoded(Option<Vec<u8>>),
+/// Flatten a decoded `ClientWelcome`'s `outofdate_subscribed_caches` into
+/// `type_id -> blobs`. A `type_id` absent from the welcome is simply absent
+/// from the map, not an entry with an empty `Vec`.
+fn so_objects_from_welcome(welcome: &CMsgClientWelcome) -> HashMap<i32, Vec<Vec<u8>>> {
+    let mut objects: HashMap<i32, Vec<Vec<u8>>> = HashMap::new();
+    for subscribed in &welcome.outofdate_subscribed_caches {
+        // drops subscribed.owner_soid, merges blobs across owners under one
+        // type_id. only safe for per-account types (one owner per welcome).
+        for obj in &subscribed.objects {
+            let Some(type_id) = obj.type_id else {
+                continue;
+            };
+            objects
+                .entry(type_id)
+                .or_default()
+                .extend(obj.object_data.iter().cloned());
+        }
+    }
+    objects
 }
 
-/// A `ClientWelcome`'s `game_data2` payload.
+/// `(SO objects by type_id, game_data2)`, the pair [`welcome_cache_update`]
+/// reads off one decoded welcome.
+type WelcomeCacheUpdate = (HashMap<i32, Vec<Vec<u8>>>, Option<Vec<u8>>);
+
+/// Decode a `ClientWelcome` body once and read off both the SO cache update
+/// and the `game_data2` payload, so a welcome carrying the whole SO cache
+/// isn't decoded twice for two unrelated reads. `None` only when the body
+/// doesn't decode as a welcome at all, in which case the caller leaves any
+/// existing cache entries alone rather than guess them away; a welcome that
+/// decodes but carries no SO caches / no `game_data2` still returns
+/// `Some`, since it's a full inventory that must wipe stale entries either
+/// way.
 ///
 /// `game_data2` is a generic `CMsgClientWelcome` field (any app's GC can use
 /// it), so this stays app-agnostic: it never looks at what the bytes
 /// contain. CS2's GC embeds a serialized
 /// `CMsgGCCStrike15_v2_MatchmakingGC2ClientHello` here, decoded by
 /// [`crate::cs2`].
-fn game_data2_from_welcome(body: &[u8]) -> WelcomeGameData2 {
-    match CMsgClientWelcome::decode(body) {
-        Ok(welcome) => WelcomeGameData2::Decoded(welcome.game_data2),
-        Err(_) => WelcomeGameData2::Undecodable,
-    }
-}
-
-/// Flatten a `ClientWelcome`'s `outofdate_subscribed_caches` into
-/// `type_id -> blobs`, or `None` if the body doesn't decode as a welcome at
-/// all. A `type_id` absent from the welcome is simply absent from the map,
-/// not an entry with an empty `Vec`.
-fn so_objects_from_welcome(body: &[u8]) -> Option<HashMap<i32, Vec<Vec<u8>>>> {
+fn welcome_cache_update(body: &[u8]) -> Option<WelcomeCacheUpdate> {
     let welcome = CMsgClientWelcome::decode(body).ok()?;
-    let mut objects: HashMap<i32, Vec<Vec<u8>>> = HashMap::new();
-    for subscribed in welcome.outofdate_subscribed_caches {
-        // drops subscribed.owner_soid, merges blobs across owners under one
-        // type_id. only safe for per-account types (one owner per welcome).
-        for obj in subscribed.objects {
-            let Some(type_id) = obj.type_id else {
-                continue;
-            };
-            objects.entry(type_id).or_default().extend(obj.object_data);
-        }
-    }
-    Some(objects)
+    let objects = so_objects_from_welcome(&welcome);
+    Some((objects, welcome.game_data2))
 }
 
 /// Background pump: relays `ClientFromGC` traffic into GC events, tracks
@@ -457,24 +456,20 @@ async fn pump(
                                 match gc_msg.msgtype {
                                     GC_CLIENT_WELCOME => {
                                         ready = true;
-                                        // The welcome carries the account's
-                                        // SO caches (Prime state among them);
-                                        // an undecodable body just skips the
-                                        // cache update, not readiness.
+                                        // Decoded once here for both the SO
+                                        // caches (Prime state among them) and
+                                        // game_data2 (CS2's penalty push, no
+                                        // standalone 9110 hello follows). An
+                                        // undecodable body just skips both
+                                        // cache updates, not readiness.
                                         // only reads outofdate_subscribed_caches, ignores field 4
                                         // uptodate_subscribed_caches. a welcome marking nothing
                                         // outofdate wipes the cache. not reachable today since our
                                         // hello sends no cache version for the gc to compare against.
-                                        if let Some(objects) = so_objects_from_welcome(&gc_msg.body) {
-                                            session.replace_so_cache(appid, objects);
-                                        }
-                                        // game_data2 frequently carries CS2's only
-                                        // report of a penalty/cooldown: no standalone
-                                        // 9110 hello follows. Cache it opaquely so a
-                                        // late subscriber can't miss it.
-                                        if let WelcomeGameData2::Decoded(game_data2) =
-                                            game_data2_from_welcome(&gc_msg.body)
+                                        if let Some((objects, game_data2)) =
+                                            welcome_cache_update(&gc_msg.body)
                                         {
+                                            session.replace_so_cache(appid, objects);
                                             session.set_cached_gc_penalty(appid, game_data2);
                                         }
                                         info!("GC welcomed");
@@ -597,7 +592,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let objects = so_objects_from_welcome(&welcome.encode_to_vec()).expect("decodes");
+        let objects = so_objects_from_welcome(&welcome);
         assert_eq!(objects.get(&7), Some(&vec![vec![1], vec![2]]));
         assert_eq!(objects.get(&2), Some(&vec![vec![9]]));
     }
@@ -614,14 +609,39 @@ mod tests {
             }],
             ..Default::default()
         };
-        let objects = so_objects_from_welcome(&welcome.encode_to_vec()).expect("decodes");
+        let objects = so_objects_from_welcome(&welcome);
         assert!(objects.is_empty());
     }
 
     #[test]
-    fn so_objects_from_welcome_is_none_on_garbage() {
+    fn welcome_cache_update_is_none_on_garbage() {
         // 0xff is not a valid protobuf tag.
-        assert!(so_objects_from_welcome(&[0xff, 0xff]).is_none());
+        assert!(welcome_cache_update(&[0xff, 0xff]).is_none());
+    }
+
+    #[test]
+    fn welcome_cache_update_reads_so_objects_and_game_data2_off_one_decode() {
+        let welcome = CMsgClientWelcome {
+            outofdate_subscribed_caches: vec![subscribed(7, vec![vec![1, 2, 3]])],
+            game_data2: Some(vec![9, 9, 9]),
+            ..Default::default()
+        };
+        let (objects, game_data2) =
+            welcome_cache_update(&welcome.encode_to_vec()).expect("decodes");
+        assert_eq!(objects.get(&7), Some(&vec![vec![1, 2, 3]]));
+        assert_eq!(game_data2, Some(vec![9, 9, 9]));
+    }
+
+    #[test]
+    fn welcome_cache_update_is_some_empty_on_a_welcome_without_caches() {
+        // Decodes fine but carries neither SO caches nor game_data2: still
+        // Some, not None, so the caller still wipes stale cache entries
+        // (full-inventory policy), rather than leaving them alone as it
+        // would for a genuinely undecodable body.
+        let (objects, game_data2) =
+            welcome_cache_update(&CMsgClientWelcome::default().encode_to_vec()).expect("decodes");
+        assert!(objects.is_empty());
+        assert_eq!(game_data2, None);
     }
 
     #[tokio::test]
@@ -1001,39 +1021,5 @@ mod tests {
             readback.cached_gc_penalty(APPID).is_none(),
             "an exited pump must not leave a stale penalty push behind"
         );
-    }
-
-    #[test]
-    fn game_data2_from_welcome_extracts_the_payload() {
-        let welcome = CMsgClientWelcome {
-            game_data2: Some(vec![1, 2, 3]),
-            ..Default::default()
-        };
-        assert!(matches!(
-            game_data2_from_welcome(&welcome.encode_to_vec()),
-            WelcomeGameData2::Decoded(Some(bytes)) if bytes == vec![1, 2, 3]
-        ));
-    }
-
-    #[test]
-    fn game_data2_from_welcome_wipes_on_a_welcome_without_one() {
-        // Decodes fine but carries no game_data2: Decoded(None), not
-        // Undecodable, so the caller still wipes a stale cache entry
-        // (full-inventory policy).
-        let welcome = CMsgClientWelcome::default();
-        assert!(matches!(
-            game_data2_from_welcome(&welcome.encode_to_vec()),
-            WelcomeGameData2::Decoded(None)
-        ));
-    }
-
-    #[test]
-    fn game_data2_from_welcome_is_undecodable_on_garbage() {
-        // 0xff is not a valid protobuf tag: leaves a stale cache entry alone
-        // rather than guessing it away.
-        assert!(matches!(
-            game_data2_from_welcome(&[0xff, 0xff]),
-            WelcomeGameData2::Undecodable
-        ));
     }
 }
