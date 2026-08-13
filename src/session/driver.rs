@@ -443,7 +443,11 @@ impl SessionHandle {
     }
 
     /// Replace every cached `SharedObject` blob for `appid` with `objects`
-    /// (keyed by SO `type_id`), as reported by a fresh GC `ClientWelcome`.
+    /// (keyed by SO `type_id`), as reported by a fresh GC `ClientWelcome`. An
+    /// empty `objects` clears every entry for `appid`, which the GC pump does
+    /// on every readiness loss (a CM reconnect, the GC reporting no session,
+    /// or the pump exiting) so a stale welcome from a prior GC session can
+    /// never keep answering.
     ///
     /// Not part of the public API: called by [`crate::gc::GameCoordinator`]'s
     /// pump when it decodes a welcome, since the welcome is a full inventory
@@ -512,17 +516,6 @@ impl SessionHandle {
             evt_tx,
             snapshots,
         )
-    }
-
-    /// **Test-only.** The raw SO cache backing this handle, for a test to
-    /// seed directly (mirroring how [`Self::for_test`] hands out the raw
-    /// snapshot cache), since the GC pump that normally populates it doesn't
-    /// run in a driverless test. Not part of the supported API. Compiled only
-    /// under `cfg(test)` or the `test-seam` feature.
-    #[cfg(any(test, feature = "test-seam"))]
-    #[doc(hidden)]
-    pub fn so_cache_for_test(&self) -> GcSoCache {
-        self.so_cache.clone()
     }
 }
 
@@ -1556,18 +1549,6 @@ mod tests {
         assert!(
             handle.cached_so_objects(730, 2).is_none(),
             "type_id 2 was not in the second welcome, so it must be gone"
-        );
-    }
-
-    #[test]
-    fn so_cache_for_test_shares_the_handles_own_cache() {
-        let (handle, ..) = SessionHandle::for_test(7);
-        let raw = handle.so_cache_for_test();
-        raw.lock().unwrap().insert((730, 7), vec![vec![0xde, 0xad]]);
-
-        assert_eq!(
-            handle.cached_so_objects(730, 7),
-            Some(vec![vec![0xde, 0xad]])
         );
     }
 

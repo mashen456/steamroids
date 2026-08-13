@@ -200,11 +200,38 @@ const SO_TYPE_ECON_GAME_ACCOUNT_CLIENT: i32 = 7;
 ///
 /// Returns `None` if no welcome carrying this `SharedObject` has arrived yet
 /// this GC session, including if [`attach`] was never called at all.
+///
+/// `!= 0` is a projection this crate assumes rather than one Valve documents:
+/// the only account observed live had `elevated_state == 5`, and
+/// `CSOPersonaDataPublic.elevated_state` (a *different*, public SO the client
+/// otherwise shows as a plain Prime flag) is declared `bool`, while this
+/// field is `uint32`. That mismatch shows Valve keeps a wider private state
+/// and collapses it to a boolean for display; this function guesses the same
+/// collapse from one data point. See [`elevated_state`] to read the raw code
+/// instead, e.g. to tell a lapsed or pending nonzero state apart from active
+/// Prime.
 pub fn has_prime(session: &SessionHandle) -> Option<bool> {
+    Some(elevated_state(session)? != 0)
+}
+
+/// The account's raw `CSOEconGameAccountClient.elevated_state` code, without
+/// [`has_prime`]'s `!= 0` collapse to a boolean.
+///
+/// Reads the same cached welcome [`has_prime`] does, under the same `None`
+/// conditions. Exists so a caller that needs to resolve the ambiguity in
+/// [`has_prime`]'s boolean projection (a lapsed or pending nonzero state, for
+/// instance) can inspect the underlying code without forking the crate.
+///
+/// The sibling field `elevated_timestamp` (field 15) also decoded to `5` in
+/// the live probe that established this constant's value, which is not a
+/// plausible Unix timestamp; that, and not merely one nonzero sample, is what
+/// points to these being small integer codes rather than a flag-plus-time
+/// pair.
+pub fn elevated_state(session: &SessionHandle) -> Option<u32> {
     let blobs = session.cached_so_objects(APP_ID, SO_TYPE_ECON_GAME_ACCOUNT_CLIENT)?;
     let blob = blobs.first()?;
     let account = CsoEconGameAccountClient::decode(blob.as_slice()).ok()?;
-    Some(account.elevated_state.unwrap_or(0) != 0)
+    Some(account.elevated_state.unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -370,6 +397,68 @@ mod tests {
         session.replace_so_cache(570, objects);
 
         assert!(has_prime(&session).is_none());
+    }
+
+    #[test]
+    fn elevated_state_is_none_before_any_welcome() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        assert!(elevated_state(&session).is_none());
+    }
+
+    #[test]
+    fn elevated_state_reads_the_raw_code_not_a_bool() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        seed_econ_game_account(
+            &session,
+            CsoEconGameAccountClient {
+                elevated_state: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(elevated_state(&session), Some(5));
+    }
+
+    #[test]
+    fn elevated_state_defaults_absent_to_zero() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        seed_econ_game_account(&session, CsoEconGameAccountClient::default());
+        assert_eq!(elevated_state(&session), Some(0));
+    }
+
+    /// Exact wire bytes of the live `CSOEconGameAccountClient` blob captured
+    /// during the 2026-08-13 probe that determined
+    /// [`SO_TYPE_ECON_GAME_ACCOUNT_CLIENT`]. Decodes to
+    /// `additional_backpack_slots = 0`, `bonus_xp_timestamp_refresh =
+    /// 1_783_472_400` (a plausible mid-2026 timestamp, which is what
+    /// confirmed byte alignment during the probe), `bonus_xp_usedflags =
+    /// 16`, `elevated_state = 5`, `elevated_timestamp = 5`.
+    ///
+    /// Every other test here round-trips through the current prost type, so
+    /// a proto regen that silently moved `elevated_state` off field 14 would
+    /// leave them all green. Pinning the raw bytes catches that.
+    const LIVE_ECON_GAME_ACCOUNT_CLIENT_PROBE: [u8; 13] = [
+        0x08, 0x00, 0x65, 0x10, 0xa1, 0x4d, 0x6a, 0x68, 0x10, 0x70, 0x05, 0x78, 0x05,
+    ];
+
+    #[test]
+    fn live_probe_bytes_decode_to_elevated_state_five() {
+        let account =
+            CsoEconGameAccountClient::decode(LIVE_ECON_GAME_ACCOUNT_CLIENT_PROBE.as_slice())
+                .expect("live probe bytes decode as CsoEconGameAccountClient");
+        assert_eq!(account.elevated_state, Some(5));
+    }
+
+    #[test]
+    fn live_probe_bytes_read_as_has_prime_true() {
+        let (session, _commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let mut objects = HashMap::new();
+        objects.insert(
+            SO_TYPE_ECON_GAME_ACCOUNT_CLIENT,
+            vec![LIVE_ECON_GAME_ACCOUNT_CLIENT_PROBE.to_vec()],
+        );
+        session.replace_so_cache(APP_ID, objects);
+
+        assert_eq!(has_prime(&session), Some(true));
     }
 
     #[test]

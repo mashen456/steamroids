@@ -3,12 +3,14 @@
 //! Steam sends `CMsgClientLicenseList` (`k_EMsgClientLicenseList` = 780,
 //! `protos/steam/enums_clientserver.proto`) once, unprompted, right after
 //! logon: the full set of packages the account owns. There is no request
-//! message for it and it is not re-pushed on change within a session, so
-//! [`licenses`] only ever reads the cached post-login push and never blocks
-//! waiting for one.
+//! message for it. Whether Steam re-pushes it on a mid-session change (a new
+//! purchase, say) has not been verified either way; regardless, [`licenses`]
+//! only ever reads the cached post-login push and never blocks waiting for
+//! one.
 
 use prost::Message as _;
 
+use crate::error::eresult;
 use crate::proto::CMsgClientLicenseList;
 use crate::session::SessionHandle;
 
@@ -41,35 +43,50 @@ pub struct License {
 /// immediately. It never blocks, and it never asks Steam for anything since
 /// there is no request message for the license list.
 ///
-/// Returns `None` only if the push hasn't arrived yet this logon. An account
-/// with zero licenses (implausible for a real Steam account, but not
-/// impossible) reads as `Some(vec![])`, distinct from "no push yet".
+/// Returns `None` if the push hasn't arrived yet this logon, or if the
+/// cached push carries a non-OK `eresult` (the proto declares `optional
+/// int32 eresult = 1 [default = 2]`, `EResult::Fail`, and a rejected list
+/// carries no licenses at all, so reading it as success would misreport a
+/// Steam-side failure as "owns nothing"). An account with zero licenses
+/// (implausible for a real Steam account, but not impossible) reads as
+/// `Some(vec![])`, distinct from either "no push yet" or "push rejected".
 pub fn licenses(session: &SessionHandle) -> Option<Vec<License>> {
     let body = session.cached_snapshot(EMSG_CLIENT_LICENSE_LIST)?;
     let list = CMsgClientLicenseList::decode(body.as_slice()).ok()?;
-    Some(licenses_from(list))
+    licenses_from(list)
 }
 
 /// Whether the account owns `package_id`, from the same cached push
 /// [`licenses`] reads.
 ///
-/// `None` under the same condition as [`licenses`]: no push has arrived yet.
+/// `None` under the same conditions as [`licenses`]: no push has arrived
+/// yet, or the cached push was rejected.
 pub fn owns_package(session: &SessionHandle, package_id: u32) -> Option<bool> {
     let list = licenses(session)?;
     Some(list.iter().any(|l| l.package_id == package_id))
 }
 
-fn licenses_from(list: CMsgClientLicenseList) -> Vec<License> {
-    list.licenses
-        .into_iter()
-        .filter_map(|l| {
-            Some(License {
-                package_id: l.package_id?,
-                time_created: l.time_created.unwrap_or(0),
-                payment_method: l.payment_method.unwrap_or(0),
+/// `None` when `list.eresult` is present and non-OK: a rejected list carries
+/// no licenses, and reading that as `Some(vec![])` would misreport the
+/// rejection as "owns nothing". `eresult` absent is treated as success
+/// (an ordinary post-login push very likely omits it), not as the proto2
+/// default of `Fail`.
+fn licenses_from(list: CMsgClientLicenseList) -> Option<Vec<License>> {
+    if matches!(list.eresult, Some(e) if e != eresult::OK) {
+        return None;
+    }
+    Some(
+        list.licenses
+            .into_iter()
+            .filter_map(|l| {
+                Some(License {
+                    package_id: l.package_id?,
+                    time_created: l.time_created.unwrap_or(0),
+                    payment_method: l.payment_method.unwrap_or(0),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -95,7 +112,7 @@ mod tests {
             licenses: vec![proto_license(17_906)],
             ..Default::default()
         };
-        let mapped = licenses_from(list);
+        let mapped = licenses_from(list).expect("ok list");
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].package_id, 17_906);
         assert_eq!(mapped[0].time_created, 1_700_000_000);
@@ -110,13 +127,54 @@ mod tests {
             licenses: vec![ProtoLicense::default()],
             ..Default::default()
         };
-        assert!(licenses_from(list).is_empty());
+        assert!(licenses_from(list).expect("ok list").is_empty());
+    }
+
+    #[test]
+    fn licenses_from_is_none_for_a_non_ok_eresult() {
+        // eresult 2 is Fail; a rejected list must not read as zero licenses.
+        let list = CMsgClientLicenseList {
+            eresult: Some(eresult::FAIL),
+            licenses: vec![proto_license(730)],
+        };
+        assert!(licenses_from(list).is_none());
+    }
+
+    #[test]
+    fn licenses_from_treats_an_absent_eresult_as_ok() {
+        // proto2's default for a missing eresult is Fail (2), but an
+        // ordinary post-login push likely omits the field entirely, so
+        // absence must read as success, not as a hidden rejection.
+        let list = CMsgClientLicenseList {
+            eresult: None,
+            licenses: vec![proto_license(730)],
+        };
+        assert_eq!(licenses_from(list).expect("ok list").len(), 1);
     }
 
     #[test]
     fn licenses_is_none_before_any_push() {
         let (handle, _commands, _events, _snapshots) = SessionHandle::for_test(SELF_ID);
         assert!(licenses(&handle).is_none());
+    }
+
+    #[test]
+    fn licenses_is_none_for_a_non_ok_eresult() {
+        let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+        let body = CMsgClientLicenseList {
+            eresult: Some(eresult::FAIL),
+            licenses: vec![proto_license(730)],
+        }
+        .encode_to_vec();
+        snapshots
+            .lock()
+            .expect("snapshot cache mutex")
+            .insert(EMSG_CLIENT_LICENSE_LIST, body);
+
+        assert!(
+            licenses(&handle).is_none(),
+            "a rejected list must not read as owning nothing"
+        );
     }
 
     #[test]

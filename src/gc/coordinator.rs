@@ -346,6 +346,8 @@ fn so_objects_from_welcome(body: &[u8]) -> Option<HashMap<i32, Vec<Vec<u8>>>> {
     let welcome = CMsgClientWelcome::decode(body).ok()?;
     let mut objects: HashMap<i32, Vec<Vec<u8>>> = HashMap::new();
     for subscribed in welcome.outofdate_subscribed_caches {
+        // drops subscribed.owner_soid, merges blobs across owners under one
+        // type_id. only safe for per-account types (one owner per welcome).
         for obj in subscribed.objects {
             let Some(type_id) = obj.type_id else {
                 continue;
@@ -360,7 +362,10 @@ fn so_objects_from_welcome(body: &[u8]) -> Option<HashMap<i32, Vec<Vec<u8>>>> {
 /// readiness, and re-launches the app when the session reconnects. Ends when the
 /// session does, or when the last [`GameCoordinator`] clone is dropped (holding
 /// the [`SessionHandle`] here would otherwise keep the session driver alive
-/// forever).
+/// forever). Every readiness loss (a CM state change, the GC reporting no
+/// session, or the pump itself exiting) also clears `appid`'s cached SO
+/// objects, so [`SessionHandle::cached_so_objects`] can never answer from a
+/// welcome that predates the current GC session.
 async fn pump(
     appid: u32,
     hello_version: u32,
@@ -396,6 +401,9 @@ async fn pump(
                 hello_attempts = 0;
                 hello.reset();
                 let _ = ready_tx.send(false);
+                // cm session changed, so the prior welcome's SO caches can no
+                // longer be vouched for until the gc re-welcomes us.
+                session.replace_so_cache(appid, HashMap::new());
                 if ready_again {
                     debug!("re-announcing app to GC after reconnect");
                     let _ = launch(&session, appid, hello_version).await;
@@ -425,6 +433,10 @@ async fn pump(
                                         // SO caches (Prime state among them);
                                         // an undecodable body just skips the
                                         // cache update, not readiness.
+                                        // only reads outofdate_subscribed_caches, ignores field 4
+                                        // uptodate_subscribed_caches. a welcome marking nothing
+                                        // outofdate wipes the cache. not reachable today since our
+                                        // hello sends no cache version for the gc to compare against.
                                         if let Some(objects) = so_objects_from_welcome(&gc_msg.body) {
                                             session.replace_so_cache(appid, objects);
                                         }
@@ -440,6 +452,9 @@ async fn pump(
                                             hello_attempts = 0;
                                             hello.reset();
                                             let _ = ready_tx.send(false);
+                                            // gc dropped our session; the last welcome's
+                                            // caches are stale until it welcomes us again.
+                                            session.replace_so_cache(appid, HashMap::new());
                                         }
                                     }
                                     _ => {}
@@ -457,6 +472,9 @@ async fn pump(
             }
         }
     }
+    // pump is done answering for `appid`; a lingering cache would claim
+    // freshness (see cached_so_objects's doc) it no longer has.
+    session.replace_so_cache(appid, HashMap::new());
 }
 
 #[cfg(test)]
@@ -752,5 +770,174 @@ mod tests {
             .await
             .expect("pump exits")
             .expect("pump task");
+    }
+
+    /// Push a real `ClientWelcome` carrying one SO object, then wait for the
+    /// pump to process it (readiness flips only after the cache write, so
+    /// waiting for it also proves the write happened first).
+    async fn welcome_and_wait(
+        events_in: &broadcast::Sender<crate::codec::SteamMessage>,
+        ready_rx: &mut watch::Receiver<bool>,
+    ) {
+        use crate::codec::SteamMessage;
+        use crate::proto::CMsgProtoBufHeader as SteamHeader;
+
+        let welcome = CMsgClientWelcome {
+            outofdate_subscribed_caches: vec![subscribed(7, vec![vec![1, 2, 3]])],
+            ..Default::default()
+        };
+        let client = envelope::wrap(
+            APPID,
+            GC_CLIENT_WELCOME,
+            &GcHeader::default(),
+            &welcome.encode_to_vec(),
+        );
+        events_in
+            .send(SteamMessage {
+                emsg: EMSG_CLIENT_FROM_GC,
+                header: SteamHeader::default(),
+                body: client.encode_to_vec(),
+            })
+            .expect("welcome delivered");
+        while !*ready_rx.borrow() {
+            ready_rx.changed().await.expect("pump running");
+        }
+    }
+
+    #[tokio::test]
+    async fn pump_clears_so_cache_when_gc_reports_no_session() {
+        use crate::codec::SteamMessage;
+        use crate::proto::CMsgProtoBufHeader as SteamHeader;
+
+        let (session, _commands, events_in, _snapshots) = SessionHandle::for_test(7);
+        let readback = session.clone();
+        let (_state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id: 7 });
+        let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+
+        let running = tokio::spawn(pump(
+            APPID,
+            1,
+            session,
+            events_in.subscribe(),
+            state_rx,
+            events_out,
+            ready_tx,
+        ));
+
+        welcome_and_wait(&events_in, &mut ready_rx).await;
+        assert_eq!(
+            readback.cached_so_objects(APPID, 7),
+            Some(vec![vec![1, 2, 3]])
+        );
+
+        // The GC drops our session without the CM connection itself dropping.
+        let status = envelope::wrap(
+            APPID,
+            GC_CLIENT_CONNECTION_STATUS,
+            &GcHeader::default(),
+            &status_body(GcConnectionStatus::NoSession),
+        );
+        events_in
+            .send(SteamMessage {
+                emsg: EMSG_CLIENT_FROM_GC,
+                header: SteamHeader::default(),
+                body: status.encode_to_vec(),
+            })
+            .expect("status delivered");
+        while *ready_rx.borrow() {
+            ready_rx.changed().await.expect("pump running");
+        }
+
+        assert!(
+            readback.cached_so_objects(APPID, 7).is_none(),
+            "a stale SO cache must not survive the GC reporting no session"
+        );
+
+        drop(ready_rx);
+        timeout(Duration::from_secs(5), running)
+            .await
+            .expect("pump exits")
+            .expect("pump task");
+    }
+
+    #[tokio::test]
+    async fn pump_clears_so_cache_when_the_cm_session_changes() {
+        let (session, _commands, events_in, _snapshots) = SessionHandle::for_test(7);
+        let readback = session.clone();
+        let (state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id: 7 });
+        let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+
+        let running = tokio::spawn(pump(
+            APPID,
+            1,
+            session,
+            events_in.subscribe(),
+            state_rx,
+            events_out,
+            ready_tx,
+        ));
+
+        welcome_and_wait(&events_in, &mut ready_rx).await;
+        assert_eq!(
+            readback.cached_so_objects(APPID, 7),
+            Some(vec![vec![1, 2, 3]])
+        );
+
+        // The CM connection drops: a reconnect episode begins. `Connecting`
+        // is not ready, so the pump won't try to re-launch and block on an
+        // unanswered command.
+        state_tx
+            .send(SessionState::Connecting)
+            .expect("state changed");
+        while *ready_rx.borrow() {
+            ready_rx.changed().await.expect("pump running");
+        }
+
+        assert!(
+            readback.cached_so_objects(APPID, 7).is_none(),
+            "a stale SO cache must not survive a CM reconnect"
+        );
+
+        drop(ready_rx);
+        timeout(Duration::from_secs(5), running)
+            .await
+            .expect("pump exits")
+            .expect("pump task");
+    }
+
+    #[tokio::test]
+    async fn pump_clears_so_cache_on_exit() {
+        let (session, _commands, events_in, _snapshots) = SessionHandle::for_test(7);
+        let readback = session.clone();
+        let (_state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id: 7 });
+        let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+
+        let running = tokio::spawn(pump(
+            APPID,
+            1,
+            session,
+            events_in.subscribe(),
+            state_rx,
+            events_out,
+            ready_tx,
+        ));
+
+        welcome_and_wait(&events_in, &mut ready_rx).await;
+        assert!(readback.cached_so_objects(APPID, 7).is_some());
+
+        drop(ready_rx); // last GameCoordinator clone gone
+
+        timeout(Duration::from_secs(5), running)
+            .await
+            .expect("pump exits")
+            .expect("pump task");
+
+        assert!(
+            readback.cached_so_objects(APPID, 7).is_none(),
+            "an exited pump must not leave a stale SO cache behind"
+        );
     }
 }
