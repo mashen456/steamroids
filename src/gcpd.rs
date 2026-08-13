@@ -188,10 +188,17 @@ fn extract_all<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
     out
 }
 
-// trim; &nbsp; and empty are absent
+// trim; empty and the nbsp entity are absent. the trailing `;` is optional
+// and the entity name is matched case-insensitively: this is scraped markup,
+// not a spec we control, and a live page has delivered `&nbsp` with no
+// semicolon. anything else (e.g. "abc") is left alone, still an error later.
 fn cell_value(raw: Option<&str>) -> Option<&str> {
     let v = raw?.trim();
-    if v.is_empty() || v == "&nbsp;" {
+    let is_nbsp = v
+        .strip_suffix(';')
+        .unwrap_or(v)
+        .eq_ignore_ascii_case("&nbsp");
+    if v.is_empty() || is_nbsp {
         None
     } else {
         Some(v)
@@ -332,6 +339,17 @@ mod tests {
         let cd = parse_cooldown(&html).unwrap().expect("cooldown present");
         assert_eq!(cd.level, Some(2));
         assert!(cd.acknowledged);
+    }
+
+    #[test]
+    fn treats_nbsp_without_a_semicolon_as_blank() {
+        // live capture: the level cell arrived as `&nbsp` with no trailing
+        // `;`, which used to fall through to the u32 parse and fail with
+        // Error::Codec. same fixture, semicolon-less variant of the level
+        // cell only -- the existing &nbsp; fixture is left untouched.
+        let html = COOLDOWN.replace("<td>&nbsp;</td>", "<td>&nbsp</td>");
+        let cd = parse_cooldown(&html).unwrap().expect("cooldown present");
+        assert_eq!(cd.level, None);
     }
 
     #[test]

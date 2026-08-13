@@ -246,13 +246,22 @@ const NEAR_U32_MAX_PERMANENT_SECS: u32 = u32::MAX - 65_536;
 
 /// Penalty reason codes observed to mean "in effect with no countdown,
 /// ever" rather than "a cooldown that ran out": outright permanent
-/// convictions (8, 10, 14) and VAC-Live convictions (22, 23), the latter
-/// routinely ship `penalty_seconds == 0` alongside their reason. Not
-/// exhaustive: any other reason code seen with `penalty_seconds == 0` is
-/// treated as [`Cs2Penalty::ExpiredUnacknowledged`], not because it is known
-/// to be one, but because the GC alone cannot tell a genuinely permanent,
-/// uncatalogued reason apart from an ordinary cooldown stuck awaiting
-/// acknowledgement.
+/// convictions (8, 10, 14) and VAC-Live convictions (22, 23). This list only
+/// governs the `penalty_seconds == 0` branch of [`Cs2Penalty::from_gc`];
+/// VAC-Live can also arrive with a live countdown instead. Live capture
+/// (2026-08-13, real account) had reason 23 arrive with `penalty_seconds =
+/// 386_347` (about 4.5 days), independently confirmed by that account's GCPD
+/// page, and resolved as [`Cs2Penalty::Active`] instead, never touching this
+/// list. Not exhaustive: any other reason code seen with `penalty_seconds ==
+/// 0` is treated as [`Cs2Penalty::ExpiredUnacknowledged`], not because it is
+/// known to be one, but because the GC alone cannot tell a genuinely
+/// permanent, uncatalogued reason apart from an ordinary cooldown stuck
+/// awaiting acknowledgement.
+///
+/// `vac_banned` (field 6 of the same hello) is a separate flag and is not
+/// implied by a reason in this list: the same live capture had
+/// `penalty_reason = 23` alongside `vac_banned = 0` on the same account. See
+/// [`vac_banned`]'s doc.
 ///
 /// None of this is written down in the protos or Valve's docs: it comes
 /// from a working implementation plus prior operational observation of live
@@ -480,6 +489,13 @@ pub fn penalty(session: &SessionHandle) -> Option<Cs2Penalty> {
 /// This settles the VAC case directly instead of inferring it from
 /// [`Cs2Penalty`]'s reason codes 22/23, which mean VAC-Live (an active
 /// competitive-integrity conviction), not a full account VAC ban.
+///
+/// **This flag is independent of a VAC-Live penalty reason; do not assume
+/// one implies the other.** Live capture (2026-08-13, real account) had
+/// `penalty_reason = 23` (VAC-Live) with an active countdown *and*
+/// `vac_banned = 0` in the same hello: [`penalty`] returned
+/// `Some(Cs2Penalty::Active { reason: 23, .. })` for that account while this
+/// function returned `Some(false)` at the same instant.
 ///
 /// Reads the same cached welcome [`penalty`] does, but **not** under the same
 /// `None` conditions: [`penalty`] folds "the account is clean" into `None`
@@ -1077,6 +1093,58 @@ mod tests {
         session.set_cached_gc_penalty(APP_ID, Some(hello.encode_to_vec()));
 
         assert_eq!(vac_banned(&session), Some(false));
+    }
+
+    /// Reconstruction standing in for the 292-byte `game_data2` blob
+    /// (`CMsgGccStrike15V2MatchmakingGc2ClientHello`) captured live on
+    /// 2026-08-13 from a real account under an active CS2 competitive
+    /// cooldown. The raw capture is not committed here: beyond `account_id`
+    /// it carried a long run of medals/rankings submessages tied to a real,
+    /// identifiable account, and this repository is public.
+    ///
+    /// These 14 bytes are hand-encoded from the wire format directly (field
+    /// numbers and wire types from `cstrike15_gcmessages.proto`, not by
+    /// calling this type's own `encode_to_vec`, so a proto regen that
+    /// silently moved `penalty_seconds` off field 4 would still be caught
+    /// here) and carry only the four fields the tests below assert on. The
+    /// field *values* are live-observed, not invented: `account_id =
+    /// 1_205_873_838`, `penalty_seconds = 386_347` (about 4.5 days),
+    /// `penalty_reason = 23` (VAC Live), `vac_banned = 0`. The account's own
+    /// GCPD cooldown page independently confirmed the expiry this decodes
+    /// to (`2026-08-17 23:54:16 GMT`).
+    const LIVE_PENALTY_HELLO_PROBE: [u8; 14] = [
+        0x08, 0xae, 0xd9, 0x80, 0xbf, 0x04, 0x20, 0xab, 0xca, 0x17, 0x28, 0x17, 0x30, 0x00,
+    ];
+
+    #[test]
+    fn live_penalty_probe_bytes_decode_to_the_captured_fields() {
+        let hello =
+            CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(LIVE_PENALTY_HELLO_PROBE.as_slice())
+                .expect("live penalty probe bytes decode as the hello type");
+        assert_eq!(hello.account_id, Some(1_205_873_838));
+        assert_eq!(hello.penalty_seconds, Some(386_347));
+        assert_eq!(hello.penalty_reason, Some(23));
+        assert_eq!(hello.vac_banned, Some(0));
+    }
+
+    #[test]
+    fn live_penalty_probe_resolves_to_an_active_countdown() {
+        let hello =
+            CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(LIVE_PENALTY_HELLO_PROBE.as_slice())
+                .expect("live penalty probe bytes decode as the hello type");
+        // now_unix from the same live capture.
+        let penalty = Cs2Penalty::from_gc(
+            hello.penalty_reason.unwrap_or(0),
+            hello.penalty_seconds.unwrap_or(0),
+            1_786_624_508,
+        );
+        assert_eq!(
+            penalty,
+            Some(Cs2Penalty::Active {
+                reason: 23,
+                expires_at_unix: 1_787_010_855,
+            })
+        );
     }
 
     /// Exact wire bytes of the live `CSOEconGameAccountClient` blob captured
