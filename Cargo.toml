@@ -93,6 +93,9 @@ dotenvy = "0.15"
 # Benchmarks (criterion) + prost for building protobuf inputs in bench setup.
 criterion = "0.5"
 prost = "0.13"
+# Terminal QR rendering for example 12 only. Dev-only, not a library dep.
+# No default features: skips the optional image/svg/pic renderers we don't use.
+qrcode = { version = "0.14", default-features = false }
 
 [[bench]]
 name = "codec"

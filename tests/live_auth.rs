@@ -19,7 +19,9 @@
 //!   `login OK` this account must have Steam Guard fully disabled; if it still
 //!   has email Guard the test soft-skips (our flow can't enter an email code
 //!   yet). This account also drives the CS2 Game Coordinator scan
-//!   (`cs2_profile_scan`).
+//!   (`cs2_profile_scan`), the web-session test
+//!   (`web_session_authenticates_a_community_request`), and the GCPD cooldown
+//!   fetch (`web_session_fetches_the_cs2_cooldown`).
 //! - **CS2 account** (`STEAM_TEST_CS2_*`, optional) — an account that owns / has
 //!   launched CS2, so its Game Coordinator welcomes us. Drives the real profile
 //!   scan; if unset, `cs2_profile_scan` falls back to the plain account and
@@ -28,9 +30,16 @@
 //!   token-reuse path.
 //!
 //! The real-login tests are `#[ignore]`d so a stray `cargo test` never fires
-//! live logins; CI opts in with `-- --include-ignored`. Each account is logged
-//! in at most once per run: the 2FA login happens only inside `cm_logon_over_wss`,
-//! and the plain login only inside `cs2_profile_scan`.
+//! live logins; CI opts in with `-- --include-ignored`. The 2FA account is
+//! logged in at most once per run, only inside `cm_logon_over_wss`, because a
+//! second concurrent login would reuse the same TOTP code inside its 30s
+//! window and Steam rejects the duplicate. The plain account logs in from
+//! three tests (`cs2_profile_scan`, `web_session_authenticates_a_community_request`,
+//! and `web_session_fetches_the_cs2_cooldown`). It carries no shared secret,
+//! so there is no one-time code for the logins to collide on, but concurrent
+//! logins would still open concurrent CM sessions on the same account, and
+//! Steam evicts one of them. CI serializes this binary (`--test-threads=1`)
+//! to avoid that.
 //!
 //! # Running locally
 //!
@@ -164,8 +173,34 @@ fn load_account(prefix: &str) -> Option<Account> {
 /// once per attempt because `execute` consumes the builder.
 async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOutcome {
     const MAX_ATTEMPTS: u32 = 4;
+    // totp codes rotate every 30s; wait past the boundary for a fresh one
+    const TOTP_WINDOW: Duration = Duration::from_secs(31);
+    // fallback when steam sends no retry hint
+    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(60);
     for attempt in 1..=MAX_ATTEMPTS {
         match build().execute().await {
+            // same code twice in one window: steam rejects the duplicate
+            Ok(SignInOutcome::GuardCodeRejected) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "[{label}] guard code rejected (attempt {attempt}/{MAX_ATTEMPTS}), \
+                     waiting for the next TOTP window"
+                );
+                tokio::time::sleep(TOTP_WINDOW).await;
+            }
+            // several logins of one account in a row: back off, lowers the
+            // odds of hitting the limit again on the next attempt. does not
+            // remove it -- a rate limit that persists past MAX_ATTEMPTS
+            // still returns RateLimited, still falls through to skip, still
+            // panics under STEAM_LIVE_REQUIRED.
+            Ok(SignInOutcome::RateLimited { retry_hint }) if attempt < MAX_ATTEMPTS => {
+                let wait = retry_hint.unwrap_or(RATE_LIMIT_BACKOFF);
+                eprintln!(
+                    "[{label}] rate-limited (attempt {attempt}/{MAX_ATTEMPTS}), \
+                     backing off {}s",
+                    wait.as_secs()
+                );
+                tokio::time::sleep(wait).await;
+            }
             Ok(outcome) => return outcome,
             Err(Error::Network(msg)) if attempt < MAX_ATTEMPTS => {
                 eprintln!(
@@ -183,6 +218,23 @@ async fn execute_with_retry(label: &str, build: impl Fn() -> SignIn) -> SignInOu
 // `cm_logon_over_wss`; there is no separate `login_account_with_2fa` test, so
 // that account is never logged in twice in one run (concurrent logins reuse the
 // same TOTP code within a 30s window and Steam rejects the duplicate).
+
+/// Panic on an outcome no live test expects to see. `GuardCodeRejected` gets
+/// a dedicated message: by the time it reaches here, `execute_with_retry`
+/// already retried it across three TOTP windows (about 93s), so a rejection
+/// that still persists is not a transient blip and retrying again would not
+/// help -- the two real causes are a wrong `shared_secret` or a system clock
+/// skewed by more than one time step.
+fn panic_on_unexpected(label: &str, outcome: &SignInOutcome) -> ! {
+    match outcome {
+        SignInOutcome::GuardCodeRejected => panic!(
+            "[{label}] guard code rejected after retrying across three TOTP \
+             windows (about 93s); check the account's shared_secret and that \
+             the system clock is in sync"
+        ),
+        other => panic!("[{label}] unexpected outcome: {other:?}"),
+    }
+}
 
 /// Sign `acc` in for a refresh token, retrying on proxy blips. Returns `None`
 /// (after printing a `SKIP`) for the soft-skippable outcomes — email Guard or
@@ -236,7 +288,7 @@ async fn sign_in_for_session(
         SignInOutcome::InvalidCredentials => {
             panic!("[{label}] username/password rejected by Steam")
         }
-        other => panic!("[{label}] unexpected outcome: {other:?}"),
+        other => panic_on_unexpected(label, &other),
     }
 }
 
@@ -413,7 +465,7 @@ async fn cm_logon_over_wss() {
         .await;
         match outcome {
             SignInOutcome::Success { refresh_token, .. } => refresh_token,
-            other => panic!("expected sign-in success, got {other:?}"),
+            other => panic_on_unexpected("cm-signin", &other),
         }
     };
 
@@ -466,6 +518,145 @@ async fn cm_logon_over_wss() {
         "OK driver: clean logoff, final state={}",
         handle.state().label()
     );
+}
+
+/// Mint a web token over a live CM session and use it to fetch a page that
+/// only renders for a signed-in account.
+///
+/// First unified `ServiceMethod` call this crate has ever sent, so the
+/// offline tests can't show Steam actually accepts the frame. `#[ignore]`d
+/// (real login).
+///
+/// Uses the plain account, not the 2FA one: `cm_logon_over_wss` already logs
+/// the 2FA account in, and a second concurrent login would reuse the same
+/// TOTP code inside its 30s window and get rejected. The plain account has no
+/// shared secret to collide on.
+#[tokio::test]
+#[ignore = "live: needs STEAM_TEST_PLAIN_* and talks to real Steam"]
+async fn web_session_authenticates_a_community_request() {
+    use steamroids::session::{spawn_session, SessionConfig};
+
+    let Some(acc) = load_account("PLAIN") else {
+        skip("web_session: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
+        return;
+    };
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    let Some(refresh_token) = sign_in_for_session("web-session", &acc, proxy.as_ref()).await else {
+        return;
+    };
+
+    let (handle, join) = spawn_session(SessionConfig {
+        account_name: acc.username.clone(),
+        refresh_token: refresh_token.clone(),
+        proxy: proxy.clone(),
+    })
+    .await
+    .expect("establish CM session");
+    assert!(handle.steam_id() > 0, "expected a real SteamID");
+    eprintln!(
+        "OK web-session: CM session up for steam_id {}",
+        handle.steam_id()
+    );
+
+    let web = steamroids::web::request_web_token(&handle, &refresh_token, proxy.as_ref())
+        .await
+        .expect("mint web token");
+    eprintln!("OK web-session: minted web token for {}", web.steam_id());
+
+    let body = web
+        .get("https://steamcommunity.com/my/gcpd/730")
+        .await
+        .expect("gcpd fetch");
+
+    // a signed-out fetch redirects to the login page instead
+    assert!(
+        !body.contains("g_steamID = false"),
+        "GCPD returned a signed-out page, the cookie did not authenticate"
+    );
+    eprintln!("OK web-session: GCPD rendered signed-in");
+
+    handle.logoff().await.expect("clean logoff");
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("driver task ends after logoff")
+        .expect("driver task did not panic")
+        .expect("clean driver shutdown");
+}
+
+/// Mint a web token over a live CM session and fetch this account's GCPD
+/// competitive matchmaking cooldown through `request_cs2_cooldown`.
+///
+/// The account under test may or may not have an active cooldown, so this
+/// does not assert one exists; it asserts the fetch reached the real GCPD
+/// page and parsed cleanly. That distinction matters here specifically: a
+/// wrong URL (the `/me/` alias, unresolved by our client) returns the Steam
+/// Community shell under HTTP 200 with no GCPD content, which used to parse
+/// as "no cooldown" -- the same `Ok(None)` a clean account produces.
+/// `request_cs2_cooldown` now guards against exactly that itself, checking
+/// the fetched body for a GCPD-only marker before parsing, so this test
+/// calls it directly instead of recomposing the URL-build, fetch, and parse
+/// steps by hand. That also makes this the only place the shipped async
+/// function actually runs. `#[ignore]`d (real login).
+///
+/// Uses the plain account for the same reason
+/// `web_session_authenticates_a_community_request` does: `cm_logon_over_wss`
+/// already logs the 2FA account in, and a second concurrent login would reuse
+/// the same TOTP code inside its 30s window and get rejected.
+#[tokio::test]
+#[ignore = "live: needs STEAM_TEST_PLAIN_* and talks to real Steam"]
+async fn web_session_fetches_the_cs2_cooldown() {
+    use steamroids::session::{spawn_session, SessionConfig};
+
+    let Some(acc) = load_account("PLAIN") else {
+        skip("gcpd_cooldown: set STEAM_TEST_PLAIN_ACCOUNT / _PASSWORD");
+        return;
+    };
+    let proxy = env_opt("STEAM_TEST_PROXY_URL")
+        .map(|u| ProxyConfig::parse(&u).expect("STEAM_TEST_PROXY_URL is not a valid proxy URL"));
+
+    let Some(refresh_token) = sign_in_for_session("gcpd-cooldown", &acc, proxy.as_ref()).await
+    else {
+        return;
+    };
+
+    let (handle, join) = spawn_session(SessionConfig {
+        account_name: acc.username.clone(),
+        refresh_token: refresh_token.clone(),
+        proxy: proxy.clone(),
+    })
+    .await
+    .expect("establish CM session");
+    assert!(handle.steam_id() > 0, "expected a real SteamID");
+    eprintln!(
+        "OK gcpd-cooldown: CM session up for steam_id {}",
+        handle.steam_id()
+    );
+
+    let web = steamroids::web::request_web_token(&handle, &refresh_token, proxy.as_ref())
+        .await
+        .expect("mint web token");
+    eprintln!("OK gcpd-cooldown: minted web token for {}", web.steam_id());
+
+    // request_cs2_cooldown itself now checks the fetched body actually
+    // landed on GCPD before parsing it, so this exercises the shipped path
+    // end to end instead of recomposing it from its private pieces.
+    match steamroids::gcpd::request_cs2_cooldown(&web).await {
+        Ok(Some(cd)) => eprintln!(
+            "OK gcpd-cooldown: cooldown until {} (level {:?}, acknowledged {})",
+            cd.expires_at_raw, cd.level, cd.acknowledged
+        ),
+        Ok(None) => eprintln!("OK gcpd-cooldown: no active cooldown"),
+        Err(e) => panic!("gcpd cooldown fetch/parse failed: {e}"),
+    }
+
+    handle.logoff().await.expect("clean logoff");
+    tokio::time::timeout(Duration::from_secs(5), join)
+        .await
+        .expect("driver task ends after logoff")
+        .expect("driver task did not panic")
+        .expect("clean driver shutdown");
 }
 
 /// The refresh-token flow validates the token locally (no WebAPI call) and

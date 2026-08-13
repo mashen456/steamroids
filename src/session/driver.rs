@@ -52,6 +52,12 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_CONNECT_ATTEMPTS: u32 = 4;
 // k_EMsgClientLogOff, from protos/steam/enums_clientserver.proto.
 const EMSG_CLIENT_LOGOFF: u32 = 706;
+// enums_clientserver.proto: k_EMsgServiceMethodCallFromClient
+pub(crate) const EMSG_SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
+// enums_clientserver.proto: k_EMsgServiceMethodResponse
+// call_service correlates on jobid_target, not this emsg. test-only.
+#[allow(dead_code)]
+pub(crate) const EMSG_SERVICE_METHOD_RESPONSE: u32 = 147;
 /// Default budget for a [`SessionHandle::request`] before it fails with
 /// [`Error::Timeout`]. Steam answers well inside this; a job that doesn't come
 /// back at all would otherwise hang the caller forever.
@@ -75,21 +81,70 @@ const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // One-shot snapshots Steam pushes exactly once after each logon: the full
-// friends list (`k_EMsgClientFriendsList` = 767), friends-groups list (5553)
-// and player-nickname list (5587). The full snapshot always precedes any
-// incremental delta on the same emsg, so the driver caches the **first** body
-// it sees per emsg since the last logon (see [`SnapshotCache`]) — a later delta
-// never overwrites it. This lets [`crate::friends`]'s `request_*` read the
-// snapshot race-free instead of having to subscribe the instant the session
-// comes up, only to find the push already broadcast and gone.
+// friends list (`k_EMsgClientFriendsList` = 767), friends-groups list (5553),
+// player-nickname list (5587). `CMsgClientFriendsList` carries `bincremental`
+// (`protos/steam/steammessages_clientserver_friends.proto`), so a later push
+// on 767 can be a delta, and that delta must not clobber the full snapshot:
+// the full snapshot always precedes any incremental delta on the same emsg,
+// so the driver caches the **first** body it sees per emsg since the last
+// logon (see [`SnapshotCache`]); a later delta never overwrites it. This lets
+// [`crate::friends`]'s `request_*` read the snapshot race-free instead of
+// having to subscribe the instant the session comes up, only to find the push
+// already broadcast and gone.
 const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 3] = [767, 5553, 5587];
 
-/// First-wins-per-emsg cache of the [`POST_LOGIN_SNAPSHOT_EMSGS`] bodies for the
-/// current logon. Shared between the driver (the only writer) and every
+// Emsgs Steam re-pushes on every change, not just once after logon: the
+// wallet balance (`k_EMsgClientWalletInfoUpdate` = 5528), and the package
+// license list (`k_EMsgClientLicenseList` = 780). First-wins would be wrong
+// for either: a later wallet push is the current balance, not a stale delta
+// to ignore, so the driver overwrites the cached body every time instead (see
+// [`SnapshotCache`]). The license list has no delta marker at all:
+// `CMsgClientLicenseList` is just `eresult` plus `repeated License`
+// (`protos/steam/steammessages_clientserver.proto`), unlike
+// `CMsgClientFriendsList`'s `bincremental` above, so any re-push of 780 can
+// only be a complete replacement, never a delta to protect a first snapshot
+// against; last-wins is therefore safe here regardless of whether Steam ever
+// actually re-pushes it mid-session. Kept as its own list, deliberately never
+// merged into [`POST_LOGIN_SNAPSHOT_EMSGS`], so that list's first-wins policy
+// (load-bearing for the friends snapshot) can never be perturbed by adding an
+// emsg here.
+const LAST_WINS_CACHE_EMSGS: [u32; 2] = [5528, 780];
+
+/// Cache of unsolicited-push bodies for the current logon, keyed by emsg. Two
+/// write policies share the map: [`POST_LOGIN_SNAPSHOT_EMSGS`] are first-wins
+/// (a one-shot snapshot that a later delta must never overwrite),
+/// [`LAST_WINS_CACHE_EMSGS`] are last-wins (a value that keeps changing, where
+/// only the latest push is useful). [`SessionHandle::cached_snapshot`] is a
+/// single reader oblivious to which policy filled a given entry: the emsg
+/// alone decides. Shared between the driver (the only writer) and every
 /// [`SessionHandle`] (readers); cleared on every (re)logon because Steam
-/// re-pushes the snapshots. Critical sections are a single map op — never held
-/// across an `.await` — so a blocking `std::sync::Mutex` is the right fit.
+/// re-pushes both kinds, and cleared again with nothing to repopulate it once
+/// the session ends for good (see [`clear_snapshots`]), so a dead session
+/// can't keep answering with pre-death data. Critical sections are a single
+/// map op, never held across an `.await`, so a blocking `std::sync::Mutex` is
+/// the right fit.
 type SnapshotCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
+
+/// Raw Game Coordinator `SharedObject` blobs from a GC's most recent
+/// `ClientWelcome`, keyed by `(appid, so type_id)`. Unlike [`SnapshotCache`]
+/// this holds no CM-level data at all: it exists so a GC-scoped push (the
+/// welcome's `outofdate_subscribed_caches`) can still answer through a plain
+/// [`SessionHandle`], the way [`crate::cs2::has_prime`] needs, without
+/// [`crate::session`] depending on [`crate::gc`] to decode it: the GC pump
+/// decodes the welcome and writes here via [`SessionHandle::replace_so_cache`];
+/// this module never looks inside the blobs. A welcome is a full inventory,
+/// not a delta, so each one wholesale-replaces the prior entries for its
+/// `appid` (see [`SessionHandle::replace_so_cache`]) rather than merging.
+type GcSoCache = Arc<Mutex<HashMap<(u32, i32), Vec<Vec<u8>>>>>;
+
+/// Raw bytes of the most recent penalty-bearing GC push for an app, keyed by
+/// appid. Unlike [`GcSoCache`] this holds one blob per appid, not a list: the
+/// GC pump extracts a `ClientWelcome`'s `game_data2` (see
+/// [`crate::gc::GameCoordinator`]) and wholesale-replaces the prior entry
+/// with it, since a welcome is a full inventory and not a delta. This module
+/// never looks inside the bytes; [`crate::cs2::Cs2Penalty`] is the first
+/// reader. Cleared under the same readiness-loss lifecycle as [`GcSoCache`].
+type GcPenaltyCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
 
 /// Everything the driver needs to establish — and re-establish — a session.
 #[derive(Debug, Clone)]
@@ -126,6 +181,7 @@ mod command {
         Request {
             emsg: u32,
             body: Vec<u8>,
+            job_name: Option<String>,
             deadline: Instant,
             reply: oneshot::Sender<Result<SteamMessage>>,
         },
@@ -169,6 +225,8 @@ pub struct SessionHandle {
     events: broadcast::Sender<SteamMessage>,
     state: watch::Receiver<SessionState>,
     snapshots: SnapshotCache,
+    so_cache: GcSoCache,
+    penalty_cache: GcPenaltyCache,
     steam_id: u64,
 }
 
@@ -227,7 +285,56 @@ impl SessionHandle {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        self.dispatch_request(emsg, req, timeout, true).await
+        self.dispatch_request(emsg, req, None, timeout, true).await
+    }
+
+    /// Call a Steam unified service method over this session.
+    ///
+    /// Unified services are addressed by name rather than by `EMsg`: the frame
+    /// goes out as `ServiceMethodCallFromClient` with a header naming
+    /// `Interface.Method#Version`. The reply is correlated by job id exactly like
+    /// [`Self::request`], so the usual deadline applies.
+    ///
+    /// ```no_run
+    /// # async fn demo(session: &steamroids::session::SessionHandle) -> steamroids::Result<()> {
+    /// # use steamroids::proto::{
+    /// #     CAuthenticationAccessTokenGenerateForAppRequest,
+    /// #     CAuthenticationAccessTokenGenerateForAppResponse,
+    /// # };
+    /// let req = CAuthenticationAccessTokenGenerateForAppRequest::default();
+    /// let resp: CAuthenticationAccessTokenGenerateForAppResponse = session
+    ///     .call_service("Authentication", "GenerateAccessTokenForApp", 1, &req)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Remote`] if the reply header carries a non-OK `EResult`,
+    /// [`Error::Timeout`] if no reply arrives before the deadline,
+    /// [`Error::WebSocket`] if the session stopped, or [`Error::Codec`] if the
+    /// body does not decode as `Resp`.
+    pub async fn call_service<Req, Resp>(
+        &self,
+        interface: &str,
+        method: &str,
+        version: u32,
+        req: &Req,
+    ) -> Result<Resp>
+    where
+        Req: prost::Message,
+        Resp: prost::Message + Default,
+    {
+        let job_name = format!("{interface}.{method}#{version}");
+        self.dispatch_request(
+            EMSG_SERVICE_METHOD_CALL_FROM_CLIENT,
+            req,
+            Some(job_name),
+            DEFAULT_REQUEST_TIMEOUT,
+            true,
+        )
+        .await
     }
 
     /// [`Self::request`] **without** the reply-header `EResult` check, for
@@ -249,7 +356,7 @@ impl SessionHandle {
         Req: prost::Message,
         Resp: prost::Message + Default,
     {
-        self.dispatch_request(emsg, req, DEFAULT_REQUEST_TIMEOUT, false)
+        self.dispatch_request(emsg, req, None, DEFAULT_REQUEST_TIMEOUT, false)
             .await
     }
 
@@ -259,6 +366,7 @@ impl SessionHandle {
         &self,
         emsg: u32,
         req: &Req,
+        job_name: Option<String>,
         timeout: Duration,
         check_eresult: bool,
     ) -> Result<Resp>
@@ -271,6 +379,7 @@ impl SessionHandle {
             .send(Command::Request {
                 emsg,
                 body: req.encode_to_vec(),
+                job_name,
                 deadline: Instant::now() + timeout,
                 reply,
             })
@@ -314,21 +423,107 @@ impl SessionHandle {
         self.events.subscribe()
     }
 
-    /// The cached body of a one-shot post-login snapshot Steam pushes once after
-    /// logon (the full friends list, friends-groups list or player-nickname
-    /// list), or `None` if that snapshot hasn't arrived yet on this logon.
+    /// The cached body of the most recent unsolicited push Steam sent this
+    /// logon for `emsg`, or `None` if none has arrived yet.
     ///
-    /// Lets a caller read a snapshot it may have missed on [`Self::subscribe`]
-    /// without racing the post-login push. To stay race-free, **subscribe
-    /// first, then read the cache**: any snapshot not yet cached is still
-    /// guaranteed to reach the subscription. The cache is cleared and repopulated
-    /// on every reconnect. Only the post-login snapshot emsgs are cached.
+    /// Two kinds of emsg are cached, with different overwrite policies: the
+    /// post-login snapshots (full friends list, friends-groups list,
+    /// player-nickname list) are first-wins, so a later incremental delta on
+    /// the same emsg never overwrites the full snapshot already cached;
+    /// wallet-balance updates and the package license list are last-wins, so
+    /// a later push always replaces the previous body. Any other emsg is
+    /// never cached, so this returns `None` for it even after a matching
+    /// push reached [`Self::subscribe`].
+    ///
+    /// For a first-wins emsg, to stay race-free **subscribe first, then read
+    /// the cache**: any snapshot not yet cached is still guaranteed to reach
+    /// the subscription. The cache is cleared and repopulated on every
+    /// reconnect, and cleared (with nothing left to repopulate it) once the
+    /// session ends for good, so this can't keep answering with data from
+    /// before the session died.
     pub fn cached_snapshot(&self, emsg: u32) -> Option<Vec<u8>> {
         self.snapshots
             .lock()
             .expect("snapshot cache mutex poisoned")
             .get(&emsg)
             .cloned()
+    }
+
+    /// The cached `SharedObject` blobs for `type_id` under `appid`'s Game
+    /// Coordinator, from its most recent `ClientWelcome`, or `None` if no
+    /// welcome carrying this type has arrived yet this GC session (including:
+    /// no [`crate::gc::GameCoordinator`] for `appid` has ever been attached).
+    ///
+    /// Populated by the GC pump via `Self::replace_so_cache` (crate-private),
+    /// not by this module. [`crate::cs2::has_prime`] is the first reader.
+    pub fn cached_so_objects(&self, appid: u32, type_id: i32) -> Option<Vec<Vec<u8>>> {
+        self.so_cache
+            .lock()
+            .expect("so cache mutex poisoned")
+            .get(&(appid, type_id))
+            .cloned()
+    }
+
+    /// Replace every cached `SharedObject` blob for `appid` with `objects`
+    /// (keyed by SO `type_id`), as reported by a fresh GC `ClientWelcome`. An
+    /// empty `objects` clears every entry for `appid`, which the GC pump does
+    /// on every readiness loss (a CM reconnect, the GC reporting no session,
+    /// or the pump exiting) so a stale welcome from a prior GC session can
+    /// never keep answering.
+    ///
+    /// Not part of the public API: called by [`crate::gc::GameCoordinator`]'s
+    /// pump when it decodes a welcome, since the welcome is a full inventory
+    /// of subscribed caches rather than a delta, so a `type_id` from a prior
+    /// welcome that the new one omits must not linger.
+    pub(crate) fn replace_so_cache(&self, appid: u32, objects: HashMap<i32, Vec<Vec<u8>>>) {
+        let mut cache = self.so_cache.lock().expect("so cache mutex poisoned");
+        cache.retain(|&(a, _), _| a != appid);
+        for (type_id, blobs) in objects {
+            cache.insert((appid, type_id), blobs);
+        }
+    }
+
+    /// The cached bytes of the most recent penalty-bearing GC push for
+    /// `appid` (a `ClientWelcome`'s `game_data2`, see
+    /// [`crate::gc::GameCoordinator`]), or `None` if none has arrived yet
+    /// this GC session, including if no coordinator for `appid` has ever
+    /// been attached.
+    ///
+    /// Populated by the GC pump via `Self::set_cached_gc_penalty`
+    /// (crate-private), not by this module. [`crate::cs2`] is the first
+    /// reader and the only place these bytes are decoded.
+    pub fn cached_gc_penalty(&self, appid: u32) -> Option<Vec<u8>> {
+        self.penalty_cache
+            .lock()
+            .expect("penalty cache mutex poisoned")
+            .get(&appid)
+            .cloned()
+    }
+
+    /// Set (`Some`) or clear (`None`) the cached penalty-bearing push bytes
+    /// for `appid`.
+    ///
+    /// Not part of the public API: called only by
+    /// [`crate::gc::GameCoordinator`]'s pump when it decodes a welcome
+    /// carrying `game_data2`, and cleared alongside [`Self::replace_so_cache`]
+    /// on every readiness loss (a CM reconnect, the GC reporting no session,
+    /// or the pump exiting) so a stale value from a prior GC session can
+    /// never keep answering. Nothing else in the crate can call this,
+    /// including the CS2 `PlayersProfile` response path, which never holds a
+    /// genuine penalty-bearing push.
+    pub(crate) fn set_cached_gc_penalty(&self, appid: u32, bytes: Option<Vec<u8>>) {
+        let mut cache = self
+            .penalty_cache
+            .lock()
+            .expect("penalty cache mutex poisoned");
+        match bytes {
+            Some(b) => {
+                cache.insert(appid, b);
+            }
+            None => {
+                cache.remove(&appid);
+            }
+        }
     }
 
     /// Cleanly log the session off: send `CMsgClientLogOff` to Steam and tear
@@ -351,13 +546,14 @@ impl SessionHandle {
 
     /// **Test-only.** Build a handle with no driver behind it, returning the
     /// pieces a fake driver needs: the command receiver, the event sender and
-    /// the post-login snapshot cache.
+    /// the snapshot cache.
     ///
-    /// This exists so `friends` / `persona` / `cs2` / `gc` request builders can
-    /// be covered offline: a test drives the returned receiver and answers
-    /// commands itself. Not part of the supported API: it may change or vanish
-    /// in any release, and it is useless in production code. Compiled only
-    /// under `cfg(test)` or the `test-seam` feature.
+    /// This exists so `friends` / `persona` / `cs2` / `gc` / `wallet` /
+    /// `licenses` request builders can be covered offline: a test drives the
+    /// returned receiver and answers commands itself. Not part of the
+    /// supported API: it may change or vanish in any release, and it is
+    /// useless in production code. Compiled only under `cfg(test)` or the
+    /// `test-seam` feature.
     #[cfg(any(test, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn for_test(
@@ -378,6 +574,8 @@ impl SessionHandle {
                 events: evt_tx.clone(),
                 state: state_rx,
                 snapshots: snapshots.clone(),
+                so_cache: Arc::new(Mutex::new(HashMap::new())),
+                penalty_cache: Arc::new(Mutex::new(HashMap::new())),
                 steam_id,
             },
             cmd_rx,
@@ -415,11 +613,23 @@ fn check_reply_eresult(msg: &SteamMessage) -> Result<()> {
 ///
 /// # Errors
 ///
+/// [`Error::InvalidConfig`] if `config.account_name` is empty: a CM logon
+/// with an empty account name doesn't fail loudly, it comes back as
+/// `eresult 5` ("invalid password"), which sends callers chasing the wrong
+/// bug. Caught here instead of leaving that trap for the CM to spring.
 /// [`Error::AuthRejected`] if the token is rejected, otherwise the last connect
 /// error after several attempts (each rediscovering through a fresh proxy exit).
 pub async fn spawn_session(
     config: SessionConfig,
 ) -> Result<(SessionHandle, JoinHandle<Result<()>>)> {
+    if config.account_name.is_empty() {
+        return Err(Error::InvalidConfig(
+            "SessionConfig::account_name is empty: a CM logon would fail with eresult 5 \
+             (invalid password); if you signed in over QR, use the account_name Steam \
+             returned from SignInOutcome::Success"
+                .into(),
+        ));
+    }
     let (conn, logged) = establish_resilient(&config).await?;
 
     let steam_id = logged.steam_id;
@@ -457,6 +667,8 @@ pub async fn spawn_session(
             events: evt_tx,
             state: state_rx,
             snapshots,
+            so_cache: Arc::new(Mutex::new(HashMap::new())),
+            penalty_cache: Arc::new(Mutex::new(HashMap::new())),
             steam_id,
         },
         join,
@@ -542,10 +754,7 @@ impl SessionDriver {
                             info!(steam_id = self.steam_id, "session reconnected");
                             // Steam re-pushes the post-login snapshots on the new
                             // logon; drop the stale ones so the cache repopulates.
-                            self.snapshots
-                                .lock()
-                                .expect("snapshot cache mutex poisoned")
-                                .clear();
+                            clear_snapshots(&self.snapshots);
                             let _ = self.state.send(SessionState::LoggedOn {
                                 steam_id: self.steam_id,
                             });
@@ -561,6 +770,11 @@ impl SessionDriver {
         // error would otherwise hold them until `self` drops, well past their
         // deadline.
         fail_all_pending(&mut self.pending, "session driver stopped");
+        // Session is done for good: a lingering snapshot would claim freshness
+        // it no longer has (same reasoning as the GC pump's exit cleanup, see
+        // crate::gc::coordinator's pump). The Disconnected/reconnect path
+        // clears and repopulates above; this path clears and stays empty.
+        clear_snapshots(&self.snapshots);
         // Graceful socket teardown (sends a WebSocket Close frame), then publish
         // the terminal state. Bounded: a half-open exit can hang the flush, and
         // that would strand the JoinHandle and the state watchers behind it.
@@ -593,7 +807,7 @@ impl SessionDriver {
                     match command {
                         None => return LoopExit::Shutdown,
                         Some(Command::Notify { emsg, body, ack }) => {
-                            let sent = send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, &body).await;
+                            let sent = send_frame(&mut self.write, self.steam_id, self.session_id, emsg, None, None, &body).await;
                             let failed = sent.is_err();
                             let _ = ack.send(sent);
                             if failed {
@@ -602,14 +816,14 @@ impl SessionDriver {
                         }
                         Some(Command::Logoff { ack }) => {
                             // Best-effort goodbye to Steam, then stop.
-                            let _ = send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_LOGOFF, None, &[]).await;
+                            let _ = send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_LOGOFF, None, None, &[]).await;
                             let _ = ack.send(());
                             return LoopExit::Shutdown;
                         }
-                        Some(Command::Request { emsg, body, deadline, reply }) => {
+                        Some(Command::Request { emsg, body, job_name, deadline, reply }) => {
                             let jobid = self.next_jobid;
                             self.next_jobid = self.next_jobid.checked_add(1).unwrap_or(1);
-                            if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, Some(jobid), &body).await.is_err() {
+                            if send_frame(&mut self.write, self.steam_id, self.session_id, emsg, Some(jobid), job_name.as_deref(), &body).await.is_err() {
                                 let _ = reply.send(Err(Error::WebSocket("session reconnecting".into())));
                                 return LoopExit::Disconnected;
                             }
@@ -626,7 +840,7 @@ impl SessionDriver {
                 }
                 () = tokio::time::sleep_until(next_heartbeat) => {
                     trace!("heartbeat");
-                    if send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, &[]).await.is_err() {
+                    if send_frame(&mut self.write, self.steam_id, self.session_id, EMSG_CLIENT_HEARTBEAT, None, None, &[]).await.is_err() {
                         return LoopExit::Disconnected;
                     }
                     // Steam never acks the heartbeat, so probe the socket too:
@@ -730,6 +944,18 @@ fn fail_all_pending(pending: &mut HashMap<u64, Pending>, reason: &'static str) {
     }
 }
 
+/// Empty the snapshot cache. Called both when a reconnect lands (the fresh
+/// logon re-pushes everything, so the cache repopulates) and when the
+/// session ends for good (nothing repopulates it, so callers of
+/// [`SessionHandle::cached_snapshot`] correctly see `None` again instead of
+/// a stale pre-death body).
+fn clear_snapshots(snapshots: &SnapshotCache) {
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex poisoned")
+        .clear();
+}
+
 /// Inbound-silence budget for a session heartbeating at `heartbeat`, which is
 /// also the WebSocket Ping probe interval.
 fn idle_timeout(heartbeat: Duration) -> Duration {
@@ -796,12 +1022,14 @@ async fn send_frame(
     session_id: i32,
     emsg: u32,
     jobid_source: Option<u64>,
+    job_name: Option<&str>,
     body: &[u8],
 ) -> Result<()> {
     let header = CMsgProtoBufHeader {
         steamid: Some(steam_id),
         client_sessionid: Some(session_id),
         jobid_source,
+        target_job_name: job_name.map(ToString::to_string),
         ..Default::default()
     };
     write_frame(write, codec::encode_raw(emsg, &header, body)).await
@@ -860,6 +1088,15 @@ fn dispatch(
             .entry(msg.emsg)
             .or_insert_with(|| msg.body.clone());
     }
+    // Wallet balance and the license list can each change mid-session, so
+    // cache the latest body seen instead (last-wins), the opposite policy
+    // from the post-login snapshots above.
+    if LAST_WINS_CACHE_EMSGS.contains(&msg.emsg) {
+        snapshots
+            .lock()
+            .expect("snapshot cache mutex poisoned")
+            .insert(msg.emsg, msg.body.clone());
+    }
     // Unsolicited, or no waiter — broadcast (ignored if there are no subscribers).
     let _ = events.send(msg);
 }
@@ -867,6 +1104,26 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_method_frames_carry_the_target_job_name() {
+        let header = CMsgProtoBufHeader {
+            steamid: Some(7),
+            client_sessionid: Some(1),
+            jobid_source: Some(42),
+            target_job_name: Some("Authentication.GenerateAccessTokenForApp#1".to_string()),
+            ..Default::default()
+        };
+        let frame = codec::encode_raw(EMSG_SERVICE_METHOD_CALL_FROM_CLIENT, &header, &[]);
+        let decoded = codec::try_decode(&frame).unwrap().expect("proto frame");
+
+        assert_eq!(decoded.emsg, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT);
+        assert_eq!(
+            decoded.header.target_job_name.as_deref(),
+            Some("Authentication.GenerateAccessTokenForApp#1")
+        );
+        assert_eq!(decoded.header.jobid_source, Some(42));
+    }
 
     fn msg(emsg: u32, jobid_target: Option<u64>, body: Vec<u8>) -> SteamMessage {
         SteamMessage {
@@ -881,6 +1138,45 @@ mod tests {
 
     fn empty_snapshots() -> SnapshotCache {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn dispatch_caches_the_latest_wallet_push_last_wins() {
+        let mut pending: HashMap<u64, Pending> = HashMap::new();
+        let (events, _keep) = broadcast::channel(8);
+        let snapshots = empty_snapshots();
+        let wallet_emsg = LAST_WINS_CACHE_EMSGS[0];
+
+        // A balance push arrives, then the balance changes and a second push
+        // arrives. Unlike the post-login snapshots, the second push must win.
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(wallet_emsg, None, vec![1, 1]),
+        );
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(wallet_emsg, None, vec![2, 2]),
+        );
+
+        let cached = snapshots.lock().unwrap().get(&wallet_emsg).cloned();
+        assert_eq!(cached, Some(vec![2, 2]), "latest push must win");
+    }
+
+    #[test]
+    fn last_wins_and_post_login_snapshot_emsgs_are_disjoint() {
+        // Guards the exact trap this cache design has to avoid: an emsg must
+        // never be first-wins (post-login snapshot) and last-wins (wallet-style
+        // repeated push) at once, or one policy silently shadows the other.
+        for emsg in LAST_WINS_CACHE_EMSGS {
+            assert!(
+                !POST_LOGIN_SNAPSHOT_EMSGS.contains(&emsg),
+                "emsg {emsg} cannot be both first-wins and last-wins"
+            );
+        }
     }
 
     fn pending_entry(deadline: Instant) -> (Pending, oneshot::Receiver<Result<SteamMessage>>) {
@@ -968,6 +1264,35 @@ mod tests {
 
         let cached = snapshots.lock().unwrap().get(&friends_list).cloned();
         assert_eq!(cached, Some(vec![1, 1]), "first snapshot body wins");
+    }
+
+    #[tokio::test]
+    async fn dispatch_caches_the_license_list_last_wins() {
+        // The license list (780) is LAST_WINS_CACHE_EMSGS, same policy as
+        // wallet: CMsgClientLicenseList carries no delta marker, so any
+        // re-push is a full replacement, not a delta that a first-wins
+        // policy would need to protect against.
+        let mut pending: HashMap<u64, Pending> = HashMap::new();
+        let (events, _keep) = broadcast::channel(8);
+        let snapshots = empty_snapshots();
+        let license_list = LAST_WINS_CACHE_EMSGS[1];
+        assert!(!POST_LOGIN_SNAPSHOT_EMSGS.contains(&license_list));
+
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(license_list, None, vec![1]),
+        );
+        dispatch(
+            &mut pending,
+            &events,
+            &snapshots,
+            msg(license_list, None, vec![2]),
+        );
+
+        let cached = snapshots.lock().unwrap().get(&license_list).cloned();
+        assert_eq!(cached, Some(vec![2]), "latest license list body wins");
     }
 
     #[tokio::test]
@@ -1129,6 +1454,7 @@ mod tests {
         assert!(!answer_while_down(Some(Command::Request {
             emsg: 1,
             body: Vec::new(),
+            job_name: None,
             deadline: Instant::now() + Duration::from_secs(60),
             reply,
         })));
@@ -1164,6 +1490,26 @@ mod tests {
             Err(Error::WebSocket(text)) => assert!(text.contains("driver stopped"), "{text}"),
             _ => panic!("expected a WebSocket error"),
         }
+    }
+
+    #[test]
+    fn clear_snapshots_empties_the_cache() {
+        // Exercised on both the reconnect path (repopulates after) and the
+        // terminal-exit path (nothing repopulates it, see run()), so a dead
+        // session can't keep answering cached_snapshot with pre-death data.
+        let snapshots = empty_snapshots();
+        snapshots
+            .lock()
+            .unwrap()
+            .insert(POST_LOGIN_SNAPSHOT_EMSGS[0], vec![1, 2, 3]);
+        snapshots
+            .lock()
+            .unwrap()
+            .insert(LAST_WINS_CACHE_EMSGS[0], vec![4, 5]);
+
+        clear_snapshots(&snapshots);
+
+        assert!(snapshots.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1280,5 +1626,150 @@ mod tests {
         }
         task.await.expect("notify task");
         assert!(snapshots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cached_so_objects_is_none_before_any_welcome() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        assert!(handle.cached_so_objects(730, 7).is_none());
+    }
+
+    #[test]
+    fn replace_so_cache_is_readable_back() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        let mut objects = HashMap::new();
+        objects.insert(7, vec![vec![1, 2, 3]]);
+        handle.replace_so_cache(730, objects);
+
+        assert_eq!(handle.cached_so_objects(730, 7), Some(vec![vec![1, 2, 3]]));
+        // A different appid's cache must stay untouched.
+        assert!(handle.cached_so_objects(570, 7).is_none());
+    }
+
+    #[test]
+    fn replace_so_cache_drops_a_type_the_new_welcome_omits() {
+        // A welcome is a full inventory, not a delta: a type_id present in an
+        // earlier welcome but absent from a later one must not linger.
+        let (handle, ..) = SessionHandle::for_test(7);
+        let mut first = HashMap::new();
+        first.insert(2, vec![vec![9]]);
+        first.insert(7, vec![vec![1]]);
+        handle.replace_so_cache(730, first);
+
+        let mut second = HashMap::new();
+        second.insert(7, vec![vec![2]]);
+        handle.replace_so_cache(730, second);
+
+        assert_eq!(handle.cached_so_objects(730, 7), Some(vec![vec![2]]));
+        assert!(
+            handle.cached_so_objects(730, 2).is_none(),
+            "type_id 2 was not in the second welcome, so it must be gone"
+        );
+    }
+
+    #[test]
+    fn cached_gc_penalty_is_none_before_any_welcome() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        assert!(handle.cached_gc_penalty(730).is_none());
+    }
+
+    #[test]
+    fn set_cached_gc_penalty_is_readable_back() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        handle.set_cached_gc_penalty(730, Some(vec![1, 2, 3]));
+
+        assert_eq!(handle.cached_gc_penalty(730), Some(vec![1, 2, 3]));
+        // A different appid's cache must stay untouched.
+        assert!(handle.cached_gc_penalty(570).is_none());
+    }
+
+    #[test]
+    fn set_cached_gc_penalty_none_clears_it() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        handle.set_cached_gc_penalty(730, Some(vec![1]));
+        handle.set_cached_gc_penalty(730, None);
+
+        assert!(handle.cached_gc_penalty(730).is_none());
+    }
+
+    #[test]
+    fn set_cached_gc_penalty_replaces_not_merges() {
+        // A fresh welcome's game_data2 replaces the prior one wholesale, the
+        // same full-inventory policy as the SO cache.
+        let (handle, ..) = SessionHandle::for_test(7);
+        handle.set_cached_gc_penalty(730, Some(vec![1]));
+        handle.set_cached_gc_penalty(730, Some(vec![2]));
+
+        assert_eq!(handle.cached_gc_penalty(730), Some(vec![2]));
+    }
+
+    #[tokio::test]
+    async fn call_service_sends_a_named_job_and_decodes_the_reply() {
+        let (handle, mut commands, _events, _snapshots) = SessionHandle::for_test(77);
+
+        let task = tokio::spawn(async move {
+            handle
+                .call_service::<_, CMsgProtoBufHeader>(
+                    "Authentication",
+                    "GenerateAccessTokenForApp",
+                    1,
+                    &CMsgProtoBufHeader::default(),
+                )
+                .await
+        });
+
+        let Some(Command::Request {
+            emsg,
+            job_name,
+            reply,
+            ..
+        }) = commands.recv().await
+        else {
+            panic!("expected a Request command");
+        };
+        assert_eq!(emsg, EMSG_SERVICE_METHOD_CALL_FROM_CLIENT);
+        assert_eq!(
+            job_name.as_deref(),
+            Some("Authentication.GenerateAccessTokenForApp#1")
+        );
+
+        // answer with a body that decodes as the response type
+        let body = CMsgProtoBufHeader {
+            steamid: Some(99),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        reply
+            .send(Ok(SteamMessage {
+                emsg: EMSG_SERVICE_METHOD_RESPONSE,
+                header: CMsgProtoBufHeader::default(),
+                body,
+            }))
+            .expect("send reply");
+
+        let resp = task.await.expect("task").expect("call_service");
+        assert_eq!(resp.steamid, Some(99));
+    }
+
+    #[tokio::test]
+    async fn spawn_session_rejects_an_empty_account_name() {
+        // An empty account_name reaches the CM as a logon that fails with
+        // eresult 5 ("invalid password"), which is a misleading error for
+        // what is actually a missing/omitted field (e.g. a QR sign-in whose
+        // account_name never got carried into SessionConfig). Caught here,
+        // before any connect attempt, so it never depends on network access.
+        // Manual match instead of unwrap_err(): SessionHandle carries no
+        // Debug impl, and unwrap_err() needs one for the Ok side.
+        match spawn_session(SessionConfig {
+            account_name: String::new(),
+            refresh_token: RefreshToken::new("irrelevant"),
+            proxy: None,
+        })
+        .await
+        {
+            Err(Error::InvalidConfig(_)) => {}
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, got Ok"),
+        }
     }
 }

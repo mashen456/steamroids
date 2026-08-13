@@ -1,9 +1,11 @@
-//! Offline coverage for the `friends` / `persona` handlers.
+//! Offline coverage for the `friends` / `persona` / `wallet` / `licenses`
+//! handlers.
 //!
-//! Each test drives the real public async function against a driverless
+//! Each test drives the real public function against a driverless
 //! `SessionHandle::for_test`, answering its command with a synthesized
 //! `CMsgClient*` reply. That covers the parts a live test can't reach on
-//! demand: rejections, partial pushes, and the post-login snapshot cache.
+//! demand: rejections, partial pushes, and the snapshot cache (first-wins for
+//! the post-login friends snapshot; last-wins for wallet and licenses).
 //!
 //! Needs the unsupported `test-seam` feature (CI runs `--all-features`):
 //!
@@ -20,17 +22,20 @@ use tokio::sync::broadcast;
 
 use steamroids::codec::SteamMessage;
 use steamroids::friends;
+use steamroids::licenses;
 use steamroids::persona;
 use steamroids::proto::{
     c_msg_client_friends_list::Friend as ProtoFriend,
+    c_msg_client_license_list::License as ProtoLicense,
     c_msg_client_persona_state::Friend as Persona, CMsgClientAddFriendToGroupResponse,
     CMsgClientDeleteFriendsGroupResponse, CMsgClientFriendProfileInfoResponse,
-    CMsgClientFriendsList, CMsgClientManageFriendsGroupResponse, CMsgClientPersonaState,
-    CMsgClientRemoveFriendFromGroupResponse, CMsgClientRequestFriendData,
-    CMsgClientSetPlayerNicknameResponse, CMsgProtoBufHeader,
+    CMsgClientFriendsList, CMsgClientLicenseList, CMsgClientManageFriendsGroupResponse,
+    CMsgClientPersonaState, CMsgClientRemoveFriendFromGroupResponse, CMsgClientRequestFriendData,
+    CMsgClientSetPlayerNicknameResponse, CMsgClientWalletInfoUpdate, CMsgProtoBufHeader,
 };
 use steamroids::session::driver::Command;
 use steamroids::session::SessionHandle;
+use steamroids::wallet;
 use steamroids::{Error, Result};
 
 const SELF_ID: u64 = 76_561_198_000_000_000;
@@ -46,6 +51,8 @@ const EMSG_AM_CLIENT_MANAGE_FRIENDS_GROUP: u32 = 5564;
 const EMSG_AM_CLIENT_DELETE_FRIENDS_GROUP: u32 = 5562;
 const EMSG_AM_CLIENT_ADD_FRIEND_TO_GROUP: u32 = 5566;
 const EMSG_AM_CLIENT_REMOVE_FRIEND_FROM_GROUP: u32 = 5568;
+const EMSG_CLIENT_WALLET_INFO_UPDATE: u32 = 5528;
+const EMSG_CLIENT_LICENSE_LIST: u32 = 780;
 
 /// `EResult::LimitExceeded`, a plausible Steam-side rejection.
 const ERESULT_LIMIT_EXCEEDED: u32 = 25;
@@ -330,6 +337,75 @@ async fn request_friends_list_skips_an_incremental_cached_delta() {
     );
 }
 
+// ---- licenses: last-wins cache ---------------------------------------------
+
+fn license_push(package_id: u32) -> Vec<u8> {
+    CMsgClientLicenseList {
+        licenses: vec![ProtoLicense {
+            package_id: Some(package_id),
+            time_created: Some(1_700_000_000),
+            payment_method: Some(1),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[tokio::test]
+async fn licenses_reads_the_cached_snapshot() {
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_LICENSE_LIST, license_push(730));
+
+    let list = licenses::licenses(&handle).expect("the cached snapshot answers without a push");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].package_id, 730);
+    assert_eq!(licenses::owns_package(&handle, 730), Some(true));
+    assert_eq!(licenses::owns_package(&handle, 999), Some(false));
+}
+
+#[tokio::test]
+async fn licenses_is_none_before_any_push() {
+    let (handle, _commands, _events, _snapshots) = SessionHandle::for_test(SELF_ID);
+    assert!(licenses::licenses(&handle).is_none());
+    assert!(licenses::owns_package(&handle, 730).is_none());
+}
+
+#[tokio::test]
+async fn licenses_reflects_a_second_push_replacing_the_first() {
+    // CMsgClientLicenseList carries no delta marker (unlike the friends
+    // list's bincremental), so a mid-session re-push is a full replacement:
+    // licenses() must reflect the *latest* push, not the first, the opposite
+    // of the friends post-login snapshot. See
+    // `dispatch_caches_the_license_list_last_wins` in `session::driver`'s own
+    // tests for the mechanism this exercises from the public side.
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_LICENSE_LIST, license_push(730));
+    assert_eq!(
+        licenses::owns_package(&handle, 730),
+        Some(true),
+        "first push answers"
+    );
+
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_LICENSE_LIST, license_push(17_906));
+
+    let list = licenses::licenses(&handle).expect("second push answers");
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        list[0].package_id, 17_906,
+        "the second push must replace the first"
+    );
+}
+
 // ---- persona --------------------------------------------------------------
 
 /// Spawn `request_player_summary`, returning its task plus the event sender,
@@ -465,6 +541,70 @@ async fn request_profile_info_maps_an_ok_response() {
     assert_eq!(info.real_name.as_deref(), Some("Gabe"));
     assert_eq!(info.city, None, "an empty string means not shared");
     assert_eq!(info.created_at, Some(1_234));
+}
+
+// ---- wallet: last-wins cache -----------------------------------------------
+
+fn wallet_push(balance64: i64, currency: i32) -> Vec<u8> {
+    CMsgClientWalletInfoUpdate {
+        has_wallet: Some(true),
+        balance64: Some(balance64),
+        currency: Some(currency),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[tokio::test]
+async fn wallet_is_none_before_any_push() {
+    let (handle, _commands, _events, _snapshots) = SessionHandle::for_test(SELF_ID);
+    assert!(wallet::wallet(&handle).is_none());
+}
+
+#[tokio::test]
+async fn wallet_reads_the_cached_push() {
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_WALLET_INFO_UPDATE, wallet_push(2_500, 1));
+
+    let w = wallet::wallet(&handle).expect("cached push answers");
+    assert_eq!(w.balance_minor_units, 2_500);
+    assert_eq!(w.currency, 1);
+}
+
+#[tokio::test]
+async fn wallet_reflects_a_second_push_replacing_the_first() {
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_WALLET_INFO_UPDATE, wallet_push(1_000, 1));
+    assert_eq!(
+        wallet::wallet(&handle)
+            .expect("first push answers")
+            .balance_minor_units,
+        1_000
+    );
+
+    // A balance change re-pushes; wallet() must reflect the *latest* value,
+    // the opposite of the friends post-login snapshot, which is deliberately
+    // first-wins (see `dispatch_caches_the_latest_wallet_push_last_wins` and
+    // `dispatch_caches_first_snapshot_per_emsg` in `session::driver`'s own
+    // tests for the mechanism this exercises from the public side).
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_WALLET_INFO_UPDATE, wallet_push(750, 1));
+
+    assert_eq!(
+        wallet::wallet(&handle)
+            .expect("second push answers")
+            .balance_minor_units,
+        750,
+        "the second push must replace the first"
+    );
 }
 
 // ---- the seam itself ------------------------------------------------------

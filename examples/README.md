@@ -19,6 +19,7 @@ and the numbering was never reused.
 | 09 | [`09_friends.rs`](./09_friends.rs) | Friends list with resolved names, vanity-URL lookup, optional add / remove | Yes (Steam + steamcommunity.com) | ✅ live |
 | 10 | [`10_account_dump.rs`](./10_account_dump.rs) | Everything fetchable for one account in one session: persona, profile, friends, avatar bytes, CS2 profile | Yes (Steam + avatar CDN) | ✅ live |
 | 11 | [`11_persist_login.rs`](./11_persist_login.rs) | Bring-your-own-storage token persistence: password login once, then `spawn_session` from the stored refresh token | Yes (Steam) | ✅ live |
+| 12 | [`12_signin_qr.rs`](./12_signin_qr.rs) | QR sign-in: `BeginAuthSessionViaQR` for a challenge URL, poll until a human approves it in the Steam mobile app | Yes (Steam + a human with a phone) | ✅ live |
 
 ## Run
 
@@ -54,6 +55,9 @@ STEAM_ACCOUNT=bot01 STEAM_PASSWORD=hunter2 \
   SHARED_SECRET=base64SharedSecret== \
   TOKEN_FILE=refresh_token.txt \
   cargo run --example 11_persist_login
+
+PROXY_URL="socks5://user:pass@host:1080" \
+  cargo run --example 12_signin_qr
 ```
 
 All env vars beyond the required credentials are optional: `PROXY_URL` works on

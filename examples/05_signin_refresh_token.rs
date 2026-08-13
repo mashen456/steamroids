@@ -49,6 +49,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             steam_id,
             refresh_token,
             access_token,
+            // The refresh-token flow validates the JWT locally and never
+            // calls PollAuthSessionStatus, so Steam never gets a chance to
+            // report one; this is always None here. Keep using the account
+            // name you already had (this example never asked for it either).
+            account_name: _,
+            ..
         }) => {
             println!("✓ logged in");
             println!("  steam_id      : {steam_id}");

@@ -1,14 +1,17 @@
 //! High-level sign-in entry point.
 //!
 //! This is the public face of the auth flow — most consumers should not need
-//! to touch `transport::*` or `proto::*` directly. Two modes:
+//! to touch `transport::*` or `proto::*` directly. Three modes:
 //!
 //! 1. **Password (+ optional Steam mobile 2FA shared secret).** First-time
 //!    login or whenever the refresh token is missing / expired.
 //! 2. **Refresh token.** Reuses a token previously returned by mode 1, skips
 //!    the 2FA round-trip.
+//! 3. **QR code.** No password needed at all: a human scans a URL with the
+//!    Steam mobile app. Two-phase, since there's a human in the loop; see
+//!    [`SignIn::with_qr`].
 //!
-//! Both modes accept an optional [`ProxyConfig`].
+//! All three modes accept an optional [`ProxyConfig`].
 //!
 //! # How it works
 //!
@@ -21,6 +24,20 @@
 //! - **Refresh-token flow:** decode and validate the token's JWT (`SteamID`,
 //!   expiry) locally and hand it back for a CM `ClientLogon`. `SteamClient`
 //!   tokens can't be redeemed over the `WebAPI`, so no access token is minted.
+//! - **QR flow:** `BeginAuthSessionViaQR` returns a `challenge_url` to display
+//!   → poll `PollAuthSessionStatus` (same poll loop as the password flow)
+//!   until a human approves it in the app.
+//!
+//! # Limitation: `QrSession::challenge_url` does not rotate
+//!
+//! Steam's QR response carries a `version` field and `PollAuthSessionStatus`
+//! can hand back a `new_challenge_url` mid-session: the URL a caller
+//! displayed can go stale before it's scanned. This version does not track
+//! either: [`QrSession::challenge_url`] returns the one URL from the initial
+//! `BeginAuthSessionViaQR` response for the whole session. If Steam rotates
+//! it before a human scans, the poll just runs out its budget and returns
+//! [`Error::Timeout`] instead of surfacing the new URL. Not implemented here;
+//! a future version may plumb it through.
 //!
 //! # Limitation: the refresh-token flow is offline-only
 //!
@@ -61,8 +78,26 @@
 //! }
 //! # Ok(()) }
 //! ```
+//!
+//! QR sign-in, two phases:
+//!
+//! ```no_run
+//! use steamroids::auth::{SignIn, SignInOutcome};
+//!
+//! # async fn run() -> steamroids::Result<()> {
+//! let qr = SignIn::with_qr().begin().await?;
+//! println!("scan with the Steam mobile app: {}", qr.challenge_url());
+//!
+//! if let SignInOutcome::Success { steam_id, account_name, .. } = qr.poll().await? {
+//!     // account_name + refresh_token are what SessionConfig needs; the QR
+//!     // flow never asked the human to type a username anywhere else.
+//!     println!("logged in as {steam_id} (account name: {account_name:?})");
+//! }
+//! # Ok(()) }
+//! ```
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::{sleep, Instant};
@@ -75,12 +110,15 @@ use crate::auth::webapi::{map_non_ok_eresult, EResult, HttpMethod, WebApiClient}
 use crate::auth::{Credentials, RefreshToken};
 use crate::proto::{
     CAuthenticationBeginAuthSessionViaCredentialsRequest,
-    CAuthenticationBeginAuthSessionViaCredentialsResponse, CAuthenticationDeviceDetails,
-    CAuthenticationGetPasswordRsaPublicKeyRequest, CAuthenticationGetPasswordRsaPublicKeyResponse,
-    CAuthenticationPollAuthSessionStatusRequest, CAuthenticationPollAuthSessionStatusResponse,
+    CAuthenticationBeginAuthSessionViaCredentialsResponse,
+    CAuthenticationBeginAuthSessionViaQrRequest, CAuthenticationBeginAuthSessionViaQrResponse,
+    CAuthenticationDeviceDetails, CAuthenticationGetPasswordRsaPublicKeyRequest,
+    CAuthenticationGetPasswordRsaPublicKeyResponse, CAuthenticationPollAuthSessionStatusRequest,
+    CAuthenticationPollAuthSessionStatusResponse,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeRequest,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeResponse,
 };
+use crate::ratelimit::RateLimiter;
 use crate::transport::proxy::ProxyConfig;
 use crate::{Error, Result};
 
@@ -122,6 +160,15 @@ const POLL_BUDGET: Duration = Duration::from_secs(120);
 #[non_exhaustive]
 pub enum SignInOutcome {
     /// Steam accepted the credentials and issued tokens.
+    ///
+    /// This variant is itself `#[non_exhaustive]`: destructure it with `..`.
+    /// [`Self::Success::account_name`] was added after the initial release
+    /// without that marker it would have been a breaking change for every
+    /// exhaustive match; with it, adding a future field to `Success` stays
+    /// non-breaking too. The cost lands only on callers who already
+    /// destructure every field by name (they must add `..`), which every
+    /// in-tree call site now does.
+    #[non_exhaustive]
     Success {
         /// 64-bit Steam ID of the authenticated account.
         steam_id: u64,
@@ -131,6 +178,18 @@ pub enum SignInOutcome {
         /// Short-lived access token, when Steam returns one. Used for
         /// `WebAPI` calls; absent if only `ClientLogon` was performed.
         access_token: Option<String>,
+        /// Account name Steam attaches to the session, straight from
+        /// `PollAuthSessionStatus`'s `account_name` field.
+        ///
+        /// This is the piece the QR flow never asks the caller for: build a
+        /// [`SessionConfig`](crate::session::SessionConfig) from this plus
+        /// `refresh_token`. Populated from what Steam actually reports, not
+        /// echoed back from a password-flow caller's own input, so it always
+        /// matches what the CM will expect on [`spawn_session`](crate::session::spawn_session).
+        /// `None` when Steam's response omits the field (rather than an
+        /// empty string, which is exactly the value that makes a CM logon
+        /// fail with `eresult 5`).
+        account_name: Option<String>,
     },
     /// 2FA required and no `shared_secret` was supplied. Caller must add one
     /// (mobile authenticator) or fall back to email-Guard handling.
@@ -172,12 +231,14 @@ impl fmt::Debug for SignInOutcome {
             Self::Success {
                 steam_id,
                 access_token,
+                account_name,
                 // `refresh_token`'s own Debug is already redacted, but we don't
                 // even reach for it here — redact uniformly.
                 refresh_token: _,
             } => f
                 .debug_struct("Success")
                 .field("steam_id", steam_id)
+                .field("account_name", account_name)
                 .field("refresh_token", &"<redacted>")
                 .field("access_token", &access_token.as_ref().map(|_| "<redacted>"))
                 .finish(),
@@ -201,11 +262,26 @@ impl fmt::Debug for SignInOutcome {
 ///
 /// Construct via [`SignIn::with_password`] or [`SignIn::with_refresh_token`],
 /// add optional config, then call [`SignIn::execute`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand: `credentials` already redacts secrets, and
+/// `rate_limiter` is shown only as a presence marker rather than trying to
+/// format the limiter itself.
+#[derive(Clone)]
 #[must_use = "SignIn does nothing until .execute() is awaited"]
 pub struct SignIn {
     credentials: Credentials,
     proxy: Option<ProxyConfig>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+}
+
+impl fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignIn")
+            .field("credentials", &self.credentials)
+            .field("proxy", &self.proxy)
+            .field("rate_limiter", &self.rate_limiter.is_some())
+            .finish()
+    }
 }
 
 impl SignIn {
@@ -216,6 +292,7 @@ impl SignIn {
         Self {
             credentials: Credentials::password(account, password, None),
             proxy: None,
+            rate_limiter: None,
         }
     }
 
@@ -235,6 +312,24 @@ impl SignIn {
         Self {
             credentials: Credentials::refresh_token(token),
             proxy: None,
+            rate_limiter: None,
+        }
+    }
+
+    /// Start a QR-code sign-in. No password, no shared secret; a human
+    /// scans a URL with the Steam mobile app and approves the login there.
+    ///
+    /// Returns a separate builder, [`QrSignIn`], rather than `Self`: unlike
+    /// [`Self::with_password`] / [`Self::with_refresh_token`], this flow can't
+    /// be driven to completion in one `execute()` call. There's a human step
+    /// in between opening the session and knowing the outcome, so it's two
+    /// calls: [`QrSignIn::begin`] to fetch the URL to display, then
+    /// [`QrSession::poll`] to await the human. See the [module docs](self)
+    /// for a full example.
+    pub fn with_qr() -> QrSignIn {
+        QrSignIn {
+            proxy: None,
+            rate_limiter: None,
         }
     }
 
@@ -261,6 +356,20 @@ impl SignIn {
     /// password-flow fallback.
     pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// Pace this sign-in's `WebAPI` requests through a shared limiter.
+    ///
+    /// Every poll of `PollAuthSessionStatus` acquires a slot too, and the
+    /// whole poll phase is itself bounded by a 120s wall-clock budget. A
+    /// limiter interval that is coarse relative to that budget (tens of
+    /// seconds, shared across a fleet behind one exit) can eat enough of it
+    /// that a healthy login times out instead of completing, so pick an
+    /// interval with that budget in mind, not just the steady-state request
+    /// rate you want.
+    pub fn rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -350,6 +459,7 @@ impl SignIn {
                     steam_id,
                     refresh_token,
                     access_token,
+                    account_name,
                 } => {
                     store
                         .save(&account, refresh_token.expose())
@@ -359,6 +469,7 @@ impl SignIn {
                         steam_id,
                         refresh_token,
                         access_token,
+                        account_name,
                     });
                 }
                 // Stored token is no good — fall through to the password flow.
@@ -384,7 +495,7 @@ impl SignIn {
             unreachable!("dispatched by execute()");
         };
 
-        let client = WebApiClient::new(self.proxy.as_ref())?;
+        let client = WebApiClient::new(self.proxy.as_ref(), self.rate_limiter.clone())?;
 
         // 1. Fetch the RSA public key + RSA-encrypt the password.
         let RsaKeyResponse {
@@ -445,7 +556,176 @@ impl SignIn {
             steam_id: claims.steam_id,
             refresh_token: token.clone(),
             access_token: None,
+            // The JWT carries no account name, and there's no poll response
+            // to read one from in this flow: Steam never told us.
+            account_name: None,
         })
+    }
+}
+
+/// Builder for a QR-code sign-in.
+///
+/// Construct via [`SignIn::with_qr`], add optional config, then call
+/// [`Self::begin`] to open the session and get the URL to display.
+///
+/// `Debug` is implemented by hand to match [`SignIn`]'s style: `rate_limiter`
+/// is shown only as a presence marker, since [`RateLimiter`] itself has no
+/// `Debug` impl.
+#[derive(Clone)]
+#[must_use = "QrSignIn does nothing until .begin() is awaited"]
+pub struct QrSignIn {
+    proxy: Option<ProxyConfig>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+}
+
+impl fmt::Debug for QrSignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QrSignIn")
+            .field("proxy", &self.proxy)
+            .field("rate_limiter", &self.rate_limiter.is_some())
+            .finish()
+    }
+}
+
+impl QrSignIn {
+    /// Route `BeginAuthSessionViaQR` and the subsequent poll through a SOCKS5
+    /// or HTTP-CONNECT proxy. See [`SignIn::proxy`].
+    pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// Pace this sign-in's `WebAPI` requests through a shared limiter. See
+    /// [`SignIn::rate_limiter`]; the same 120s poll budget applies here.
+    pub fn rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Open the QR auth session: calls `BeginAuthSessionViaQR` and returns
+    /// the [`QrSession`] holding the challenge URL to display. Call
+    /// [`QrSession::poll`] afterwards to wait for the human.
+    ///
+    /// # Errors
+    ///
+    /// - Transport / proxy errors propagate as-is.
+    /// - A rate-limited or throttled response comes back as
+    ///   [`Error::AuthRateLimited`].
+    /// - Any other non-OK `EResult`, or a response missing a field this flow
+    ///   needs, comes back as [`Error::AuthRejected`].
+    pub async fn begin(self) -> Result<QrSession> {
+        let client = WebApiClient::new(self.proxy.as_ref(), self.rate_limiter.clone())?;
+
+        let req = CAuthenticationBeginAuthSessionViaQrRequest {
+            device_friendly_name: Some("steamroids".into()),
+            platform_type: Some(PLATFORM_STEAM_CLIENT),
+            device_details: Some(CAuthenticationDeviceDetails {
+                device_friendly_name: Some("steamroids".into()),
+                platform_type: Some(PLATFORM_STEAM_CLIENT),
+                os_type: Some(OS_TYPE_WINDOWS_10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (er, resp): (_, CAuthenticationBeginAuthSessionViaQrResponse) = client
+            .call("BeginAuthSessionViaQR", HttpMethod::Post, &req)
+            .await?;
+        if er != EResult::OK {
+            // qr begin has no credentials to reject, so throttle is the only
+            // outcome worth naming; anything else is just an error.
+            if er == EResult::RATE_LIMIT_EXCEEDED || er == EResult::ACCOUNT_LOGIN_DENIED_THROTTLE {
+                return Err(Error::AuthRateLimited(format!(
+                    "BeginAuthSessionViaQR eresult {}",
+                    er.0
+                )));
+            }
+            return Err(Error::AuthRejected(format!(
+                "BeginAuthSessionViaQR eresult {}",
+                er.0
+            )));
+        }
+
+        let client_id = resp.client_id.ok_or_else(|| {
+            Error::AuthRejected("BeginAuthSessionViaQR response: missing client_id".into())
+        })?;
+        let challenge_url = resp.challenge_url.ok_or_else(|| {
+            Error::AuthRejected("BeginAuthSessionViaQR response: missing challenge_url".into())
+        })?;
+        let request_id = resp.request_id.ok_or_else(|| {
+            Error::AuthRejected("BeginAuthSessionViaQR response: missing request_id".into())
+        })?;
+        let poll_interval = compute_poll_interval(resp.interval);
+
+        debug!(
+            target: "steamroids::auth::signin",
+            client_id,
+            "BeginAuthSessionViaQR accepted"
+        );
+
+        Ok(QrSession {
+            client,
+            challenge_url,
+            begin: BeginSession {
+                client_id,
+                request_id,
+                // qr response carries no steamid; poll_for_token only falls
+                // back to this if the refresh-token JWT itself won't decode.
+                session_steamid: 0,
+                poll_interval,
+                guards: Vec::new(),
+                email_domain_hint: None,
+            },
+        })
+    }
+}
+
+/// An opened QR sign-in session: the URL to display and the pending poll for
+/// a human to approve it in the Steam mobile app.
+///
+/// Obtained from [`QrSignIn::begin`]. Display [`Self::challenge_url`] first,
+/// then call [`Self::poll`]; the URL does not rotate for the lifetime of
+/// this session, see the [module docs](self#limitation-qrsessionchallenge_url-does-not-rotate).
+pub struct QrSession {
+    client: WebApiClient,
+    begin: BeginSession,
+    challenge_url: String,
+}
+
+impl fmt::Debug for QrSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QrSession")
+            .field("challenge_url", &self.challenge_url)
+            .field("client_id", &self.begin.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QrSession {
+    /// The URL to render as a QR code (or hand to the user directly, the
+    /// Steam mobile app also accepts it pasted into a browser).
+    ///
+    /// This crate does not render QR codes itself: encode/display the URL
+    /// however fits the caller (a terminal QR renderer, a web page, …).
+    pub fn challenge_url(&self) -> &str {
+        &self.challenge_url
+    }
+
+    /// Block until the session is approved, declined, or times out.
+    ///
+    /// Polls `PollAuthSessionStatus` at Steam's suggested interval (falling
+    /// back sensibly if it's absent or zero; see [`SignIn::rate_limiter`]'s
+    /// docs on the shared 120s wall-clock budget), the same loop the password
+    /// flow uses. Display [`Self::challenge_url`] *before* calling this: a
+    /// human has to scan it while this call is blocked waiting.
+    ///
+    /// # Errors
+    ///
+    /// - An unexpected non-OK `EResult` mid-poll comes back as
+    ///   [`Error::AuthRejected`].
+    /// - Nobody scanning (or the session otherwise never resolving) within
+    ///   the poll budget comes back as [`Error::Timeout`].
+    pub async fn poll(self) -> Result<SignInOutcome> {
+        poll_for_token(&self.client, &self.begin).await
     }
 }
 
@@ -685,18 +965,36 @@ async fn poll_for_token(client: &WebApiClient, begin: &BeginSession) -> Result<S
             resp.new_client_id,
         ));
 
-        if let Some(rt) = resp.refresh_token.filter(|s| !s.is_empty()) {
-            let steam_id = steam_id_from_refresh_token(&rt).unwrap_or(begin.session_steamid);
-            let access_token = resp.access_token.filter(|s| !s.is_empty());
-            return Ok(SignInOutcome::Success {
-                steam_id,
-                refresh_token: RefreshToken::new(rt),
-                access_token,
-            });
+        if let Some(outcome) = success_from_poll_response(&resp, begin.session_steamid) {
+            return Ok(outcome);
         }
     }
 
     Err(Error::Timeout("auth poll exceeded 120s"))
+}
+
+/// Build a [`SignInOutcome::Success`] from a poll response that carries a
+/// refresh token, or `None` if it doesn't (poll again).
+///
+/// Split out from [`poll_for_token`] so the field mapping, in particular
+/// `account_name` (the QR flow depends on it since it never asks the caller
+/// for one), is testable without a live `WebApiClient`.
+fn success_from_poll_response(
+    resp: &CAuthenticationPollAuthSessionStatusResponse,
+    session_steamid: u64,
+) -> Option<SignInOutcome> {
+    let rt = resp.refresh_token.clone().filter(|s| !s.is_empty())?;
+    let steam_id = steam_id_from_refresh_token(&rt).unwrap_or(session_steamid);
+    let access_token = resp.access_token.clone().filter(|s| !s.is_empty());
+    // Steam's own report of the account name, not an echo of whatever the
+    // caller supplied (the QR flow has no such input to echo).
+    let account_name = resp.account_name.clone().filter(|s| !s.is_empty());
+    Some(SignInOutcome::Success {
+        steam_id,
+        refresh_token: RefreshToken::new(rt),
+        access_token,
+        account_name,
+    })
 }
 
 /// Apply Steam's `new_client_id` rotation hint, keeping `current` when the
@@ -745,6 +1043,16 @@ mod tests {
         assert!(matches!(s.credentials, Credentials::RefreshToken(_)));
     }
 
+    #[test]
+    fn qr_builder_round_trips_config() {
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(1)));
+        let qr = SignIn::with_qr()
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .rate_limiter(Arc::clone(&limiter));
+        assert!(qr.proxy.is_some());
+        assert!(qr.rate_limiter.is_some());
+    }
+
     #[tokio::test]
     async fn refresh_token_with_malformed_jwt_errors_immediately() {
         // The refresh-token flow validates the JWT shape before doing any
@@ -776,10 +1084,15 @@ mod tests {
                 steam_id,
                 refresh_token,
                 access_token,
+                account_name,
             } => {
                 assert_eq!(steam_id, 76_561_198_000_000_001);
                 assert_eq!(refresh_token.expose(), jwt, "token handed back unchanged");
                 assert!(access_token.is_none(), "no web access token is minted");
+                assert!(
+                    account_name.is_none(),
+                    "the refresh-token flow has no account name to report"
+                );
             }
             other => panic!("expected Success, got {other:?}"),
         }
@@ -826,6 +1139,7 @@ mod tests {
             steam_id: 76_561_198_000_000_001,
             refresh_token: RefreshToken::new("secret-refresh-jwt"),
             access_token: Some("secret-access-jwt".into()),
+            account_name: Some("bot01".into()),
         };
         let dbg = format!("{outcome:?}");
         assert!(
@@ -836,14 +1150,16 @@ mod tests {
             !dbg.contains("secret-access-jwt"),
             "access token leaked: {dbg}"
         );
-        // Non-secret context (the SteamID) and token presence stay visible.
+        // Non-secret context (the SteamID, account name) and token presence
+        // stay visible.
         assert!(dbg.contains("76561198000000001"));
+        assert!(dbg.contains("bot01"));
         assert!(dbg.contains("redacted"));
     }
 
     #[test]
     fn signin_builder_debug_redacts_password() {
-        // SignIn derives Debug; it must not leak via its embedded credentials.
+        // SignIn's Debug must not leak via its embedded credentials.
         let dbg = format!("{:?}", SignIn::with_password("bot01", "leak-me"));
         assert!(
             !dbg.contains("leak-me"),
@@ -917,6 +1233,67 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn execute_waits_on_an_attached_rate_limiter() {
+        // burn the first slot so the next acquire must wait
+        // 45s: clearly above both http.rs's 30s TOTAL_TIMEOUT and its 10s
+        // connect_timeout, so this asserts the limiter waited, not a reqwest
+        // timeout that happened to fire first.
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
+        limiter.acquire().await;
+
+        let start = Instant::now();
+        // dead proxy: fails at connect, but the limiter must be consulted first
+        let _ = SignIn::with_password("bot01", "pw")
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .rate_limiter(Arc::clone(&limiter))
+            .execute()
+            .await;
+        assert!(start.elapsed() >= Duration::from_secs(45));
+    }
+
+    #[tokio::test]
+    async fn execute_without_a_limiter_does_not_wait() {
+        // real time, no start_paused: connect-refused timing is os-dependent,
+        // fine for the paired test's lower bound but not this upper bound.
+        // 20s: above http.rs's 10s connect timeout, below the 45s floor a
+        // limiter would force.
+        let start = std::time::Instant::now();
+        let _ = SignIn::with_password("bot01", "pw")
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .execute()
+            .await;
+        assert!(start.elapsed() < Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn qr_begin_fails_over_a_dead_proxy() {
+        // proves begin() actually dispatches BeginAuthSessionViaQR over the
+        // configured transport, same shape as the password flow's proxy test.
+        let err = SignIn::with_qr()
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .begin()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "got {err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn qr_begin_waits_on_an_attached_rate_limiter() {
+        // same reasoning as execute_waits_on_an_attached_rate_limiter, for
+        // the qr begin() path.
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
+        limiter.acquire().await;
+
+        let start = Instant::now();
+        let _ = SignIn::with_qr()
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .rate_limiter(Arc::clone(&limiter))
+            .begin()
+            .await;
+        assert!(start.elapsed() >= Duration::from_secs(45));
+    }
+
     #[test]
     fn rotate_client_id_keeps_current_without_a_hint() {
         assert_eq!(rotate_client_id(7, None), 7);
@@ -937,5 +1314,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::AuthRejected(_)));
+    }
+
+    #[test]
+    fn poll_response_without_refresh_token_yields_no_success() {
+        // The common case mid-poll: Steam has nothing new to report yet.
+        let resp = CAuthenticationPollAuthSessionStatusResponse::default();
+        assert!(success_from_poll_response(&resp, 123).is_none());
+    }
+
+    #[test]
+    fn poll_response_empty_refresh_token_is_treated_as_absent() {
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(success_from_poll_response(&resp, 123).is_none());
+    }
+
+    #[test]
+    fn poll_response_populates_account_name_from_steam() {
+        // The bug this fixes: the QR flow has no account name to echo back,
+        // so it has to come from Steam's own poll response.
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some("opaque-token".into()),
+            account_name: Some("bot01".into()),
+            ..Default::default()
+        };
+        let outcome = success_from_poll_response(&resp, 76_561_198_000_000_001).unwrap();
+        match outcome {
+            SignInOutcome::Success {
+                steam_id,
+                account_name,
+                ..
+            } => {
+                // "opaque-token" isn't a JWT, so the steamid falls back to
+                // the one BeginAuthSession reported.
+                assert_eq!(steam_id, 76_561_198_000_000_001);
+                assert_eq!(account_name.as_deref(), Some("bot01"));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_response_missing_account_name_stays_none() {
+        // Steam may simply omit the field. Must not default to Some(""),
+        // which is exactly the value a CM logon rejects with eresult 5.
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some("opaque-token".into()),
+            account_name: None,
+            ..Default::default()
+        };
+        let outcome = success_from_poll_response(&resp, 1).unwrap();
+        match outcome {
+            SignInOutcome::Success { account_name, .. } => assert!(account_name.is_none()),
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_response_empty_account_name_string_is_treated_as_none() {
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some("opaque-token".into()),
+            account_name: Some(String::new()),
+            ..Default::default()
+        };
+        let outcome = success_from_poll_response(&resp, 1).unwrap();
+        match outcome {
+            SignInOutcome::Success { account_name, .. } => assert!(account_name.is_none()),
+            other => panic!("expected Success, got {other:?}"),
+        }
     }
 }

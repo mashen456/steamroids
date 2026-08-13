@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("in game       : —"),
             }
             // Download the actual image and save it next to the binary's CWD.
-            match persona::fetch_avatar(&s.avatar_url, proxy.as_ref()).await {
+            match persona::fetch_avatar(&s.avatar_url, proxy.as_ref(), None).await {
                 Ok(bytes) => {
                     let path = format!("avatar_{account_id}.jpg");
                     if let Err(e) = std::fs::write(&path, &bytes) {

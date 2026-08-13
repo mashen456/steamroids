@@ -1,0 +1,386 @@
+//! CS2 competitive matchmaking cooldown from the Steam GCPD.
+//!
+//! [`request_cs2_cooldown`] fetches an account's GCPD matchmaking page over a
+//! [`WebSession`] and hands the body to [`parse_cooldown`], which does the
+//! actual HTML extraction and touches no network itself. GCPD renders every
+//! table on the page (cooldown, casual matchmaking stats, deathmatch stats,
+//! ...) with the same `generic_kv_table` class and no id or wrapper to tell
+//! them apart, so the cooldown table is found by matching its header row
+//! rather than by its position on the page.
+
+use crate::web::WebSession;
+use crate::{Error, Result};
+
+// gcpd matchmaking-tab url. /profiles/<steamid64>/ form, deliberately not
+// /me/: that alias resolves browser-side and returns the steam community
+// shell under http 200 with no gcpd content, fails silently. only caller is
+// request_cs2_cooldown; the live test exercises this by calling that
+// directly, so a change here cannot drift out of sync with what it runs.
+// l=english pins the ui language: steam renders nav labels in the account's
+// own preference otherwise, and GCPD_PAGE_MARKER is an english literal.
+fn cooldown_url(steam_id: u64) -> String {
+    format!("https://steamcommunity.com/profiles/{steam_id}/gcpd/730?tab=matchmaking&l=english")
+}
+
+// left-nav tab label on every gcpd page. live-verified: appears twice on a
+// real gcpd page, zero times on the community shell a wrong url returns.
+// only reliable because cooldown_url pins l=english.
+const GCPD_PAGE_MARKER: &str = "Competitive Matches";
+
+/// Read this account's active CS2 competitive cooldown from its GCPD page.
+///
+/// `Ok(None)` means no cooldown is active: Steam omits the table entirely
+/// rather than rendering an empty one.
+///
+/// # Errors
+///
+/// Any transport error from [`WebSession::get`]; [`Error::Remote`] if the
+/// fetched page is not actually a GCPD page (the session's web token may
+/// have expired, landing the request on the login page instead); or
+/// [`Error::Codec`] if the cooldown table is present but its expiry does not
+/// parse.
+pub async fn request_cs2_cooldown(web: &WebSession) -> Result<Option<Cs2Cooldown>> {
+    let html = web.get(&cooldown_url(web.steam_id())).await?;
+    if !html.contains(GCPD_PAGE_MARKER) {
+        return Err(Error::Remote(
+            "fetched page is not a GCPD page; the web session may have expired".into(),
+        ));
+    }
+    parse_cooldown(&html)
+}
+
+/// A CS2 competitive matchmaking cooldown read from a GCPD page.
+///
+/// Pairs with [`crate::cs2::Cs2Penalty`], the same state as reported by the
+/// Game Coordinator instead of GCPD. The GC gives a reason code and a raw
+/// `penalty_seconds` that goes ambiguous once it hits `0`; GCPD gives
+/// [`Self::expires_at_unix`] (the same countdown, rendered as a date instead
+/// of a duration) and [`Self::acknowledged`] (whether the account has
+/// cleared it), which is exactly the piece the GC alone cannot supply.
+/// Together: a [`crate::cs2::Cs2Penalty::ExpiredUnacknowledged`] from the GC
+/// alongside a `Cs2Cooldown` here with `acknowledged == false` is the same
+/// event seen from both sides: "expired, awaiting acknowledgement". If
+/// GCPD reports no cooldown table at all (`request_cs2_cooldown` returning
+/// `Ok(None)`) while the GC still reports a penalty, reading that penalty as
+/// the permanent case instead is a projection this crate assumes, not a
+/// verified fact: it depends on GCPD keeping no row for a cooldown that
+/// expired but is still awaiting acknowledgement, which has not been
+/// confirmed live.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Cs2Cooldown {
+    /// Cooldown expiry, as a Unix timestamp (UTC).
+    pub expires_at_unix: i64,
+    /// The expiry exactly as GCPD rendered it, e.g. `"2026-08-17 23:54:16 GMT"`.
+    pub expires_at_raw: String,
+    /// Cooldown level, when GCPD reports one. A real active cooldown has been
+    /// observed with this cell blank, so it is optional.
+    pub level: Option<u32>,
+    /// Whether the account has acknowledged the cooldown. Steam only clears
+    /// a GC-reported penalty once this is `true`; see
+    /// [`crate::cs2::Cs2Penalty`] for what an unacknowledged expiry looks
+    /// like from the GC's side.
+    ///
+    /// A blank cell reads as `false`, the same as an explicit "No": the
+    /// field is `bool`, not `Option<bool>` (unlike [`Self::level`], where a
+    /// blank cell was actually observed live), so a blank has to resolve to
+    /// one or the other. No blank cell has been observed live here, the
+    /// fixture this parser was built against had "No", so this mapping is an
+    /// assumption, not a confirmed one. `false` was chosen as the
+    /// conservative read: misreading a blank as still-pending is safer than
+    /// misreading it as cleared.
+    pub acknowledged: bool,
+}
+
+const COOLDOWN_HEADERS: [&str; 3] = [
+    "Competitive Cooldown Expiration",
+    "Competitive Cooldown Level",
+    "Acknowledged",
+];
+
+/// Parse the CS2 competitive cooldown out of a GCPD page.
+///
+/// `html` is expected to be the body of an account's GCPD
+/// `?tab=matchmaking` page.
+///
+/// `Ok(None)` means the cooldown table itself is absent from the page. GCPD
+/// renders no such table at all for a clean account, so this is the normal
+/// case, not a parse failure.
+///
+/// # Errors
+///
+/// [`Error::Codec`] if the cooldown table is present but its expiry cell
+/// does not parse as `YYYY-MM-DD HH:MM:SS GMT`, or its level cell is
+/// non-blank and not a valid number.
+pub fn parse_cooldown(html: &str) -> Result<Option<Cs2Cooldown>> {
+    let Some(table) = find_cooldown_table(html) else {
+        return Ok(None);
+    };
+
+    // first <tr> is the header row, already matched; read only the next one
+    // so an undersized row can't borrow cells from whatever follows it
+    let rows = extract_all(table, "tr");
+    let data_row = rows.get(1).copied().unwrap_or("");
+    let cells = extract_all(data_row, "td");
+
+    let raw = cells.first().copied().unwrap_or("").trim();
+    let expires_at_unix = parse_gmt_timestamp(raw)?;
+
+    let level = match cell_value(cells.get(1).copied()) {
+        Some(v) => Some(
+            v.parse::<u32>()
+                .map_err(|e| Error::Codec(format!("cooldown level {v:?}: {e}")))?,
+        ),
+        None => None,
+    };
+
+    // blank cell -> false, same as "No". not observed live, see field doc.
+    let acknowledged =
+        cell_value(cells.get(2).copied()).is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+
+    Ok(Some(Cs2Cooldown {
+        expires_at_unix,
+        expires_at_raw: raw.to_string(),
+        level,
+        acknowledged,
+    }))
+}
+
+// scan for the table whose header row is exactly the cooldown headers
+fn find_cooldown_table(html: &str) -> Option<&str> {
+    const OPEN: &str = "<table class=\"generic_kv_table\">";
+    const CLOSE: &str = "</table>";
+
+    let mut pos = 0;
+    while let Some(rel) = html[pos..].find(OPEN) {
+        let start = pos + rel;
+        let body_start = start + OPEN.len();
+        let close_rel = html[body_start..].find(CLOSE)?;
+        let end = body_start + close_rel + CLOSE.len();
+        let table = &html[start..end];
+
+        let headers: Vec<&str> = extract_all(table, "th").iter().map(|h| h.trim()).collect();
+        if headers.as_slice() == COOLDOWN_HEADERS.as_slice() {
+            return Some(table);
+        }
+
+        pos = end;
+    }
+    None
+}
+
+// text between every <tag>...</tag> pair, in document order, no nesting
+fn extract_all<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(rel) = html[pos..].find(&open) {
+        let start = pos + rel + open.len();
+        let Some(close_rel) = html[start..].find(&close) else {
+            break;
+        };
+        let end = start + close_rel;
+        out.push(&html[start..end]);
+        pos = end + close.len();
+    }
+    out
+}
+
+// trim; empty and the nbsp entity are absent. the trailing `;` is optional
+// and the entity name is matched case-insensitively: this is scraped markup,
+// not a spec we control, and a live page has delivered `&nbsp` with no
+// semicolon. anything else (e.g. "abc") is left alone, still an error later.
+fn cell_value(raw: Option<&str>) -> Option<&str> {
+    let v = raw?.trim();
+    let is_nbsp = v
+        .strip_suffix(';')
+        .unwrap_or(v)
+        .eq_ignore_ascii_case("&nbsp");
+    if v.is_empty() || is_nbsp {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+fn parse_gmt_timestamp(raw: &str) -> Result<i64> {
+    fn bad(raw: &str) -> Error {
+        Error::Codec(format!(
+            "cooldown expiry {raw:?}: expected YYYY-MM-DD HH:MM:SS GMT"
+        ))
+    }
+
+    let rest = raw.strip_suffix(" GMT").ok_or_else(|| bad(raw))?;
+    let (date, time) = rest.split_once(' ').ok_or_else(|| bad(raw))?;
+
+    let mut date_parts = date.split('-');
+    let (Some(y), Some(m), Some(d), None) = (
+        date_parts.next(),
+        date_parts.next(),
+        date_parts.next(),
+        date_parts.next(),
+    ) else {
+        return Err(bad(raw));
+    };
+
+    let mut time_parts = time.split(':');
+    let (Some(hh), Some(mm), Some(ss), None) = (
+        time_parts.next(),
+        time_parts.next(),
+        time_parts.next(),
+        time_parts.next(),
+    ) else {
+        return Err(bad(raw));
+    };
+
+    let y: i64 = y.parse().map_err(|_| bad(raw))?;
+    let m: i64 = m.parse().map_err(|_| bad(raw))?;
+    let d: i64 = d.parse().map_err(|_| bad(raw))?;
+    let hh: i64 = hh.parse().map_err(|_| bad(raw))?;
+    let mm: i64 = mm.parse().map_err(|_| bad(raw))?;
+    let ss: i64 = ss.parse().map_err(|_| bad(raw))?;
+
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 59 {
+        return Err(bad(raw));
+    }
+
+    let days = days_from_civil(y, m, d);
+    Ok(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+// days from civil, Howard Hinnant's algorithm. valid for any gregorian date.
+// names (era, yoe, doy, doe) match the reference algorithm, kept for verifiability.
+#[allow(clippy::similar_names)]
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COOLDOWN: &str = include_str!("../tests/fixtures/gcpd_cooldown.html");
+    const NO_COOLDOWN: &str = include_str!("../tests/fixtures/gcpd_no_cooldown.html");
+
+    #[test]
+    fn days_from_civil_matches_known_dates() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 3, 1), 11017);
+    }
+
+    #[test]
+    fn cooldown_url_uses_the_profiles_form_not_me() {
+        assert_eq!(
+            cooldown_url(76_561_198_000_000_001),
+            "https://steamcommunity.com/profiles/76561198000000001/gcpd/730?tab=matchmaking&l=english"
+        );
+    }
+
+    #[test]
+    fn cooldown_url_pins_the_ui_language() {
+        // GCPD_PAGE_MARKER is an english literal; without this the guard
+        // would reject a real page on a non-english account
+        assert!(cooldown_url(1).contains("l=english"));
+    }
+
+    #[test]
+    fn parses_an_active_cooldown() {
+        let cd = parse_cooldown(COOLDOWN).unwrap().expect("cooldown present");
+        assert_eq!(cd.expires_at_raw, "2026-08-17 23:54:16 GMT");
+        // 2026-08-17T23:54:16Z
+        assert_eq!(cd.expires_at_unix, 1_787_010_856);
+        // real active cooldown had a blank level cell
+        assert_eq!(cd.level, None);
+        assert!(!cd.acknowledged);
+    }
+
+    #[test]
+    fn clean_account_has_no_cooldown() {
+        assert!(parse_cooldown(NO_COOLDOWN).unwrap().is_none());
+    }
+
+    #[test]
+    fn does_not_match_a_table_by_position() {
+        // cooldown table genuinely in second position: a non-cooldown table
+        // first, then the cooldown table, in one well-formed fixture.
+        let first_table_end = NO_COOLDOWN
+            .find("</table>")
+            .expect("no-cooldown fixture has a table")
+            + "</table>".len();
+        let cooldown_start = COOLDOWN
+            .find("<table")
+            .expect("cooldown fixture has a table");
+        let cooldown_end = COOLDOWN
+            .find("</table>")
+            .expect("cooldown fixture has a table")
+            + "</table>".len();
+
+        let swapped = format!(
+            "{}{}</div>\n",
+            &NO_COOLDOWN[..first_table_end],
+            &COOLDOWN[cooldown_start..cooldown_end]
+        );
+
+        assert!(parse_cooldown(&swapped).unwrap().is_some());
+    }
+
+    #[test]
+    fn reads_a_numeric_level_and_acknowledged_yes() {
+        let html = COOLDOWN
+            .replace("<td>&nbsp;</td>", "<td>2</td>")
+            .replace("<td>No</td>", "<td>Yes</td>");
+        let cd = parse_cooldown(&html).unwrap().expect("cooldown present");
+        assert_eq!(cd.level, Some(2));
+        assert!(cd.acknowledged);
+    }
+
+    #[test]
+    fn treats_nbsp_without_a_semicolon_as_blank() {
+        // live capture: the level cell arrived as `&nbsp` with no trailing
+        // `;`, which used to fall through to the u32 parse and fail with
+        // Error::Codec. same fixture, semicolon-less variant of the level
+        // cell only -- the existing &nbsp; fixture is left untouched.
+        let html = COOLDOWN.replace("<td>&nbsp;</td>", "<td>&nbsp</td>");
+        let cd = parse_cooldown(&html).unwrap().expect("cooldown present");
+        assert_eq!(cd.level, None);
+    }
+
+    #[test]
+    fn rejects_a_malformed_timestamp() {
+        let html = COOLDOWN.replace("2026-08-17 23:54:16 GMT", "not a date");
+        assert!(parse_cooldown(&html).is_err());
+    }
+
+    #[test]
+    fn non_blank_non_numeric_level_is_a_codec_error() {
+        let html = COOLDOWN.replace("<td>&nbsp;</td>", "<td>abc</td>");
+        let err = parse_cooldown(&html).unwrap_err();
+        assert!(matches!(err, Error::Codec(_)), "{err:?}");
+    }
+
+    #[test]
+    fn header_order_mismatch_is_no_cooldown_not_an_error() {
+        // same three header texts, first two swapped: order must match too
+        let html = COOLDOWN
+            .replacen("Competitive Cooldown Expiration", "@@TMP@@", 1)
+            .replacen(
+                "Competitive Cooldown Level",
+                "Competitive Cooldown Expiration",
+                1,
+            )
+            .replacen("@@TMP@@", "Competitive Cooldown Level", 1);
+        assert!(parse_cooldown(&html).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_input_is_no_cooldown_not_an_error() {
+        assert!(parse_cooldown("").unwrap().is_none());
+    }
+}

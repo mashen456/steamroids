@@ -56,6 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             steam_id,
             refresh_token,
             access_token,
+            // Same account name you passed in above, echoed back by Steam's
+            // poll response: nothing new to show for the password flow.
+            account_name: _,
+            ..
         }) => {
             println!("✓ logged in");
             println!("  steam_id      : {steam_id}");

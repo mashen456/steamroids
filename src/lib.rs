@@ -7,8 +7,9 @@
 //!
 //! The full client stack is now in-tree:
 //!
-//! - **Auth** — log an account in (password + mobile 2FA, or a stored refresh
-//!   token) and obtain access / refresh tokens via [`auth::SignIn`].
+//! - **Auth**: log an account in (password + mobile 2FA, a stored refresh
+//!   token, or a scanned QR code) and obtain access / refresh tokens via
+//!   [`auth::SignIn`].
 //! - **CM session** — [`session::spawn_session`] holds a live, self-healing
 //!   Connection Manager session over WSS (`ClientLogon`, heartbeat, reconnect,
 //!   job-id-multiplexed `request` / `notify` / `subscribe`).
@@ -42,27 +43,45 @@
 //! - [`auth`]: credentials, TOTP, the `WebAPI` sign-in flow ([`auth::SignIn`]),
 //!   and refresh-token persistence ([`auth::TokenStore`])
 //! - [`codec`] — Steam `EMsg` + protobuf message framing for the CM transport
+//! - [`confirmations`]: fetch and approve mobile confirmations
+//!   ([`confirmations::list`], [`confirmations::accept`])
 //! - [`session`] — live CM session lifecycle ([`session::spawn_session`])
 //! - [`persona`] — player summary, profile info, and vanity-URL resolution
 //! - [`friends`]: friends list, add / remove, nicknames, visibility, chat,
 //!   groups
 //! - [`gc`] — generic Game Coordinator envelope + client ([`gc::GameCoordinator`])
+//! - [`gcpd`]: fetch and parse an account's CS2 competitive cooldown from its
+//!   GCPD page ([`gcpd::request_cs2_cooldown`])
+//! - [`licenses`]: the account's package licenses, read from Steam's
+//!   unprompted post-login push ([`licenses::licenses`])
 //! - [`cs2`] — CS2 (app 730) helpers built on the GC layer ([`cs2::PlayerProfile`])
 //! - [`pool`] — proxy pooling + dead-proxy detection for fleets ([`pool::ProxyPool`])
+//! - [`ratelimit`]: a shareable request pacer for fleets behind proxies
+//!   ([`ratelimit::RateLimiter`])
+//! - [`wallet`]: the account's wallet balance, read from Steam's unprompted
+//!   post-login/on-change push ([`wallet::wallet`])
+//! - [`web`]: mint a `steamcommunity.com` web access token over the session
+//!   ([`web::request_web_token`])
 
 #![doc(html_root_url = "https://docs.rs/steamroids/0.3.0")]
 
 pub mod auth;
 pub mod codec;
+pub mod confirmations;
 pub mod cs2;
 pub mod error;
 pub mod friends;
 pub mod gc;
+pub mod gcpd;
+pub mod licenses;
 pub mod persona;
 pub mod pool;
 pub mod proto;
+pub mod ratelimit;
 pub mod session;
 pub mod transport;
+pub mod wallet;
+pub mod web;
 
 // Crate-private: shared reqwest client setup for the WebAPI auth flow and CM
 // server discovery.
