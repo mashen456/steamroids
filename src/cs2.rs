@@ -275,8 +275,11 @@ const PERMANENT_REASONS: [u32; 5] = [8, 10, 14, 22, 23];
 /// page reports, and `acknowledged` says whether the account has cleared
 /// it. Pair the two: a GC-reported [`Self::ExpiredUnacknowledged`] alongside
 /// a GCPD cooldown whose `acknowledged` is `false` is the same event seen
-/// from both sides; if GCPD shows no cooldown table for the account at all,
-/// the GC-reported penalty is the permanent case instead.
+/// from both sides. If GCPD shows no cooldown table for the account at all,
+/// reading the GC-reported penalty as the permanent case instead is a
+/// projection this crate assumes, not a verified fact: it depends on GCPD
+/// keeping no row for a cooldown that expired but is still awaiting
+/// acknowledgement, which has not been confirmed live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Cs2Penalty {
@@ -450,10 +453,16 @@ pub fn elevated_state(session: &SessionHandle) -> Option<u32> {
 /// the same cached bytes [`SessionHandle::cached_gc_penalty`] keeps; see
 /// [`Cs2Penalty::from_gc`] for the interpretation rules.
 ///
-/// Returns `None` if no welcome carrying `game_data2` has arrived yet this
-/// GC session, including if [`attach`] was never called at all, or the
-/// cached bytes don't decode. Never blocks and never asks the GC for
-/// anything.
+/// Returns `None` when the account has no penalty at all, i.e. both
+/// `penalty_reason` and `penalty_seconds` are `0` (see
+/// [`Cs2Penalty::from_gc`]), by far the most common `None` case, since most
+/// accounts are clean. A caller must not read `None` as "don't know" and
+/// retry-loop waiting for it to resolve on a healthy account. `None` also
+/// covers the ordinary "no data yet" causes: no welcome carrying
+/// `game_data2` has arrived yet this GC session, including if [`attach`] was
+/// never called at all, or the cached bytes don't decode. [`vac_banned`]
+/// reads the same cached bytes but does *not* fold "clean" into `None`; see
+/// its doc. Never blocks and never asks the GC for anything.
 #[must_use]
 pub fn penalty(session: &SessionHandle) -> Option<Cs2Penalty> {
     let bytes = session.cached_gc_penalty(APP_ID)?;
@@ -472,8 +481,11 @@ pub fn penalty(session: &SessionHandle) -> Option<Cs2Penalty> {
 /// [`Cs2Penalty`]'s reason codes 22/23, which mean VAC-Live (an active
 /// competitive-integrity conviction), not a full account VAC ban.
 ///
-/// Reads the same cached welcome [`penalty`] does, under the same `None`
-/// conditions.
+/// Reads the same cached welcome [`penalty`] does, but **not** under the same
+/// `None` conditions: [`penalty`] folds "the account is clean" into `None`
+/// too (see its doc), while this function has a real `bool` for that case and
+/// returns `Some(false)`. `None` here means only "no welcome yet, or the
+/// cached bytes don't decode".
 #[must_use]
 pub fn vac_banned(session: &SessionHandle) -> Option<bool> {
     let bytes = session.cached_gc_penalty(APP_ID)?;

@@ -3,10 +3,15 @@
 //! Steam sends `CMsgClientLicenseList` (`k_EMsgClientLicenseList` = 780,
 //! `protos/steam/enums_clientserver.proto`) once, unprompted, right after
 //! logon: the full set of packages the account owns. There is no request
-//! message for it. Whether Steam re-pushes it on a mid-session change (a new
-//! purchase, say) has not been verified either way; regardless, [`licenses`]
-//! only ever reads the cached post-login push and never blocks waiting for
-//! one.
+//! message for it. Whether Steam ever re-pushes it mid-session (a new
+//! purchase, say) has not been verified live, but the proto settles what
+//! such a push would mean: `CMsgClientLicenseList` is just `eresult` plus
+//! `repeated License`, with no incremental-delta marker the way
+//! `CMsgClientFriendsList`'s `bincremental` has, so a re-push can only be a
+//! full replacement, never a delta to guard a first snapshot against. The
+//! session driver caches this emsg last-wins for that reason (see
+//! [`SessionHandle::cached_snapshot`]); [`licenses`] just reads whatever is
+//! cached and never blocks waiting for a push.
 
 use prost::Message as _;
 

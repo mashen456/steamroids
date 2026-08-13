@@ -5,7 +5,7 @@
 //! `SessionHandle::for_test`, answering its command with a synthesized
 //! `CMsgClient*` reply. That covers the parts a live test can't reach on
 //! demand: rejections, partial pushes, and the snapshot cache (first-wins for
-//! the post-login snapshots, friends and licenses; last-wins for wallet).
+//! the post-login friends snapshot; last-wins for wallet and licenses).
 //!
 //! Needs the unsupported `test-seam` feature (CI runs `--all-features`):
 //!
@@ -337,25 +337,28 @@ async fn request_friends_list_skips_an_incremental_cached_delta() {
     );
 }
 
-// ---- licenses: the post-login snapshot cache -------------------------------
+// ---- licenses: last-wins cache ---------------------------------------------
 
-#[tokio::test]
-async fn licenses_reads_the_cached_snapshot() {
-    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
-    let body = CMsgClientLicenseList {
+fn license_push(package_id: u32) -> Vec<u8> {
+    CMsgClientLicenseList {
         licenses: vec![ProtoLicense {
-            package_id: Some(730),
+            package_id: Some(package_id),
             time_created: Some(1_700_000_000),
             payment_method: Some(1),
             ..Default::default()
         }],
         ..Default::default()
     }
-    .encode_to_vec();
+    .encode_to_vec()
+}
+
+#[tokio::test]
+async fn licenses_reads_the_cached_snapshot() {
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
     snapshots
         .lock()
         .expect("snapshot cache mutex")
-        .insert(EMSG_CLIENT_LICENSE_LIST, body);
+        .insert(EMSG_CLIENT_LICENSE_LIST, license_push(730));
 
     let list = licenses::licenses(&handle).expect("the cached snapshot answers without a push");
     assert_eq!(list.len(), 1);
@@ -369,6 +372,38 @@ async fn licenses_is_none_before_any_push() {
     let (handle, _commands, _events, _snapshots) = SessionHandle::for_test(SELF_ID);
     assert!(licenses::licenses(&handle).is_none());
     assert!(licenses::owns_package(&handle, 730).is_none());
+}
+
+#[tokio::test]
+async fn licenses_reflects_a_second_push_replacing_the_first() {
+    // CMsgClientLicenseList carries no delta marker (unlike the friends
+    // list's bincremental), so a mid-session re-push is a full replacement:
+    // licenses() must reflect the *latest* push, not the first, the opposite
+    // of the friends post-login snapshot. See
+    // `dispatch_caches_the_license_list_last_wins` in `session::driver`'s own
+    // tests for the mechanism this exercises from the public side.
+    let (handle, _commands, _events, snapshots) = SessionHandle::for_test(SELF_ID);
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_LICENSE_LIST, license_push(730));
+    assert_eq!(
+        licenses::owns_package(&handle, 730),
+        Some(true),
+        "first push answers"
+    );
+
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex")
+        .insert(EMSG_CLIENT_LICENSE_LIST, license_push(17_906));
+
+    let list = licenses::licenses(&handle).expect("second push answers");
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        list[0].package_id, 17_906,
+        "the second push must replace the first"
+    );
 }
 
 // ---- persona --------------------------------------------------------------

@@ -88,13 +88,23 @@ pub struct Confirmation {
 /// distinguished from a transient blip (check again shortly) in any way,
 /// since Steam's response gives no such signal.
 ///
+/// The signature is built from `SystemTime::now()`, the local host clock, and
+/// Steam server-validates the timestamp exactly like a Steam Guard code: a
+/// drifted host produces a signature Steam rejects, and that failure surfaces
+/// here as an opaque `success: false` ([`Error::Remote`]) with no hint that
+/// the clock is the culprit. If confirmations are failing for no obvious
+/// reason, check the host clock against Steam's own with
+/// [`crate::auth::totp::query_server_time_offset`] before suspecting the
+/// `identity_secret`.
+///
 /// # Errors
 ///
 /// [`Error::HmacKey`] if `identity_secret` cannot key an HMAC-SHA1 (in
 /// practice this never happens: HMAC accepts any key length). Any transport
 /// error from [`WebSession::get`]. [`Error::Network`] if the response body
 /// is not the expected JSON shape. [`Error::Remote`] if Steam's response
-/// parses but reports `"success": false`.
+/// parses but reports `"success": false`, which includes a rejected
+/// timestamp from local clock drift; see above.
 pub async fn list(
     web: &WebSession,
     identity_secret: &[u8],
@@ -122,6 +132,12 @@ pub async fn list(
 /// `identity_secret` and `device_id` come from a Steam Desktop Authenticator
 /// maFile; see the [module docs](self) for where to get them.
 ///
+/// Like [`list`], the signature is built from `SystemTime::now()` and
+/// Steam server-validates it; on a drifted host this fails the same opaque
+/// way `success: false` does for an actioned or expired confirmation. See
+/// [`crate::auth::totp::query_server_time_offset`] to rule the clock in or
+/// out before assuming the id/nonce pair or `identity_secret` is wrong.
+///
 /// # Errors
 ///
 /// [`Error::HmacKey`] if `identity_secret` cannot key an HMAC-SHA1 (in
@@ -129,7 +145,8 @@ pub async fn list(
 /// [`WebSession::get`]. [`Error::Network`] if the response body is not the
 /// expected JSON shape. [`Error::Remote`] if Steam's response parses but
 /// reports `"success": false`; this includes the confirmation having
-/// already been actioned, expired, or the id/nonce pair being wrong.
+/// already been actioned, expired, the id/nonce pair being wrong, or local
+/// clock drift rejecting the signature's timestamp.
 pub async fn accept(
     web: &WebSession,
     identity_secret: &[u8],

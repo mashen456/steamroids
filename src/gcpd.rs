@@ -61,8 +61,11 @@ pub async fn request_cs2_cooldown(web: &WebSession) -> Result<Option<Cs2Cooldown
 /// alongside a `Cs2Cooldown` here with `acknowledged == false` is the same
 /// event seen from both sides: "expired, awaiting acknowledgement". If
 /// GCPD reports no cooldown table at all (`request_cs2_cooldown` returning
-/// `Ok(None)`) while the GC still reports a penalty, that penalty is the
-/// permanent case instead, since there is no cooldown left to expire.
+/// `Ok(None)`) while the GC still reports a penalty, reading that penalty as
+/// the permanent case instead is a projection this crate assumes, not a
+/// verified fact: it depends on GCPD keeping no row for a cooldown that
+/// expired but is still awaiting acknowledgement, which has not been
+/// confirmed live.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Cs2Cooldown {
@@ -77,6 +80,15 @@ pub struct Cs2Cooldown {
     /// a GC-reported penalty once this is `true`; see
     /// [`crate::cs2::Cs2Penalty`] for what an unacknowledged expiry looks
     /// like from the GC's side.
+    ///
+    /// A blank cell reads as `false`, the same as an explicit "No": the
+    /// field is `bool`, not `Option<bool>` (unlike [`Self::level`], where a
+    /// blank cell was actually observed live), so a blank has to resolve to
+    /// one or the other. No blank cell has been observed live here, the
+    /// fixture this parser was built against had "No", so this mapping is an
+    /// assumption, not a confirmed one. `false` was chosen as the
+    /// conservative read: misreading a blank as still-pending is safer than
+    /// misreading it as cleared.
     pub acknowledged: bool,
 }
 
@@ -122,6 +134,7 @@ pub fn parse_cooldown(html: &str) -> Result<Option<Cs2Cooldown>> {
         None => None,
     };
 
+    // blank cell -> false, same as "No". not observed live, see field doc.
     let acknowledged =
         cell_value(cells.get(2).copied()).is_some_and(|v| v.eq_ignore_ascii_case("yes"));
 

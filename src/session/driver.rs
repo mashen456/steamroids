@@ -82,26 +82,33 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // One-shot snapshots Steam pushes exactly once after each logon: the full
 // friends list (`k_EMsgClientFriendsList` = 767), friends-groups list (5553),
-// player-nickname list (5587), and the package license list
-// (`k_EMsgClientLicenseList` = 780). The full snapshot always precedes any
-// incremental delta on the same emsg, so the driver caches the **first** body
-// it sees per emsg since the last logon (see [`SnapshotCache`]) — a later delta
-// never overwrites it. This lets [`crate::friends`]'s `request_*` read the
-// snapshot race-free instead of having to subscribe the instant the session
-// comes up, only to find the push already broadcast and gone. The license list
-// fits the same policy for the same reason (a one-shot post-login push, not
-// repeated on change within a session, unlike wallet below), so
-// [`crate::licenses`] reads it the same way.
-const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 4] = [767, 5553, 5587, 780];
+// player-nickname list (5587). `CMsgClientFriendsList` carries `bincremental`
+// (`protos/steam/steammessages_clientserver_friends.proto`), so a later push
+// on 767 can be a delta, and that delta must not clobber the full snapshot:
+// the full snapshot always precedes any incremental delta on the same emsg,
+// so the driver caches the **first** body it sees per emsg since the last
+// logon (see [`SnapshotCache`]); a later delta never overwrites it. This lets
+// [`crate::friends`]'s `request_*` read the snapshot race-free instead of
+// having to subscribe the instant the session comes up, only to find the push
+// already broadcast and gone.
+const POST_LOGIN_SNAPSHOT_EMSGS: [u32; 3] = [767, 5553, 5587];
 
 // Emsgs Steam re-pushes on every change, not just once after logon: the
-// wallet balance (`k_EMsgClientWalletInfoUpdate` = 5528). First-wins would be
-// wrong here: a later push is the current balance, not a stale delta to
-// ignore, so the driver overwrites the cached body every time instead (see
-// [`SnapshotCache`]). Kept as its own list, deliberately never merged into
-// [`POST_LOGIN_SNAPSHOT_EMSGS`], so that list's first-wins policy (load-bearing
-// for the friends snapshot) can never be perturbed by adding an emsg here.
-const LAST_WINS_CACHE_EMSGS: [u32; 1] = [5528];
+// wallet balance (`k_EMsgClientWalletInfoUpdate` = 5528), and the package
+// license list (`k_EMsgClientLicenseList` = 780). First-wins would be wrong
+// for either: a later wallet push is the current balance, not a stale delta
+// to ignore, so the driver overwrites the cached body every time instead (see
+// [`SnapshotCache`]). The license list has no delta marker at all:
+// `CMsgClientLicenseList` is just `eresult` plus `repeated License`
+// (`protos/steam/steammessages_clientserver.proto`), unlike
+// `CMsgClientFriendsList`'s `bincremental` above, so any re-push of 780 can
+// only be a complete replacement, never a delta to protect a first snapshot
+// against; last-wins is therefore safe here regardless of whether Steam ever
+// actually re-pushes it mid-session. Kept as its own list, deliberately never
+// merged into [`POST_LOGIN_SNAPSHOT_EMSGS`], so that list's first-wins policy
+// (load-bearing for the friends snapshot) can never be perturbed by adding an
+// emsg here.
+const LAST_WINS_CACHE_EMSGS: [u32; 2] = [5528, 780];
 
 /// Cache of unsolicited-push bodies for the current logon, keyed by emsg. Two
 /// write policies share the map: [`POST_LOGIN_SNAPSHOT_EMSGS`] are first-wins
@@ -111,8 +118,11 @@ const LAST_WINS_CACHE_EMSGS: [u32; 1] = [5528];
 /// single reader oblivious to which policy filled a given entry: the emsg
 /// alone decides. Shared between the driver (the only writer) and every
 /// [`SessionHandle`] (readers); cleared on every (re)logon because Steam
-/// re-pushes both kinds. Critical sections are a single map op, never held
-/// across an `.await`, so a blocking `std::sync::Mutex` is the right fit.
+/// re-pushes both kinds, and cleared again with nothing to repopulate it once
+/// the session ends for good (see [`clear_snapshots`]), so a dead session
+/// can't keep answering with pre-death data. Critical sections are a single
+/// map op, never held across an `.await`, so a blocking `std::sync::Mutex` is
+/// the right fit.
 type SnapshotCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
 
 /// Raw Game Coordinator `SharedObject` blobs from a GC's most recent
@@ -418,17 +428,19 @@ impl SessionHandle {
     ///
     /// Two kinds of emsg are cached, with different overwrite policies: the
     /// post-login snapshots (full friends list, friends-groups list,
-    /// player-nickname list, license list) are first-wins, so a later
-    /// incremental delta on the same emsg never overwrites the full snapshot
-    /// already cached; wallet-balance updates are last-wins, so a later push
-    /// always replaces the previous balance. Any other emsg is never cached,
-    /// so this returns `None` for it even after a matching push reached
-    /// [`Self::subscribe`].
+    /// player-nickname list) are first-wins, so a later incremental delta on
+    /// the same emsg never overwrites the full snapshot already cached;
+    /// wallet-balance updates and the package license list are last-wins, so
+    /// a later push always replaces the previous body. Any other emsg is
+    /// never cached, so this returns `None` for it even after a matching
+    /// push reached [`Self::subscribe`].
     ///
     /// For a first-wins emsg, to stay race-free **subscribe first, then read
     /// the cache**: any snapshot not yet cached is still guaranteed to reach
     /// the subscription. The cache is cleared and repopulated on every
-    /// reconnect.
+    /// reconnect, and cleared (with nothing left to repopulate it) once the
+    /// session ends for good, so this can't keep answering with data from
+    /// before the session died.
     pub fn cached_snapshot(&self, emsg: u32) -> Option<Vec<u8>> {
         self.snapshots
             .lock()
@@ -730,10 +742,7 @@ impl SessionDriver {
                             info!(steam_id = self.steam_id, "session reconnected");
                             // Steam re-pushes the post-login snapshots on the new
                             // logon; drop the stale ones so the cache repopulates.
-                            self.snapshots
-                                .lock()
-                                .expect("snapshot cache mutex poisoned")
-                                .clear();
+                            clear_snapshots(&self.snapshots);
                             let _ = self.state.send(SessionState::LoggedOn {
                                 steam_id: self.steam_id,
                             });
@@ -749,6 +758,11 @@ impl SessionDriver {
         // error would otherwise hold them until `self` drops, well past their
         // deadline.
         fail_all_pending(&mut self.pending, "session driver stopped");
+        // Session is done for good: a lingering snapshot would claim freshness
+        // it no longer has (same reasoning as the GC pump's exit cleanup, see
+        // crate::gc::coordinator's pump). The Disconnected/reconnect path
+        // clears and repopulates above; this path clears and stays empty.
+        clear_snapshots(&self.snapshots);
         // Graceful socket teardown (sends a WebSocket Close frame), then publish
         // the terminal state. Bounded: a half-open exit can hang the flush, and
         // that would strand the JoinHandle and the state watchers behind it.
@@ -918,6 +932,18 @@ fn fail_all_pending(pending: &mut HashMap<u64, Pending>, reason: &'static str) {
     }
 }
 
+/// Empty the snapshot cache. Called both when a reconnect lands (the fresh
+/// logon re-pushes everything, so the cache repopulates) and when the
+/// session ends for good (nothing repopulates it, so callers of
+/// [`SessionHandle::cached_snapshot`] correctly see `None` again instead of
+/// a stale pre-death body).
+fn clear_snapshots(snapshots: &SnapshotCache) {
+    snapshots
+        .lock()
+        .expect("snapshot cache mutex poisoned")
+        .clear();
+}
+
 /// Inbound-silence budget for a session heartbeating at `heartbeat`, which is
 /// also the WebSocket Ping probe interval.
 fn idle_timeout(heartbeat: Duration) -> Duration {
@@ -1050,8 +1076,9 @@ fn dispatch(
             .entry(msg.emsg)
             .or_insert_with(|| msg.body.clone());
     }
-    // Wallet balance changes repeatedly, so cache the latest body seen instead
-    // (last-wins), the opposite policy from the post-login snapshots above.
+    // Wallet balance and the license list can each change mid-session, so
+    // cache the latest body seen instead (last-wins), the opposite policy
+    // from the post-login snapshots above.
     if LAST_WINS_CACHE_EMSGS.contains(&msg.emsg) {
         snapshots
             .lock()
@@ -1228,15 +1255,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_caches_the_license_list_first_wins() {
-        // The license list (780) joined POST_LOGIN_SNAPSHOT_EMSGS as a
-        // one-shot post-login push, same policy as the friends snapshot above,
-        // not LAST_WINS_CACHE_EMSGS, which is wallet's policy.
+    async fn dispatch_caches_the_license_list_last_wins() {
+        // The license list (780) is LAST_WINS_CACHE_EMSGS, same policy as
+        // wallet: CMsgClientLicenseList carries no delta marker, so any
+        // re-push is a full replacement, not a delta that a first-wins
+        // policy would need to protect against.
         let mut pending: HashMap<u64, Pending> = HashMap::new();
         let (events, _keep) = broadcast::channel(8);
         let snapshots = empty_snapshots();
-        let license_list = 780;
-        assert!(POST_LOGIN_SNAPSHOT_EMSGS.contains(&license_list));
+        let license_list = LAST_WINS_CACHE_EMSGS[1];
+        assert!(!POST_LOGIN_SNAPSHOT_EMSGS.contains(&license_list));
 
         dispatch(
             &mut pending,
@@ -1252,7 +1280,7 @@ mod tests {
         );
 
         let cached = snapshots.lock().unwrap().get(&license_list).cloned();
-        assert_eq!(cached, Some(vec![1]), "first license list body wins");
+        assert_eq!(cached, Some(vec![2]), "latest license list body wins");
     }
 
     #[tokio::test]
@@ -1450,6 +1478,26 @@ mod tests {
             Err(Error::WebSocket(text)) => assert!(text.contains("driver stopped"), "{text}"),
             _ => panic!("expected a WebSocket error"),
         }
+    }
+
+    #[test]
+    fn clear_snapshots_empties_the_cache() {
+        // Exercised on both the reconnect path (repopulates after) and the
+        // terminal-exit path (nothing repopulates it, see run()), so a dead
+        // session can't keep answering cached_snapshot with pre-death data.
+        let snapshots = empty_snapshots();
+        snapshots
+            .lock()
+            .unwrap()
+            .insert(POST_LOGIN_SNAPSHOT_EMSGS[0], vec![1, 2, 3]);
+        snapshots
+            .lock()
+            .unwrap()
+            .insert(LAST_WINS_CACHE_EMSGS[0], vec![4, 5]);
+
+        clear_snapshots(&snapshots);
+
+        assert!(snapshots.lock().unwrap().is_empty());
     }
 
     #[test]
