@@ -26,7 +26,11 @@
 //!
 //! The issued refresh token is `SteamClient`-platform, same as the password
 //! flow, so it can be handed straight to `spawn_session` (see example 11) or
-//! persisted and reused via example 05.
+//! persisted and reused via example 05. Unlike the password flow, though, this
+//! example never types an account name anywhere: `spawn_session` still needs
+//! one (`SessionConfig::account_name`), so it has to come from Steam itself,
+//! via `SignInOutcome::Success::account_name` on the poll response. Persist
+//! that alongside the refresh token, not just the token on its own.
 //!
 //! `SignIn::with_qr` does not implement challenge-URL rotation; see the
 //! `steamroids::auth::signin` module docs for that limitation.
@@ -102,15 +106,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             steam_id,
             refresh_token,
             access_token,
+            account_name,
+            ..
         }) => {
             println!("logged in");
             println!("  steam_id      : {steam_id}");
+            println!(
+                "  account_name  : {}",
+                account_name.as_deref().unwrap_or("<none>")
+            );
             println!("  refresh_token : {}", refresh_token.expose());
             if let Some(at) = access_token {
                 println!("  access_token  : {at}");
             }
             println!();
-            println!("Persist refresh_token to reuse via example 05 (no QR scan next time).");
+            if let Some(name) = &account_name {
+                println!("account_name + refresh_token are what spawn_session needs:");
+                println!();
+                println!("  spawn_session(SessionConfig {{");
+                println!("      account_name: \"{name}\".into(),");
+                println!("      refresh_token: /* the token above */,");
+                println!("      proxy: None,");
+                println!("  }})");
+                println!();
+                println!("Persist both to reuse via example 05 (no QR scan next time).");
+            } else {
+                // Steam can omit this field; without it there is no
+                // account_name to build a SessionConfig from at all, and
+                // spawn_session now rejects an empty one outright rather
+                // than letting the CM fail it with a misleading eresult 5.
+                eprintln!(
+                    "Steam's poll response carried no account_name; spawn_session needs one."
+                );
+                eprintln!("Run again, or fall back to a password sign-in (example 04).");
+            }
         }
         Ok(SignInOutcome::RateLimited { retry_hint }) => {
             eprintln!("rate-limited by Steam (retry after {retry_hint:?})");

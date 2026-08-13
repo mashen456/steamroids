@@ -613,11 +613,23 @@ fn check_reply_eresult(msg: &SteamMessage) -> Result<()> {
 ///
 /// # Errors
 ///
+/// [`Error::InvalidConfig`] if `config.account_name` is empty: a CM logon
+/// with an empty account name doesn't fail loudly, it comes back as
+/// `eresult 5` ("invalid password"), which sends callers chasing the wrong
+/// bug. Caught here instead of leaving that trap for the CM to spring.
 /// [`Error::AuthRejected`] if the token is rejected, otherwise the last connect
 /// error after several attempts (each rediscovering through a fresh proxy exit).
 pub async fn spawn_session(
     config: SessionConfig,
 ) -> Result<(SessionHandle, JoinHandle<Result<()>>)> {
+    if config.account_name.is_empty() {
+        return Err(Error::InvalidConfig(
+            "SessionConfig::account_name is empty: a CM logon would fail with eresult 5 \
+             (invalid password); if you signed in over QR, use the account_name Steam \
+             returned from SignInOutcome::Success"
+                .into(),
+        ));
+    }
     let (conn, logged) = establish_resilient(&config).await?;
 
     let steam_id = logged.steam_id;
@@ -1737,5 +1749,27 @@ mod tests {
 
         let resp = task.await.expect("task").expect("call_service");
         assert_eq!(resp.steamid, Some(99));
+    }
+
+    #[tokio::test]
+    async fn spawn_session_rejects_an_empty_account_name() {
+        // An empty account_name reaches the CM as a logon that fails with
+        // eresult 5 ("invalid password"), which is a misleading error for
+        // what is actually a missing/omitted field (e.g. a QR sign-in whose
+        // account_name never got carried into SessionConfig). Caught here,
+        // before any connect attempt, so it never depends on network access.
+        // Manual match instead of unwrap_err(): SessionHandle carries no
+        // Debug impl, and unwrap_err() needs one for the Ok side.
+        match spawn_session(SessionConfig {
+            account_name: String::new(),
+            refresh_token: RefreshToken::new("irrelevant"),
+            proxy: None,
+        })
+        .await
+        {
+            Err(Error::InvalidConfig(_)) => {}
+            Err(other) => panic!("expected InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected InvalidConfig, got Ok"),
+        }
     }
 }

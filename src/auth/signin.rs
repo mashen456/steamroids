@@ -88,8 +88,10 @@
 //! let qr = SignIn::with_qr().begin().await?;
 //! println!("scan with the Steam mobile app: {}", qr.challenge_url());
 //!
-//! if let SignInOutcome::Success { steam_id, .. } = qr.poll().await? {
-//!     println!("logged in as {steam_id}");
+//! if let SignInOutcome::Success { steam_id, account_name, .. } = qr.poll().await? {
+//!     // account_name + refresh_token are what SessionConfig needs; the QR
+//!     // flow never asked the human to type a username anywhere else.
+//!     println!("logged in as {steam_id} (account name: {account_name:?})");
 //! }
 //! # Ok(()) }
 //! ```
@@ -158,6 +160,15 @@ const POLL_BUDGET: Duration = Duration::from_secs(120);
 #[non_exhaustive]
 pub enum SignInOutcome {
     /// Steam accepted the credentials and issued tokens.
+    ///
+    /// This variant is itself `#[non_exhaustive]`: destructure it with `..`.
+    /// [`Self::Success::account_name`] was added after the initial release
+    /// without that marker it would have been a breaking change for every
+    /// exhaustive match; with it, adding a future field to `Success` stays
+    /// non-breaking too. The cost lands only on callers who already
+    /// destructure every field by name (they must add `..`), which every
+    /// in-tree call site now does.
+    #[non_exhaustive]
     Success {
         /// 64-bit Steam ID of the authenticated account.
         steam_id: u64,
@@ -167,6 +178,18 @@ pub enum SignInOutcome {
         /// Short-lived access token, when Steam returns one. Used for
         /// `WebAPI` calls; absent if only `ClientLogon` was performed.
         access_token: Option<String>,
+        /// Account name Steam attaches to the session, straight from
+        /// `PollAuthSessionStatus`'s `account_name` field.
+        ///
+        /// This is the piece the QR flow never asks the caller for: build a
+        /// [`SessionConfig`](crate::session::SessionConfig) from this plus
+        /// `refresh_token`. Populated from what Steam actually reports, not
+        /// echoed back from a password-flow caller's own input, so it always
+        /// matches what the CM will expect on [`spawn_session`](crate::session::spawn_session).
+        /// `None` when Steam's response omits the field (rather than an
+        /// empty string, which is exactly the value that makes a CM logon
+        /// fail with `eresult 5`).
+        account_name: Option<String>,
     },
     /// 2FA required and no `shared_secret` was supplied. Caller must add one
     /// (mobile authenticator) or fall back to email-Guard handling.
@@ -208,12 +231,14 @@ impl fmt::Debug for SignInOutcome {
             Self::Success {
                 steam_id,
                 access_token,
+                account_name,
                 // `refresh_token`'s own Debug is already redacted, but we don't
                 // even reach for it here — redact uniformly.
                 refresh_token: _,
             } => f
                 .debug_struct("Success")
                 .field("steam_id", steam_id)
+                .field("account_name", account_name)
                 .field("refresh_token", &"<redacted>")
                 .field("access_token", &access_token.as_ref().map(|_| "<redacted>"))
                 .finish(),
@@ -434,6 +459,7 @@ impl SignIn {
                     steam_id,
                     refresh_token,
                     access_token,
+                    account_name,
                 } => {
                     store
                         .save(&account, refresh_token.expose())
@@ -443,6 +469,7 @@ impl SignIn {
                         steam_id,
                         refresh_token,
                         access_token,
+                        account_name,
                     });
                 }
                 // Stored token is no good — fall through to the password flow.
@@ -529,6 +556,9 @@ impl SignIn {
             steam_id: claims.steam_id,
             refresh_token: token.clone(),
             access_token: None,
+            // The JWT carries no account name, and there's no poll response
+            // to read one from in this flow: Steam never told us.
+            account_name: None,
         })
     }
 }
@@ -935,18 +965,36 @@ async fn poll_for_token(client: &WebApiClient, begin: &BeginSession) -> Result<S
             resp.new_client_id,
         ));
 
-        if let Some(rt) = resp.refresh_token.filter(|s| !s.is_empty()) {
-            let steam_id = steam_id_from_refresh_token(&rt).unwrap_or(begin.session_steamid);
-            let access_token = resp.access_token.filter(|s| !s.is_empty());
-            return Ok(SignInOutcome::Success {
-                steam_id,
-                refresh_token: RefreshToken::new(rt),
-                access_token,
-            });
+        if let Some(outcome) = success_from_poll_response(&resp, begin.session_steamid) {
+            return Ok(outcome);
         }
     }
 
     Err(Error::Timeout("auth poll exceeded 120s"))
+}
+
+/// Build a [`SignInOutcome::Success`] from a poll response that carries a
+/// refresh token, or `None` if it doesn't (poll again).
+///
+/// Split out from [`poll_for_token`] so the field mapping, in particular
+/// `account_name` (the QR flow depends on it since it never asks the caller
+/// for one), is testable without a live `WebApiClient`.
+fn success_from_poll_response(
+    resp: &CAuthenticationPollAuthSessionStatusResponse,
+    session_steamid: u64,
+) -> Option<SignInOutcome> {
+    let rt = resp.refresh_token.clone().filter(|s| !s.is_empty())?;
+    let steam_id = steam_id_from_refresh_token(&rt).unwrap_or(session_steamid);
+    let access_token = resp.access_token.clone().filter(|s| !s.is_empty());
+    // Steam's own report of the account name, not an echo of whatever the
+    // caller supplied (the QR flow has no such input to echo).
+    let account_name = resp.account_name.clone().filter(|s| !s.is_empty());
+    Some(SignInOutcome::Success {
+        steam_id,
+        refresh_token: RefreshToken::new(rt),
+        access_token,
+        account_name,
+    })
 }
 
 /// Apply Steam's `new_client_id` rotation hint, keeping `current` when the
@@ -1036,10 +1084,15 @@ mod tests {
                 steam_id,
                 refresh_token,
                 access_token,
+                account_name,
             } => {
                 assert_eq!(steam_id, 76_561_198_000_000_001);
                 assert_eq!(refresh_token.expose(), jwt, "token handed back unchanged");
                 assert!(access_token.is_none(), "no web access token is minted");
+                assert!(
+                    account_name.is_none(),
+                    "the refresh-token flow has no account name to report"
+                );
             }
             other => panic!("expected Success, got {other:?}"),
         }
@@ -1086,6 +1139,7 @@ mod tests {
             steam_id: 76_561_198_000_000_001,
             refresh_token: RefreshToken::new("secret-refresh-jwt"),
             access_token: Some("secret-access-jwt".into()),
+            account_name: Some("bot01".into()),
         };
         let dbg = format!("{outcome:?}");
         assert!(
@@ -1096,8 +1150,10 @@ mod tests {
             !dbg.contains("secret-access-jwt"),
             "access token leaked: {dbg}"
         );
-        // Non-secret context (the SteamID) and token presence stay visible.
+        // Non-secret context (the SteamID, account name) and token presence
+        // stay visible.
         assert!(dbg.contains("76561198000000001"));
+        assert!(dbg.contains("bot01"));
         assert!(dbg.contains("redacted"));
     }
 
@@ -1258,5 +1314,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::AuthRejected(_)));
+    }
+
+    #[test]
+    fn poll_response_without_refresh_token_yields_no_success() {
+        // The common case mid-poll: Steam has nothing new to report yet.
+        let resp = CAuthenticationPollAuthSessionStatusResponse::default();
+        assert!(success_from_poll_response(&resp, 123).is_none());
+    }
+
+    #[test]
+    fn poll_response_empty_refresh_token_is_treated_as_absent() {
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(success_from_poll_response(&resp, 123).is_none());
+    }
+
+    #[test]
+    fn poll_response_populates_account_name_from_steam() {
+        // The bug this fixes: the QR flow has no account name to echo back,
+        // so it has to come from Steam's own poll response.
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some("opaque-token".into()),
+            account_name: Some("bot01".into()),
+            ..Default::default()
+        };
+        let outcome = success_from_poll_response(&resp, 76_561_198_000_000_001).unwrap();
+        match outcome {
+            SignInOutcome::Success {
+                steam_id,
+                account_name,
+                ..
+            } => {
+                // "opaque-token" isn't a JWT, so the steamid falls back to
+                // the one BeginAuthSession reported.
+                assert_eq!(steam_id, 76_561_198_000_000_001);
+                assert_eq!(account_name.as_deref(), Some("bot01"));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_response_missing_account_name_stays_none() {
+        // Steam may simply omit the field. Must not default to Some(""),
+        // which is exactly the value a CM logon rejects with eresult 5.
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some("opaque-token".into()),
+            account_name: None,
+            ..Default::default()
+        };
+        let outcome = success_from_poll_response(&resp, 1).unwrap();
+        match outcome {
+            SignInOutcome::Success { account_name, .. } => assert!(account_name.is_none()),
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_response_empty_account_name_string_is_treated_as_none() {
+        let resp = CAuthenticationPollAuthSessionStatusResponse {
+            refresh_token: Some("opaque-token".into()),
+            account_name: Some(String::new()),
+            ..Default::default()
+        };
+        let outcome = success_from_poll_response(&resp, 1).unwrap();
+        match outcome {
+            SignInOutcome::Success { account_name, .. } => assert!(account_name.is_none()),
+            other => panic!("expected Success, got {other:?}"),
+        }
     }
 }
