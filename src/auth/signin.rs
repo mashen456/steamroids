@@ -1,14 +1,17 @@
 //! High-level sign-in entry point.
 //!
 //! This is the public face of the auth flow — most consumers should not need
-//! to touch `transport::*` or `proto::*` directly. Two modes:
+//! to touch `transport::*` or `proto::*` directly. Three modes:
 //!
 //! 1. **Password (+ optional Steam mobile 2FA shared secret).** First-time
 //!    login or whenever the refresh token is missing / expired.
 //! 2. **Refresh token.** Reuses a token previously returned by mode 1, skips
 //!    the 2FA round-trip.
+//! 3. **QR code.** No password needed at all: a human scans a URL with the
+//!    Steam mobile app. Two-phase, since there's a human in the loop; see
+//!    [`SignIn::with_qr`].
 //!
-//! Both modes accept an optional [`ProxyConfig`].
+//! All three modes accept an optional [`ProxyConfig`].
 //!
 //! # How it works
 //!
@@ -21,6 +24,20 @@
 //! - **Refresh-token flow:** decode and validate the token's JWT (`SteamID`,
 //!   expiry) locally and hand it back for a CM `ClientLogon`. `SteamClient`
 //!   tokens can't be redeemed over the `WebAPI`, so no access token is minted.
+//! - **QR flow:** `BeginAuthSessionViaQR` returns a `challenge_url` to display
+//!   → poll `PollAuthSessionStatus` (same poll loop as the password flow)
+//!   until a human approves it in the app.
+//!
+//! # Limitation: `QrSession::challenge_url` does not rotate
+//!
+//! Steam's QR response carries a `version` field and `PollAuthSessionStatus`
+//! can hand back a `new_challenge_url` mid-session: the URL a caller
+//! displayed can go stale before it's scanned. This version does not track
+//! either: [`QrSession::challenge_url`] returns the one URL from the initial
+//! `BeginAuthSessionViaQR` response for the whole session. If Steam rotates
+//! it before a human scans, the poll just runs out its budget and returns
+//! [`Error::Timeout`] instead of surfacing the new URL. Not implemented here;
+//! a future version may plumb it through.
 //!
 //! # Limitation: the refresh-token flow is offline-only
 //!
@@ -61,6 +78,21 @@
 //! }
 //! # Ok(()) }
 //! ```
+//!
+//! QR sign-in, two phases:
+//!
+//! ```no_run
+//! use steamroids::auth::{SignIn, SignInOutcome};
+//!
+//! # async fn run() -> steamroids::Result<()> {
+//! let qr = SignIn::with_qr().begin().await?;
+//! println!("scan with the Steam mobile app: {}", qr.challenge_url());
+//!
+//! if let SignInOutcome::Success { steam_id, .. } = qr.poll().await? {
+//!     println!("logged in as {steam_id}");
+//! }
+//! # Ok(()) }
+//! ```
 
 use std::fmt;
 use std::sync::Arc;
@@ -76,9 +108,11 @@ use crate::auth::webapi::{map_non_ok_eresult, EResult, HttpMethod, WebApiClient}
 use crate::auth::{Credentials, RefreshToken};
 use crate::proto::{
     CAuthenticationBeginAuthSessionViaCredentialsRequest,
-    CAuthenticationBeginAuthSessionViaCredentialsResponse, CAuthenticationDeviceDetails,
-    CAuthenticationGetPasswordRsaPublicKeyRequest, CAuthenticationGetPasswordRsaPublicKeyResponse,
-    CAuthenticationPollAuthSessionStatusRequest, CAuthenticationPollAuthSessionStatusResponse,
+    CAuthenticationBeginAuthSessionViaCredentialsResponse,
+    CAuthenticationBeginAuthSessionViaQrRequest, CAuthenticationBeginAuthSessionViaQrResponse,
+    CAuthenticationDeviceDetails, CAuthenticationGetPasswordRsaPublicKeyRequest,
+    CAuthenticationGetPasswordRsaPublicKeyResponse, CAuthenticationPollAuthSessionStatusRequest,
+    CAuthenticationPollAuthSessionStatusResponse,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeRequest,
     CAuthenticationUpdateAuthSessionWithSteamGuardCodeResponse,
 };
@@ -252,6 +286,23 @@ impl SignIn {
     pub fn with_refresh_token(token: impl Into<String>) -> Self {
         Self {
             credentials: Credentials::refresh_token(token),
+            proxy: None,
+            rate_limiter: None,
+        }
+    }
+
+    /// Start a QR-code sign-in. No password, no shared secret; a human
+    /// scans a URL with the Steam mobile app and approves the login there.
+    ///
+    /// Returns a separate builder, [`QrSignIn`], rather than `Self`: unlike
+    /// [`Self::with_password`] / [`Self::with_refresh_token`], this flow can't
+    /// be driven to completion in one `execute()` call. There's a human step
+    /// in between opening the session and knowing the outcome, so it's two
+    /// calls: [`QrSignIn::begin`] to fetch the URL to display, then
+    /// [`QrSession::poll`] to await the human. See the [module docs](self)
+    /// for a full example.
+    pub fn with_qr() -> QrSignIn {
+        QrSignIn {
             proxy: None,
             rate_limiter: None,
         }
@@ -479,6 +530,172 @@ impl SignIn {
             refresh_token: token.clone(),
             access_token: None,
         })
+    }
+}
+
+/// Builder for a QR-code sign-in.
+///
+/// Construct via [`SignIn::with_qr`], add optional config, then call
+/// [`Self::begin`] to open the session and get the URL to display.
+///
+/// `Debug` is implemented by hand to match [`SignIn`]'s style: `rate_limiter`
+/// is shown only as a presence marker, since [`RateLimiter`] itself has no
+/// `Debug` impl.
+#[derive(Clone)]
+#[must_use = "QrSignIn does nothing until .begin() is awaited"]
+pub struct QrSignIn {
+    proxy: Option<ProxyConfig>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+}
+
+impl fmt::Debug for QrSignIn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QrSignIn")
+            .field("proxy", &self.proxy)
+            .field("rate_limiter", &self.rate_limiter.is_some())
+            .finish()
+    }
+}
+
+impl QrSignIn {
+    /// Route `BeginAuthSessionViaQR` and the subsequent poll through a SOCKS5
+    /// or HTTP-CONNECT proxy. See [`SignIn::proxy`].
+    pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
+
+    /// Pace this sign-in's `WebAPI` requests through a shared limiter. See
+    /// [`SignIn::rate_limiter`]; the same 120s poll budget applies here.
+    pub fn rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
+        self
+    }
+
+    /// Open the QR auth session: calls `BeginAuthSessionViaQR` and returns
+    /// the [`QrSession`] holding the challenge URL to display. Call
+    /// [`QrSession::poll`] afterwards to wait for the human.
+    ///
+    /// # Errors
+    ///
+    /// - Transport / proxy errors propagate as-is.
+    /// - A rate-limited or throttled response comes back as
+    ///   [`Error::AuthRateLimited`].
+    /// - Any other non-OK `EResult`, or a response missing a field this flow
+    ///   needs, comes back as [`Error::AuthRejected`].
+    pub async fn begin(self) -> Result<QrSession> {
+        let client = WebApiClient::new(self.proxy.as_ref(), self.rate_limiter.clone())?;
+
+        let req = CAuthenticationBeginAuthSessionViaQrRequest {
+            device_friendly_name: Some("steamroids".into()),
+            platform_type: Some(PLATFORM_STEAM_CLIENT),
+            device_details: Some(CAuthenticationDeviceDetails {
+                device_friendly_name: Some("steamroids".into()),
+                platform_type: Some(PLATFORM_STEAM_CLIENT),
+                os_type: Some(OS_TYPE_WINDOWS_10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (er, resp): (_, CAuthenticationBeginAuthSessionViaQrResponse) = client
+            .call("BeginAuthSessionViaQR", HttpMethod::Post, &req)
+            .await?;
+        if er != EResult::OK {
+            // qr begin has no credentials to reject, so throttle is the only
+            // outcome worth naming; anything else is just an error.
+            if er == EResult::RATE_LIMIT_EXCEEDED || er == EResult::ACCOUNT_LOGIN_DENIED_THROTTLE {
+                return Err(Error::AuthRateLimited(format!(
+                    "BeginAuthSessionViaQR eresult {}",
+                    er.0
+                )));
+            }
+            return Err(Error::AuthRejected(format!(
+                "BeginAuthSessionViaQR eresult {}",
+                er.0
+            )));
+        }
+
+        let client_id = resp.client_id.ok_or_else(|| {
+            Error::AuthRejected("BeginAuthSessionViaQR response: missing client_id".into())
+        })?;
+        let challenge_url = resp.challenge_url.ok_or_else(|| {
+            Error::AuthRejected("BeginAuthSessionViaQR response: missing challenge_url".into())
+        })?;
+        let request_id = resp.request_id.ok_or_else(|| {
+            Error::AuthRejected("BeginAuthSessionViaQR response: missing request_id".into())
+        })?;
+        let poll_interval = compute_poll_interval(resp.interval);
+
+        debug!(
+            target: "steamroids::auth::signin",
+            client_id,
+            "BeginAuthSessionViaQR accepted"
+        );
+
+        Ok(QrSession {
+            client,
+            challenge_url,
+            begin: BeginSession {
+                client_id,
+                request_id,
+                // qr response carries no steamid; poll_for_token only falls
+                // back to this if the refresh-token JWT itself won't decode.
+                session_steamid: 0,
+                poll_interval,
+                guards: Vec::new(),
+                email_domain_hint: None,
+            },
+        })
+    }
+}
+
+/// An opened QR sign-in session: the URL to display and the pending poll for
+/// a human to approve it in the Steam mobile app.
+///
+/// Obtained from [`QrSignIn::begin`]. Display [`Self::challenge_url`] first,
+/// then call [`Self::poll`]; the URL does not rotate for the lifetime of
+/// this session, see the [module docs](self#limitation-qrsessionchallenge_url-does-not-rotate).
+pub struct QrSession {
+    client: WebApiClient,
+    begin: BeginSession,
+    challenge_url: String,
+}
+
+impl fmt::Debug for QrSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QrSession")
+            .field("challenge_url", &self.challenge_url)
+            .field("client_id", &self.begin.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QrSession {
+    /// The URL to render as a QR code (or hand to the user directly, the
+    /// Steam mobile app also accepts it pasted into a browser).
+    ///
+    /// This crate does not render QR codes itself: encode/display the URL
+    /// however fits the caller (a terminal QR renderer, a web page, …).
+    pub fn challenge_url(&self) -> &str {
+        &self.challenge_url
+    }
+
+    /// Block until the session is approved, declined, or times out.
+    ///
+    /// Polls `PollAuthSessionStatus` at Steam's suggested interval (falling
+    /// back sensibly if it's absent or zero; see [`SignIn::rate_limiter`]'s
+    /// docs on the shared 120s wall-clock budget), the same loop the password
+    /// flow uses. Display [`Self::challenge_url`] *before* calling this: a
+    /// human has to scan it while this call is blocked waiting.
+    ///
+    /// # Errors
+    ///
+    /// - An unexpected non-OK `EResult` mid-poll comes back as
+    ///   [`Error::AuthRejected`].
+    /// - Nobody scanning (or the session otherwise never resolving) within
+    ///   the poll budget comes back as [`Error::Timeout`].
+    pub async fn poll(self) -> Result<SignInOutcome> {
+        poll_for_token(&self.client, &self.begin).await
     }
 }
 
@@ -778,6 +995,16 @@ mod tests {
         assert!(matches!(s.credentials, Credentials::RefreshToken(_)));
     }
 
+    #[test]
+    fn qr_builder_round_trips_config() {
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(1)));
+        let qr = SignIn::with_qr()
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .rate_limiter(Arc::clone(&limiter));
+        assert!(qr.proxy.is_some());
+        assert!(qr.rate_limiter.is_some());
+    }
+
     #[tokio::test]
     async fn refresh_token_with_malformed_jwt_errors_immediately() {
         // The refresh-token flow validates the JWT shape before doing any
@@ -981,6 +1208,34 @@ mod tests {
             .execute()
             .await;
         assert!(start.elapsed() < Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn qr_begin_fails_over_a_dead_proxy() {
+        // proves begin() actually dispatches BeginAuthSessionViaQR over the
+        // configured transport, same shape as the password flow's proxy test.
+        let err = SignIn::with_qr()
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .begin()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Network(_)), "got {err:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn qr_begin_waits_on_an_attached_rate_limiter() {
+        // same reasoning as execute_waits_on_an_attached_rate_limiter, for
+        // the qr begin() path.
+        let limiter = Arc::new(RateLimiter::with_interval(Duration::from_secs(45)));
+        limiter.acquire().await;
+
+        let start = Instant::now();
+        let _ = SignIn::with_qr()
+            .proxy(ProxyConfig::parse("socks5://127.0.0.1:1").unwrap())
+            .rate_limiter(Arc::clone(&limiter))
+            .begin()
+            .await;
+        assert!(start.elapsed() >= Duration::from_secs(45));
     }
 
     #[test]

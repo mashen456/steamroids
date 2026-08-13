@@ -7,8 +7,9 @@
 //!
 //! The full client stack is now in-tree:
 //!
-//! - **Auth** — log an account in (password + mobile 2FA, or a stored refresh
-//!   token) and obtain access / refresh tokens via [`auth::SignIn`].
+//! - **Auth**: log an account in (password + mobile 2FA, a stored refresh
+//!   token, or a scanned QR code) and obtain access / refresh tokens via
+//!   [`auth::SignIn`].
 //! - **CM session** — [`session::spawn_session`] holds a live, self-healing
 //!   Connection Manager session over WSS (`ClientLogon`, heartbeat, reconnect,
 //!   job-id-multiplexed `request` / `notify` / `subscribe`).
