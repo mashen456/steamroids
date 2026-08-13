@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! PROXY_URL=socks5://user:pass@host:1080 \      # optional
+//! QR_INVERT=1                            \      # optional, see below
 //!     cargo run --example 12_signin_qr
 //! ```
 //!
@@ -10,6 +11,18 @@
 //! URL, then `PollAuthSessionStatus` blocks (same poll loop the password flow
 //! uses, bounded to a 120s wall-clock budget) until the phone approves it,
 //! declines it, or the budget runs out.
+//!
+//! The challenge URL is rendered as a scannable QR code right in the
+//! terminal, using Unicode half-block characters (the `qrcode` crate, a
+//! dev-dependency of this example only, never a dependency of the library
+//! itself). The raw URL is printed underneath as a fallback in case the
+//! block-character rendering does not come through cleanly.
+//!
+//! Terminal QR codes need dark modules on a light background to scan
+//! reliably, but this example cannot detect whether the terminal it is
+//! running in has a dark or light theme, so it guesses dark-background (the
+//! common case) and swaps the block/blank mapping accordingly. If the code
+//! will not scan, set `QR_INVERT=1` and run again to flip it.
 //!
 //! The issued refresh token is `SteamClient`-platform, same as the password
 //! flow, so it can be handed straight to `spawn_session` (see example 11) or
@@ -20,9 +33,43 @@
 
 use std::env;
 
+use qrcode::render::unicode::Dense1x2;
+use qrcode::QrCode;
 use steamroids::auth::{SignIn, SignInOutcome};
 use steamroids::transport::proxy::ProxyConfig;
 use steamroids::Error;
+
+// terminals are usually dark bg, light fg. the renderer's own default paints
+// dark modules as filled blocks (fg color, i.e. light) and light modules as
+// blank (bg color, i.e. dark) -- backwards. swap so dark modules blank out
+// to the dark terminal bg and light modules show as fg-colored blocks.
+// QR_INVERT=1 flips back to the crate's raw default, for light-bg terminals.
+fn print_qr(url: &str) {
+    let invert = env::var("QR_INVERT").is_ok_and(|v| v == "1");
+    let (dark, light) = if invert {
+        (Dense1x2::Dark, Dense1x2::Light)
+    } else {
+        (Dense1x2::Light, Dense1x2::Dark)
+    };
+
+    match QrCode::new(url.as_bytes()) {
+        Ok(code) => {
+            let rendered = code
+                .render::<Dense1x2>()
+                .quiet_zone(true)
+                .dark_color(dark)
+                .light_color(light)
+                .build();
+            println!("{rendered}");
+            println!("If that does not scan, set QR_INVERT=1 and run again.");
+        }
+        Err(e) => eprintln!("could not render a qr code for the url: {e}"),
+    }
+    println!();
+    println!("Or paste this URL into a browser on the phone:");
+    println!();
+    println!("  {url}");
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,9 +91,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let session = qr.begin().await?;
     println!("Open the Steam mobile app, tap the QR icon on the sign-in screen,");
-    println!("and scan this URL (or paste it into a browser on the phone):");
+    println!("and scan the code below.");
     println!();
-    println!("  {}", session.challenge_url());
+    print_qr(session.challenge_url());
     println!();
     println!("Waiting for approval (up to 120s)...");
 
