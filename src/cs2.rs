@@ -245,28 +245,45 @@ const DURATION_VS_TIMESTAMP_THRESHOLD_SECS: u32 = 10 * 365 * 24 * 3600;
 const NEAR_U32_MAX_PERMANENT_SECS: u32 = u32::MAX - 65_536;
 
 /// Penalty reason codes observed to mean "in effect with no countdown,
-/// ever" rather than "a cooldown that ran out": outright permanent
-/// convictions (8, 10, 14) and VAC-Live convictions (22, 23). This list only
-/// governs the `penalty_seconds == 0` branch of [`Cs2Penalty::from_gc`];
-/// VAC-Live can also arrive with a live countdown instead. Live capture
-/// (2026-08-13, real account) had reason 23 arrive with `penalty_seconds =
-/// 386_347` (about 4.5 days), independently confirmed by that account's GCPD
-/// page, and resolved as [`Cs2Penalty::Active`] instead, never touching this
-/// list. Not exhaustive: any other reason code seen with `penalty_seconds ==
-/// 0` is treated as [`Cs2Penalty::ExpiredUnacknowledged`], not because it is
-/// known to be one, but because the GC alone cannot tell a genuinely
-/// permanent, uncatalogued reason apart from an ordinary cooldown stuck
-/// awaiting acknowledgement.
+/// ever" rather than "a cooldown that ran out": reasons 8 and 14, Valve's
+/// own `SFUI_CooldownExplanationReason_OfficialBan` ("This account is
+/// permanently Untrusted"), and reason 10, `ConvictedForCheating`
+/// ("Convicted by Overwatch - Majorly Disruptive"). This list only governs
+/// the `penalty_seconds == 0` branch of [`Cs2Penalty::from_gc`].
 ///
-/// `vac_banned` (field 6 of the same hello) is a separate flag and is not
-/// implied by a reason in this list: the same live capture had
-/// `penalty_reason = 23` alongside `vac_banned = 0` on the same account. See
+/// Reasons 22 and 23 (`VacNetCulprit` / `VacNetAffiliate` in Valve's naming)
+/// are deliberately **not** in this list. Both are
+/// `SFUI_CooldownExplanationReason_*` keys, i.e. cooldowns, and Valve's own
+/// `Expired_Cooldown` string ("Subsequent cooldowns may be longer")
+/// describes escalation, not permanence. A live capture (2026-08-13, real
+/// account) had reason 23 arrive with `penalty_seconds = 386_347` (about 4.5
+/// days), independently confirmed by that account's GCPD page, and resolved
+/// as [`Cs2Penalty::Active`], never touching this list. With
+/// `penalty_seconds == 0` a `VACnet` reason instead falls into
+/// [`Cs2Penalty::ExpiredUnacknowledged`], the same honest "cannot tell from
+/// the GC alone" bucket as any other uncatalogued reason; GCPD's
+/// `Acknowledged` column resolves it from the other side.
+///
+/// Not exhaustive beyond that: any other reason code seen with
+/// `penalty_seconds == 0` is treated as [`Cs2Penalty::ExpiredUnacknowledged`]
+/// too, not because it is known to be one, but because the GC alone cannot
+/// tell a genuinely permanent, uncatalogued reason apart from an ordinary
+/// cooldown stuck awaiting acknowledgement.
+///
+/// `vac_banned` (field 6 of the same hello) is a separate flag entirely. A
+/// `VACnet`-flagged cooldown is not a VAC ban and does not imply one: `VACnet` is
+/// Valve's gameplay-flagging system, distinct from a full account VAC ban.
+/// The same live capture had `penalty_reason = 23` alongside `vac_banned = 0`
+/// on the same account, which is exactly what that distinction predicts. See
 /// [`vac_banned`]'s doc.
 ///
-/// None of this is written down in the protos or Valve's docs: it comes
-/// from a working implementation plus prior operational observation of live
-/// accounts.
-const PERMANENT_REASONS: [u32; 5] = [8, 10, 14, 22, 23];
+/// The reason keys and their English strings above are Valve's own
+/// (`csgo_english.txt`, `SFUI_CooldownExplanationReason_*`), but the numeric
+/// codes are not written down in the protos anywhere; they come from a
+/// third-party tool and prior operational observation of live accounts, not
+/// from Valve. See [`penalty_reason_text`] for the full mapping and its
+/// provenance.
+const PERMANENT_REASONS: [u32; 3] = [8, 10, 14];
 
 /// A CS2 account penalty, interpreted from the Game Coordinator's raw
 /// `penalty_seconds` / `penalty_reason` pair via [`Self::from_gc`].
@@ -310,10 +327,14 @@ pub enum Cs2Penalty {
         expires_at_unix: i64,
     },
     /// The countdown reached zero, but Steam has not cleared the reason code
-    /// yet, pending client acknowledgement of the expiry. **Or** this is a
-    /// permanent/VAC-Live conviction whose reason code this crate doesn't
-    /// know about. See the type-level docs: the GC alone cannot tell these
-    /// two apart.
+    /// yet, pending client acknowledgement of the expiry. This is also where
+    /// a `VACnet` reason (`VacNetCulprit` / `VacNetAffiliate`, 22/23) lands
+    /// once its cooldown has run out: those are ordinary cooldowns, not
+    /// permanent convictions, so they resolve here rather than to
+    /// [`Self::Permanent`]. **Or**, for a reason code outside
+    /// `PERMANENT_REASONS`, this is a permanent conviction this crate
+    /// doesn't catalogue. See the type-level docs: the GC alone cannot tell
+    /// these apart.
     ExpiredUnacknowledged {
         /// Raw GC penalty reason code.
         reason: u32,
@@ -376,6 +397,56 @@ impl Cs2Penalty {
             expires_at_unix,
         })
     }
+}
+
+/// Human-readable text for a raw CS2 penalty reason code, in Valve's own
+/// words verbatim.
+///
+/// The strings are Valve's own localisation, copied without paraphrase from
+/// `csgo_english.txt`'s `SFUI_CooldownExplanationReason_*` keys, e.g.
+/// `OfficialBan` -> "This account is permanently Untrusted",
+/// `VacNetAffiliate` -> "You partied with a player whose gameplay has been
+/// flagged by VAC as irregular".
+///
+/// **Only the strings are Valve-sourced. The reason-code-to-key numbering is
+/// not.** There is no numeric enum for `SFUI_CooldownExplanationReason_*` in
+/// the vendored protos (checked: `CooldownExplanation`, `PenaltyReason`, and
+/// `VacNet` do not appear anywhere under `protos/`), so which integer means
+/// `OfficialBan` versus `Kicked` comes from a third-party tool
+/// (`csgo-checker`) and prior operational observation of live accounts, not
+/// from Valve. Treat the numbering as unverified, with one exception: reason
+/// 23 is corroborated by a live capture (2026-08-13, real account, see
+/// `LIVE_PENALTY_HELLO_PROBE` in this module's tests) that arrived with a
+/// multi-day countdown consistent with `VacNetAffiliate`, a cooldown reason,
+/// never resolving as permanent.
+///
+/// Returns `None` for a reason code not in this mapping, rather than
+/// guessing at an unmapped value.
+#[must_use]
+pub fn penalty_reason_text(reason: u32) -> Option<&'static str> {
+    Some(match reason {
+        1 => "You were kicked from the last match",
+        2 => "You killed too many teammates",
+        3 => "You killed a teammate at round start",
+        4 => "You failed to reconnect to the last match",
+        5 => "You abandoned the last match",
+        6 => "You did too much damage to your teammates",
+        7 => "You did too much damage to your teammates at round start",
+        8 | 14 => "This account is permanently Untrusted",
+        9 => "You were kicked from too many recent matches",
+        10 => "Convicted by Overwatch - Majorly Disruptive",
+        11 => "Convicted by Overwatch - Minorly Disruptive",
+        16 => "You failed to connect by match start",
+        17 => "You have kicked too many teammates in recent matches",
+        18..=20 => {
+            "Congratulations on your recent competitive wins... wait for \
+            matchmaking servers to calibrate your Skill Group placement"
+        }
+        21 => "You have received significantly more griefing reports than most players",
+        22 => "VAC has flagged your gameplay as irregular",
+        23 => "You partied with a player whose gameplay has been flagged by VAC as irregular",
+        _ => return None,
+    })
 }
 
 /// Current Unix time in seconds, or `0` if the clock reads before the epoch
@@ -487,15 +558,21 @@ pub fn penalty(session: &SessionHandle) -> Option<Cs2Penalty> {
 /// welcome as [`penalty`] (field 6, `vac_banned`, of the same hello).
 ///
 /// This settles the VAC case directly instead of inferring it from
-/// [`Cs2Penalty`]'s reason codes 22/23, which mean VAC-Live (an active
-/// competitive-integrity conviction), not a full account VAC ban.
+/// [`Cs2Penalty`]'s reason codes 22/23 (`VacNetCulprit` / `VacNetAffiliate`
+/// in Valve's naming), which are a different thing entirely: `VACnet` is
+/// Valve's gameplay-flagging system and produces a cooldown, not a ban. A
+/// VAC ban is a separate, permanent account state tracked by this flag
+/// instead, so a `VACnet`-flagged cooldown should not be expected to move
+/// `vac_banned` at all.
 ///
-/// **This flag is independent of a VAC-Live penalty reason; do not assume
-/// one implies the other.** Live capture (2026-08-13, real account) had
-/// `penalty_reason = 23` (VAC-Live) with an active countdown *and*
-/// `vac_banned = 0` in the same hello: [`penalty`] returned
-/// `Some(Cs2Penalty::Active { reason: 23, .. })` for that account while this
-/// function returned `Some(false)` at the same instant.
+/// A live capture (2026-08-13, real account) confirms exactly that
+/// distinction: `penalty_reason = 23` (`VacNetAffiliate`) arrived with an
+/// active countdown *and* `vac_banned = 0` in the same hello, [`penalty`]
+/// returning `Some(Cs2Penalty::Active { reason: 23, .. })` for that account
+/// while this function returned `Some(false)` at the same instant. That is
+/// the expected shape given the two are unrelated, not a contradiction: a
+/// `VACnet` flag from partying with a flagged player is not, by itself, a VAC
+/// ban.
 ///
 /// Reads the same cached welcome [`penalty`] does, but **not** under the same
 /// `None` conditions: [`penalty`] folds "the account is clean" into `None`
@@ -909,13 +986,78 @@ mod tests {
     }
 
     #[test]
-    fn rule5_vac_live_reason_codes_are_22_and_23_with_zero_seconds() {
+    fn rule5_vacnet_reason_codes_22_and_23_are_not_permanent() {
+        // VacNetCulprit (22) and VacNetAffiliate (23) are cooldowns
+        // (SFUI_CooldownExplanationReason_*), not permanent convictions:
+        // Valve's own Expired_Cooldown wording ("Subsequent cooldowns may be
+        // longer") describes escalation, not permanence. With seconds == 0
+        // they fall into the same honest "cannot tell from the GC alone"
+        // bucket as any other uncatalogued reason.
         for reason in [22, 23] {
             assert_eq!(
                 Cs2Penalty::from_gc(reason, 0, 1_000),
-                Some(Cs2Penalty::Permanent { reason }),
+                Some(Cs2Penalty::ExpiredUnacknowledged { reason }),
                 "reason {reason}"
             );
+        }
+    }
+
+    #[test]
+    fn rule5_vacnet_affiliate_reason_23_with_zero_seconds_is_expired_unacknowledged() {
+        // Reason 23 is the one code in this list corroborated by a live
+        // capture (see LIVE_PENALTY_HELLO_PROBE below), which arrived with a
+        // multi-day countdown, not a permanent state. With seconds == 0 it
+        // must resolve the same way an ordinary expired cooldown does.
+        assert_eq!(
+            Cs2Penalty::from_gc(23, 0, 1_000),
+            Some(Cs2Penalty::ExpiredUnacknowledged { reason: 23 })
+        );
+    }
+
+    #[test]
+    fn penalty_reason_text_uses_valves_wording_verbatim() {
+        assert_eq!(
+            penalty_reason_text(8),
+            Some("This account is permanently Untrusted")
+        );
+        assert_eq!(
+            penalty_reason_text(14),
+            Some("This account is permanently Untrusted")
+        );
+        assert_eq!(
+            penalty_reason_text(23),
+            Some("You partied with a player whose gameplay has been flagged by VAC as irregular")
+        );
+        assert_eq!(
+            penalty_reason_text(22),
+            Some("VAC has flagged your gameplay as irregular")
+        );
+        assert_eq!(
+            penalty_reason_text(1),
+            Some("You were kicked from the last match")
+        );
+        assert_eq!(
+            penalty_reason_text(10),
+            Some("Convicted by Overwatch - Majorly Disruptive")
+        );
+        // 18-20 (SkillGroupCalibration) all share the same string.
+        for reason in [18, 19, 20] {
+            assert_eq!(
+                penalty_reason_text(reason),
+                Some(
+                    "Congratulations on your recent competitive wins... wait for \
+                    matchmaking servers to calibrate your Skill Group placement"
+                ),
+                "reason {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn penalty_reason_text_is_none_for_an_unmapped_code() {
+        // 0 (no penalty), and gaps in the third-party numbering (12, 13, 15).
+        for reason in [0, 12, 13, 15, 999] {
+            assert_eq!(penalty_reason_text(reason), None, "reason {reason}");
         }
     }
 
@@ -1109,7 +1251,7 @@ mod tests {
     /// here) and carry only the four fields the tests below assert on. The
     /// field *values* are live-observed, not invented: `account_id =
     /// 1_205_873_838`, `penalty_seconds = 386_347` (about 4.5 days),
-    /// `penalty_reason = 23` (VAC Live), `vac_banned = 0`. The account's own
+    /// `penalty_reason = 23` (`VacNetAffiliate`), `vac_banned = 0`. The account's own
     /// GCPD cooldown page independently confirmed the expiry this decodes
     /// to (`2026-08-17 23:54:16 GMT`).
     const LIVE_PENALTY_HELLO_PROBE: [u8; 14] = [
