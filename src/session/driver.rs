@@ -127,6 +127,15 @@ type SnapshotCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
 /// `appid` (see [`SessionHandle::replace_so_cache`]) rather than merging.
 type GcSoCache = Arc<Mutex<HashMap<(u32, i32), Vec<Vec<u8>>>>>;
 
+/// Raw bytes of the most recent penalty-bearing GC push for an app, keyed by
+/// appid. Unlike [`GcSoCache`] this holds one blob per appid, not a list: the
+/// GC pump extracts a `ClientWelcome`'s `game_data2` (see
+/// [`crate::gc::GameCoordinator`]) and wholesale-replaces the prior entry
+/// with it, since a welcome is a full inventory and not a delta. This module
+/// never looks inside the bytes; [`crate::cs2::Cs2Penalty`] is the first
+/// reader. Cleared under the same readiness-loss lifecycle as [`GcSoCache`].
+type GcPenaltyCache = Arc<Mutex<HashMap<u32, Vec<u8>>>>;
+
 /// Everything the driver needs to establish — and re-establish — a session.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -207,6 +216,7 @@ pub struct SessionHandle {
     state: watch::Receiver<SessionState>,
     snapshots: SnapshotCache,
     so_cache: GcSoCache,
+    penalty_cache: GcPenaltyCache,
     steam_id: u64,
 }
 
@@ -461,6 +471,49 @@ impl SessionHandle {
         }
     }
 
+    /// The cached bytes of the most recent penalty-bearing GC push for
+    /// `appid` (a `ClientWelcome`'s `game_data2`, see
+    /// [`crate::gc::GameCoordinator`]), or `None` if none has arrived yet
+    /// this GC session, including if no coordinator for `appid` has ever
+    /// been attached.
+    ///
+    /// Populated by the GC pump via `Self::set_cached_gc_penalty`
+    /// (crate-private), not by this module. [`crate::cs2`] is the first
+    /// reader and the only place these bytes are decoded.
+    pub fn cached_gc_penalty(&self, appid: u32) -> Option<Vec<u8>> {
+        self.penalty_cache
+            .lock()
+            .expect("penalty cache mutex poisoned")
+            .get(&appid)
+            .cloned()
+    }
+
+    /// Set (`Some`) or clear (`None`) the cached penalty-bearing push bytes
+    /// for `appid`.
+    ///
+    /// Not part of the public API: called only by
+    /// [`crate::gc::GameCoordinator`]'s pump when it decodes a welcome
+    /// carrying `game_data2`, and cleared alongside [`Self::replace_so_cache`]
+    /// on every readiness loss (a CM reconnect, the GC reporting no session,
+    /// or the pump exiting) so a stale value from a prior GC session can
+    /// never keep answering. Nothing else in the crate can call this,
+    /// including the CS2 `PlayersProfile` response path, which never holds a
+    /// genuine penalty-bearing push.
+    pub(crate) fn set_cached_gc_penalty(&self, appid: u32, bytes: Option<Vec<u8>>) {
+        let mut cache = self
+            .penalty_cache
+            .lock()
+            .expect("penalty cache mutex poisoned");
+        match bytes {
+            Some(b) => {
+                cache.insert(appid, b);
+            }
+            None => {
+                cache.remove(&appid);
+            }
+        }
+    }
+
     /// Cleanly log the session off: send `CMsgClientLogOff` to Steam and tear
     /// the socket down. The session stops afterwards (the driver's `JoinHandle`
     /// resolves to `Ok(())`).
@@ -510,6 +563,7 @@ impl SessionHandle {
                 state: state_rx,
                 snapshots: snapshots.clone(),
                 so_cache: Arc::new(Mutex::new(HashMap::new())),
+                penalty_cache: Arc::new(Mutex::new(HashMap::new())),
                 steam_id,
             },
             cmd_rx,
@@ -590,6 +644,7 @@ pub async fn spawn_session(
             state: state_rx,
             snapshots,
             so_cache: Arc::new(Mutex::new(HashMap::new())),
+            penalty_cache: Arc::new(Mutex::new(HashMap::new())),
             steam_id,
         },
         join,
@@ -1550,6 +1605,42 @@ mod tests {
             handle.cached_so_objects(730, 2).is_none(),
             "type_id 2 was not in the second welcome, so it must be gone"
         );
+    }
+
+    #[test]
+    fn cached_gc_penalty_is_none_before_any_welcome() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        assert!(handle.cached_gc_penalty(730).is_none());
+    }
+
+    #[test]
+    fn set_cached_gc_penalty_is_readable_back() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        handle.set_cached_gc_penalty(730, Some(vec![1, 2, 3]));
+
+        assert_eq!(handle.cached_gc_penalty(730), Some(vec![1, 2, 3]));
+        // A different appid's cache must stay untouched.
+        assert!(handle.cached_gc_penalty(570).is_none());
+    }
+
+    #[test]
+    fn set_cached_gc_penalty_none_clears_it() {
+        let (handle, ..) = SessionHandle::for_test(7);
+        handle.set_cached_gc_penalty(730, Some(vec![1]));
+        handle.set_cached_gc_penalty(730, None);
+
+        assert!(handle.cached_gc_penalty(730).is_none());
+    }
+
+    #[test]
+    fn set_cached_gc_penalty_replaces_not_merges() {
+        // A fresh welcome's game_data2 replaces the prior one wholesale, the
+        // same full-inventory policy as the SO cache.
+        let (handle, ..) = SessionHandle::for_test(7);
+        handle.set_cached_gc_penalty(730, Some(vec![1]));
+        handle.set_cached_gc_penalty(730, Some(vec![2]));
+
+        assert_eq!(handle.cached_gc_penalty(730), Some(vec![2]));
     }
 
     #[tokio::test]

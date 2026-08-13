@@ -50,6 +50,19 @@ pub async fn request_cs2_cooldown(web: &WebSession) -> Result<Option<Cs2Cooldown
 }
 
 /// A CS2 competitive matchmaking cooldown read from a GCPD page.
+///
+/// Pairs with [`crate::cs2::Cs2Penalty`], the same state as reported by the
+/// Game Coordinator instead of GCPD. The GC gives a reason code and a raw
+/// `penalty_seconds` that goes ambiguous once it hits `0`; GCPD gives
+/// [`Self::expires_at_unix`] (the same countdown, rendered as a date instead
+/// of a duration) and [`Self::acknowledged`] (whether the account has
+/// cleared it), which is exactly the piece the GC alone cannot supply.
+/// Together: a [`crate::cs2::Cs2Penalty::ExpiredUnacknowledged`] from the GC
+/// alongside a `Cs2Cooldown` here with `acknowledged == false` is the same
+/// event seen from both sides: "expired, awaiting acknowledgement". If
+/// GCPD reports no cooldown table at all (`request_cs2_cooldown` returning
+/// `Ok(None)`) while the GC still reports a penalty, that penalty is the
+/// permanent case instead, since there is no cooldown left to expire.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Cs2Cooldown {
@@ -60,7 +73,10 @@ pub struct Cs2Cooldown {
     /// Cooldown level, when GCPD reports one. A real active cooldown has been
     /// observed with this cell blank, so it is optional.
     pub level: Option<u32>,
-    /// Whether the account has acknowledged the cooldown.
+    /// Whether the account has acknowledged the cooldown. Steam only clears
+    /// a GC-reported penalty once this is `true`; see
+    /// [`crate::cs2::Cs2Penalty`] for what an unacknowledged expiry looks
+    /// like from the GC's side.
     pub acknowledged: bool,
 }
 

@@ -26,8 +26,8 @@ use prost::Message as _;
 
 use crate::gc::GameCoordinator;
 use crate::proto::gc::{
-    CMsgGccStrike15V2ClientRequestPlayersProfile, CMsgGccStrike15V2PlayersProfile,
-    CsoEconGameAccountClient,
+    CMsgGccStrike15V2ClientRequestPlayersProfile, CMsgGccStrike15V2MatchmakingGc2ClientHello,
+    CMsgGccStrike15V2PlayersProfile, CsoEconGameAccountClient,
 };
 use crate::session::SessionHandle;
 use crate::{Error, Result};
@@ -86,6 +86,27 @@ pub struct PlayerProfile {
     pub medals: Vec<u32>,
     /// The featured (showcased) medal's defindex, if the player set one.
     pub featured_medal: Option<u32>,
+    /// Raw penalty countdown in seconds, from the most recent
+    /// penalty-bearing GC push cached this session (a `ClientWelcome`'s
+    /// `game_data2`), **never** from this `PlayersProfile` response itself,
+    /// which the GC leaves at `0` here even when a real penalty exists. `0`
+    /// if the GC has reported no penalty this session. Prefer
+    /// [`Self::penalty`] over reading this directly.
+    pub penalty_seconds: u32,
+    /// Raw penalty reason code paired with [`Self::penalty_seconds`]. `0` if
+    /// none. Prefer [`Self::penalty`] over reading this directly.
+    pub penalty_reason: u32,
+}
+
+impl PlayerProfile {
+    /// Interpret [`Self::penalty_seconds`] / [`Self::penalty_reason`] as a
+    /// [`Cs2Penalty`], using the current wall-clock time to resolve whether
+    /// `penalty_seconds` is a countdown duration or an already-absolute
+    /// expiry (see [`Cs2Penalty::from_gc`]).
+    #[must_use]
+    pub fn penalty(&self) -> Option<Cs2Penalty> {
+        Cs2Penalty::from_gc(self.penalty_reason, self.penalty_seconds, now_unix())
+    }
 }
 
 /// Request one player's public CS2 profile through `gc`.
@@ -150,6 +171,15 @@ pub async fn request_player_profile(
         .medals
         .map(|m| (m.display_items_defidx, m.featured_display_item_defidx))
         .unwrap_or_default();
+
+    // profile.penalty_seconds / profile.penalty_reason are deliberately
+    // never read here: PlayersProfile's account entry reuses the hello's
+    // message shape, but the GC leaves these at 0 in that response even when
+    // a real penalty exists. The GC pump's welcome-derived cache (see
+    // cached_penalty) is the one genuinely penalty-bearing source, and only
+    // it may set these fields.
+    let (penalty_seconds, penalty_reason) = cached_penalty(gc).unwrap_or((0, 0));
+
     Ok(PlayerProfile {
         account_id,
         level: profile.player_level.unwrap_or(0),
@@ -158,7 +188,22 @@ pub async fn request_player_profile(
         competitive_wins: ranking.as_ref().and_then(|r| r.wins),
         medals,
         featured_medal,
+        penalty_seconds,
+        penalty_reason,
     })
+}
+
+/// Decode the GC pump's cached penalty-bearing push (a `ClientWelcome`'s
+/// `game_data2`, cached opaquely by [`crate::gc::GameCoordinator`]'s pump)
+/// into the raw `(penalty_seconds, penalty_reason)` pair, or `None` if
+/// nothing has been cached yet this GC session, or the bytes don't decode.
+fn cached_penalty(gc: &GameCoordinator) -> Option<(u32, u32)> {
+    let bytes = gc.session().cached_gc_penalty(gc.appid())?;
+    let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(bytes.as_slice()).ok()?;
+    Some((
+        hello.penalty_seconds.unwrap_or(0),
+        hello.penalty_reason.unwrap_or(0),
+    ))
 }
 
 /// Extract the 32-bit account id from a 64-bit `SteamID` (its low 32 bits).
@@ -168,6 +213,140 @@ pub fn account_id_from_steam_id(steam_id: u64) -> u32 {
     {
         steam_id as u32
     }
+}
+
+/// Seconds threshold separating a countdown duration from an already-absolute
+/// Unix expiry in a GC `penalty_seconds` value (see [`Cs2Penalty::from_gc`]).
+/// Roughly ten years: no real CS2 cooldown or temporary ban runs anywhere
+/// close to that, so a value above it can only be an absolute timestamp
+/// already.
+const DURATION_VS_TIMESTAMP_THRESHOLD_SECS: u32 = 10 * 365 * 24 * 3600;
+
+/// `penalty_seconds` at or above this is the GC's "permanent" sentinel
+/// rather than a genuinely huge but finite absolute timestamp. Generous
+/// margin below the true `u32::MAX`: a real absolute timestamp (see
+/// [`DURATION_VS_TIMESTAMP_THRESHOLD_SECS`]) is nowhere near the year 2106
+/// that `u32::MAX` seconds since the epoch would represent.
+const NEAR_U32_MAX_PERMANENT_SECS: u32 = u32::MAX - 65_536;
+
+/// Penalty reason codes observed to mean "in effect with no countdown,
+/// ever" rather than "a cooldown that ran out": outright permanent
+/// convictions (8, 10, 14) and VAC-Live convictions (22, 23), the latter
+/// routinely ship `penalty_seconds == 0` alongside their reason. Not
+/// exhaustive: any other reason code seen with `penalty_seconds == 0` is
+/// treated as [`Cs2Penalty::ExpiredUnacknowledged`], not because it is known
+/// to be one, but because the GC alone cannot tell a genuinely permanent,
+/// uncatalogued reason apart from an ordinary cooldown stuck awaiting
+/// acknowledgement.
+///
+/// None of this is written down in the protos or Valve's docs: it comes
+/// from a working implementation plus prior operational observation of live
+/// accounts.
+const PERMANENT_REASONS: [u32; 5] = [8, 10, 14, 22, 23];
+
+/// A CS2 account penalty, interpreted from the Game Coordinator's raw
+/// `penalty_seconds` / `penalty_reason` pair via [`Self::from_gc`].
+///
+/// [`Self::Permanent`] and [`Self::ExpiredUnacknowledged`] can be
+/// indistinguishable on the wire: both show as `penalty_reason` set,
+/// `penalty_seconds == 0`. For the reason codes in `PERMANENT_REASONS`
+/// that's resolved outright; for anything else, the GC alone cannot tell
+/// "flagged forever" from "a cooldown that ran out and the client hasn't
+/// acknowledged the expiry yet" (Steam only clears the reason once the
+/// client acknowledges it).
+///
+/// [`crate::gcpd::Cs2Cooldown`] carries the other half of that
+/// disambiguation: its `expires_at_unix` is the same countdown GCPD's own
+/// page reports, and `acknowledged` says whether the account has cleared
+/// it. Pair the two: a GC-reported [`Self::ExpiredUnacknowledged`] alongside
+/// a GCPD cooldown whose `acknowledged` is `false` is the same event seen
+/// from both sides; if GCPD shows no cooldown table for the account at all,
+/// the GC-reported penalty is the permanent case instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Cs2Penalty {
+    /// In effect indefinitely: either a reason code in `PERMANENT_REASONS`,
+    /// or `penalty_seconds` reported near `u32::MAX`, the GC's sentinel for
+    /// "forever". No expiry to display.
+    Permanent {
+        /// Raw GC penalty reason code.
+        reason: u32,
+    },
+    /// Actively counting down.
+    Active {
+        /// Raw GC penalty reason code.
+        reason: u32,
+        /// Unix timestamp (UTC) the penalty expires.
+        expires_at_unix: i64,
+    },
+    /// The countdown reached zero, but Steam has not cleared the reason code
+    /// yet, pending client acknowledgement of the expiry. **Or** this is a
+    /// permanent/VAC-Live conviction whose reason code this crate doesn't
+    /// know about. See the type-level docs: the GC alone cannot tell these
+    /// two apart.
+    ExpiredUnacknowledged {
+        /// Raw GC penalty reason code.
+        reason: u32,
+    },
+}
+
+impl Cs2Penalty {
+    /// Interpret a GC hello's raw `penalty_reason` / `penalty_seconds` pair.
+    /// `now_unix` is the current Unix time; it matters only when `seconds`
+    /// turns out to be a countdown duration rather than an absolute
+    /// timestamp (see below), to compute the resulting expiry.
+    ///
+    /// None of these rules are derivable from the protos. They come from a
+    /// working implementation and prior operational observation of live
+    /// accounts:
+    ///
+    /// - No penalty (`None`) only when **both** fields are `0`. Checking
+    ///   `seconds` alone misses a penalty stuck at `0` seconds with a reason
+    ///   set, a known bug in other tools.
+    /// - `seconds` at or above `NEAR_U32_MAX_PERMANENT_SECS` (near
+    ///   `u32::MAX`) is [`Self::Permanent`], regardless of `reason`.
+    /// - Otherwise `seconds == 0` with `reason` set is [`Self::Permanent`]
+    ///   for a reason in `PERMANENT_REASONS`, or
+    ///   [`Self::ExpiredUnacknowledged`] for anything else.
+    /// - Otherwise `seconds > 0` is [`Self::Active`]. Above
+    ///   `DURATION_VS_TIMESTAMP_THRESHOLD_SECS` (roughly ten years) it's
+    ///   already an absolute Unix expiry; at or below it, it's a countdown
+    ///   duration added to `now_unix`.
+    #[must_use]
+    pub fn from_gc(reason: u32, seconds: u32, now_unix: i64) -> Option<Self> {
+        if reason == 0 && seconds == 0 {
+            return None;
+        }
+        if seconds >= NEAR_U32_MAX_PERMANENT_SECS {
+            return Some(Self::Permanent { reason });
+        }
+        if seconds == 0 {
+            return Some(if PERMANENT_REASONS.contains(&reason) {
+                Self::Permanent { reason }
+            } else {
+                Self::ExpiredUnacknowledged { reason }
+            });
+        }
+        let expires_at_unix = if seconds > DURATION_VS_TIMESTAMP_THRESHOLD_SECS {
+            i64::from(seconds)
+        } else {
+            now_unix + i64::from(seconds)
+        };
+        Some(Self::Active {
+            reason,
+            expires_at_unix,
+        })
+    }
+}
+
+/// Current Unix time in seconds, or `0` if the clock reads before the epoch
+/// or (theoretically) past `i64::MAX` seconds.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 /// SO `type_id` for `CSOEconGameAccountClient`
@@ -240,9 +419,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::gc::GcMessage;
-    use crate::proto::gc::{
-        CMsgGccStrike15V2MatchmakingGc2ClientHello, CMsgProtoBufHeader as GcHeader,
-    };
+    use crate::proto::gc::CMsgProtoBufHeader as GcHeader;
     use crate::session::driver::Command;
 
     /// A `PlayersProfile` reply carrying one profile per account id.
@@ -326,6 +503,64 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfig(_)), "{err:?}");
     }
 
+    #[tokio::test]
+    async fn profile_penalty_comes_from_the_cached_welcome_not_the_profile_response() {
+        const WANTED: u32 = 100;
+        let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
+        // Seed the cache exactly as the GC pump would from a welcome's
+        // game_data2 (see gc::coordinator).
+        let hello = CMsgGccStrike15V2MatchmakingGc2ClientHello {
+            penalty_seconds: Some(10),
+            penalty_reason: Some(5),
+            ..Default::default()
+        };
+        session.set_cached_gc_penalty(APP_ID, Some(hello.encode_to_vec()));
+
+        let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        // The PlayersProfile response itself carries different penalty
+        // fields on its account entry (it reuses the hello's message shape),
+        // simulating what the real GC never actually sends there. These
+        // must be ignored entirely in favour of the cached welcome.
+        let reply = GcMessage {
+            appid: APP_ID,
+            msgtype: GC_PLAYERS_PROFILE,
+            header: GcHeader::default(),
+            body: CMsgGccStrike15V2PlayersProfile {
+                account_profiles: vec![CMsgGccStrike15V2MatchmakingGc2ClientHello {
+                    account_id: Some(WANTED),
+                    player_level: Some(1),
+                    penalty_seconds: Some(999),
+                    penalty_reason: Some(99),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        };
+        let fake = fake_gc(commands, replies, vec![reply]);
+
+        let profile = request_player_profile(&gc, WANTED).await.expect("profile");
+
+        assert_eq!(profile.penalty_seconds, 10);
+        assert_eq!(profile.penalty_reason, 5);
+        fake.await.expect("fake GC");
+    }
+
+    #[tokio::test]
+    async fn profile_penalty_is_zero_when_nothing_cached() {
+        const WANTED: u32 = 55;
+        let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        let fake = fake_gc(commands, replies, vec![profiles_reply(&[WANTED])]);
+
+        let profile = request_player_profile(&gc, WANTED).await.expect("profile");
+
+        assert_eq!(profile.penalty_seconds, 0);
+        assert_eq!(profile.penalty_reason, 0);
+        assert!(profile.penalty().is_none());
+        fake.await.expect("fake GC");
+    }
+
     #[test]
     fn account_id_takes_low_32_bits() {
         // An individual SteamID is 0x0110_0001_0000_0000 + account_id, so the
@@ -344,6 +579,154 @@ mod tests {
         // Guards against an accidental edit drifting from cstrike15_gcmessages.proto.
         assert_eq!(GC_CLIENT_REQUEST_PLAYERS_PROFILE, 9127);
         assert_eq!(GC_PLAYERS_PROFILE, 9128);
+    }
+
+    // --- Cs2Penalty::from_gc: rules 1-5, see the type's doc comment for
+    // where they come from. Each test below is named for the rule it pins.
+
+    #[test]
+    fn rule1_no_penalty_only_when_both_fields_are_zero() {
+        assert_eq!(Cs2Penalty::from_gc(0, 0, 1_000), None);
+    }
+
+    #[test]
+    fn rule1_reason_alone_is_still_a_penalty() {
+        // Checking penalty_seconds alone (a known bug in other tools) would
+        // read this as "no penalty". reason 5 is not a known permanent code,
+        // so it lands as ExpiredUnacknowledged, not None.
+        assert_eq!(
+            Cs2Penalty::from_gc(5, 0, 1_000),
+            Some(Cs2Penalty::ExpiredUnacknowledged { reason: 5 })
+        );
+    }
+
+    #[test]
+    fn rule2_zero_seconds_known_permanent_reason_is_permanent() {
+        // A permanent conviction that never had a countdown.
+        assert_eq!(
+            Cs2Penalty::from_gc(8, 0, 1_000),
+            Some(Cs2Penalty::Permanent { reason: 8 })
+        );
+    }
+
+    #[test]
+    fn rule2_zero_seconds_unknown_reason_is_expired_unacknowledged() {
+        // A cooldown that ran its course but Steam hasn't cleared the
+        // reason pending client acknowledgement.
+        assert_eq!(
+            Cs2Penalty::from_gc(3, 0, 1_000),
+            Some(Cs2Penalty::ExpiredUnacknowledged { reason: 3 })
+        );
+    }
+
+    #[test]
+    fn rule3_small_seconds_is_a_duration_added_to_now() {
+        assert_eq!(
+            Cs2Penalty::from_gc(1, 3_600, 1_000_000),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 1_003_600,
+            })
+        );
+    }
+
+    #[test]
+    fn rule3_large_seconds_is_an_absolute_timestamp_not_added_to_now() {
+        // Above the ~10-year threshold: used as-is, ignoring now_unix
+        // entirely (a wildly different now_unix must not change the result).
+        assert_eq!(
+            Cs2Penalty::from_gc(1, 2_000_000_000, 1),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 2_000_000_000,
+            })
+        );
+        assert_eq!(
+            Cs2Penalty::from_gc(1, 2_000_000_000, 999_999_999),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 2_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn rule4_near_u32_max_seconds_is_permanent() {
+        assert_eq!(
+            Cs2Penalty::from_gc(1, u32::MAX, 1_000),
+            Some(Cs2Penalty::Permanent { reason: 1 })
+        );
+        // "Near", not just the exact sentinel value.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, u32::MAX - 100, 1_000),
+            Some(Cs2Penalty::Permanent { reason: 1 })
+        );
+    }
+
+    #[test]
+    fn rule4_permanent_threshold_does_not_swallow_a_real_absolute_timestamp() {
+        // A genuinely huge but finite absolute expiry, far below u32::MAX,
+        // must stay Active, not get misclassified as permanent.
+        assert_eq!(
+            Cs2Penalty::from_gc(1, 2_000_000_000, 1_000),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 2_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn rule5_permanent_reason_codes_are_8_10_and_14() {
+        for reason in [8, 10, 14] {
+            assert_eq!(
+                Cs2Penalty::from_gc(reason, 0, 1_000),
+                Some(Cs2Penalty::Permanent { reason }),
+                "reason {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn rule5_vac_live_reason_codes_are_22_and_23_with_zero_seconds() {
+        for reason in [22, 23] {
+            assert_eq!(
+                Cs2Penalty::from_gc(reason, 0, 1_000),
+                Some(Cs2Penalty::Permanent { reason }),
+                "reason {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn player_profile_penalty_delegates_to_cs2_penalty_from_gc() {
+        // now-independent case (an absolute timestamp) so the assertion
+        // doesn't race real wall-clock time.
+        let profile = PlayerProfile {
+            account_id: 1,
+            level: 0,
+            current_xp: 0,
+            competitive_rank: None,
+            competitive_wins: None,
+            medals: Vec::new(),
+            featured_medal: None,
+            penalty_seconds: 2_000_000_000,
+            penalty_reason: 1,
+        };
+        assert_eq!(
+            profile.penalty(),
+            Some(Cs2Penalty::Active {
+                reason: 1,
+                expires_at_unix: 2_000_000_000,
+            })
+        );
+
+        let clean = PlayerProfile {
+            penalty_seconds: 0,
+            penalty_reason: 0,
+            ..profile
+        };
+        assert_eq!(clean.penalty(), None);
     }
 
     fn seed_econ_game_account(session: &SessionHandle, account: CsoEconGameAccountClient) {

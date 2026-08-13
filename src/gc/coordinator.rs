@@ -338,6 +338,32 @@ fn has_gc_session(body: &[u8]) -> bool {
     }
 }
 
+/// Outcome of extracting `game_data2` from a `ClientWelcome` body.
+enum WelcomeGameData2 {
+    /// The body didn't decode as a welcome at all: leave any existing cache
+    /// entry alone rather than guess it away.
+    Undecodable,
+    /// The body decoded fine. `None` means it decoded but carried no
+    /// `game_data2`, a full-inventory welcome that must still wipe a stale
+    /// cache entry, the same policy [`so_objects_from_welcome`] follows for
+    /// SO objects.
+    Decoded(Option<Vec<u8>>),
+}
+
+/// A `ClientWelcome`'s `game_data2` payload.
+///
+/// `game_data2` is a generic `CMsgClientWelcome` field (any app's GC can use
+/// it), so this stays app-agnostic: it never looks at what the bytes
+/// contain. CS2's GC embeds a serialized
+/// `CMsgGCCStrike15_v2_MatchmakingGC2ClientHello` here, decoded by
+/// [`crate::cs2`].
+fn game_data2_from_welcome(body: &[u8]) -> WelcomeGameData2 {
+    match CMsgClientWelcome::decode(body) {
+        Ok(welcome) => WelcomeGameData2::Decoded(welcome.game_data2),
+        Err(_) => WelcomeGameData2::Undecodable,
+    }
+}
+
 /// Flatten a `ClientWelcome`'s `outofdate_subscribed_caches` into
 /// `type_id -> blobs`, or `None` if the body doesn't decode as a welcome at
 /// all. A `type_id` absent from the welcome is simply absent from the map,
@@ -364,8 +390,9 @@ fn so_objects_from_welcome(body: &[u8]) -> Option<HashMap<i32, Vec<Vec<u8>>>> {
 /// the [`SessionHandle`] here would otherwise keep the session driver alive
 /// forever). Every readiness loss (a CM state change, the GC reporting no
 /// session, or the pump itself exiting) also clears `appid`'s cached SO
-/// objects, so [`SessionHandle::cached_so_objects`] can never answer from a
-/// welcome that predates the current GC session.
+/// objects and cached penalty push, so [`SessionHandle::cached_so_objects`]
+/// and [`SessionHandle::cached_gc_penalty`] can never answer from a welcome
+/// that predates the current GC session.
 async fn pump(
     appid: u32,
     hello_version: u32,
@@ -404,6 +431,7 @@ async fn pump(
                 // cm session changed, so the prior welcome's SO caches can no
                 // longer be vouched for until the gc re-welcomes us.
                 session.replace_so_cache(appid, HashMap::new());
+                session.set_cached_gc_penalty(appid, None);
                 if ready_again {
                     debug!("re-announcing app to GC after reconnect");
                     let _ = launch(&session, appid, hello_version).await;
@@ -440,6 +468,15 @@ async fn pump(
                                         if let Some(objects) = so_objects_from_welcome(&gc_msg.body) {
                                             session.replace_so_cache(appid, objects);
                                         }
+                                        // game_data2 frequently carries CS2's only
+                                        // report of a penalty/cooldown: no standalone
+                                        // 9110 hello follows. Cache it opaquely so a
+                                        // late subscriber can't miss it.
+                                        if let WelcomeGameData2::Decoded(game_data2) =
+                                            game_data2_from_welcome(&gc_msg.body)
+                                        {
+                                            session.set_cached_gc_penalty(appid, game_data2);
+                                        }
                                         info!("GC welcomed");
                                         let _ = ready_tx.send(true);
                                     }
@@ -455,6 +492,7 @@ async fn pump(
                                             // gc dropped our session; the last welcome's
                                             // caches are stale until it welcomes us again.
                                             session.replace_so_cache(appid, HashMap::new());
+                                            session.set_cached_gc_penalty(appid, None);
                                         }
                                     }
                                     _ => {}
@@ -475,6 +513,7 @@ async fn pump(
     // pump is done answering for `appid`; a lingering cache would claim
     // freshness (see cached_so_objects's doc) it no longer has.
     session.replace_so_cache(appid, HashMap::new());
+    session.set_cached_gc_penalty(appid, None);
 }
 
 #[cfg(test)]
@@ -739,6 +778,7 @@ mod tests {
         // (EMSG_CLIENT_FROM_GC -> CMsgGcClient -> the inner GC frame).
         let welcome = CMsgClientWelcome {
             outofdate_subscribed_caches: vec![subscribed(7, vec![vec![1, 2, 3]])],
+            game_data2: Some(vec![9, 9, 9]),
             ..Default::default()
         };
         let client = envelope::wrap(
@@ -764,6 +804,11 @@ mod tests {
             readback.cached_so_objects(APPID, 7),
             Some(vec![vec![1, 2, 3]])
         );
+        assert_eq!(
+            readback.cached_gc_penalty(APPID),
+            Some(vec![9, 9, 9]),
+            "game_data2 must be cached opaquely alongside the SO objects"
+        );
 
         drop(ready_rx);
         timeout(Duration::from_secs(5), running)
@@ -772,9 +817,10 @@ mod tests {
             .expect("pump task");
     }
 
-    /// Push a real `ClientWelcome` carrying one SO object, then wait for the
-    /// pump to process it (readiness flips only after the cache write, so
-    /// waiting for it also proves the write happened first).
+    /// Push a real `ClientWelcome` carrying one SO object and a `game_data2`
+    /// payload, then wait for the pump to process it (readiness flips only
+    /// after the cache writes, so waiting for it also proves the writes
+    /// happened first).
     async fn welcome_and_wait(
         events_in: &broadcast::Sender<crate::codec::SteamMessage>,
         ready_rx: &mut watch::Receiver<bool>,
@@ -784,6 +830,7 @@ mod tests {
 
         let welcome = CMsgClientWelcome {
             outofdate_subscribed_caches: vec![subscribed(7, vec![vec![1, 2, 3]])],
+            game_data2: Some(vec![9, 9, 9]),
             ..Default::default()
         };
         let client = envelope::wrap(
@@ -830,6 +877,7 @@ mod tests {
             readback.cached_so_objects(APPID, 7),
             Some(vec![vec![1, 2, 3]])
         );
+        assert_eq!(readback.cached_gc_penalty(APPID), Some(vec![9, 9, 9]));
 
         // The GC drops our session without the CM connection itself dropping.
         let status = envelope::wrap(
@@ -852,6 +900,10 @@ mod tests {
         assert!(
             readback.cached_so_objects(APPID, 7).is_none(),
             "a stale SO cache must not survive the GC reporting no session"
+        );
+        assert!(
+            readback.cached_gc_penalty(APPID).is_none(),
+            "a stale penalty push must not survive the GC reporting no session"
         );
 
         drop(ready_rx);
@@ -884,6 +936,7 @@ mod tests {
             readback.cached_so_objects(APPID, 7),
             Some(vec![vec![1, 2, 3]])
         );
+        assert_eq!(readback.cached_gc_penalty(APPID), Some(vec![9, 9, 9]));
 
         // The CM connection drops: a reconnect episode begins. `Connecting`
         // is not ready, so the pump won't try to re-launch and block on an
@@ -898,6 +951,10 @@ mod tests {
         assert!(
             readback.cached_so_objects(APPID, 7).is_none(),
             "a stale SO cache must not survive a CM reconnect"
+        );
+        assert!(
+            readback.cached_gc_penalty(APPID).is_none(),
+            "a stale penalty push must not survive a CM reconnect"
         );
 
         drop(ready_rx);
@@ -927,6 +984,7 @@ mod tests {
 
         welcome_and_wait(&events_in, &mut ready_rx).await;
         assert!(readback.cached_so_objects(APPID, 7).is_some());
+        assert!(readback.cached_gc_penalty(APPID).is_some());
 
         drop(ready_rx); // last GameCoordinator clone gone
 
@@ -939,5 +997,43 @@ mod tests {
             readback.cached_so_objects(APPID, 7).is_none(),
             "an exited pump must not leave a stale SO cache behind"
         );
+        assert!(
+            readback.cached_gc_penalty(APPID).is_none(),
+            "an exited pump must not leave a stale penalty push behind"
+        );
+    }
+
+    #[test]
+    fn game_data2_from_welcome_extracts_the_payload() {
+        let welcome = CMsgClientWelcome {
+            game_data2: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            game_data2_from_welcome(&welcome.encode_to_vec()),
+            WelcomeGameData2::Decoded(Some(bytes)) if bytes == vec![1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn game_data2_from_welcome_wipes_on_a_welcome_without_one() {
+        // Decodes fine but carries no game_data2: Decoded(None), not
+        // Undecodable, so the caller still wipes a stale cache entry
+        // (full-inventory policy).
+        let welcome = CMsgClientWelcome::default();
+        assert!(matches!(
+            game_data2_from_welcome(&welcome.encode_to_vec()),
+            WelcomeGameData2::Decoded(None)
+        ));
+    }
+
+    #[test]
+    fn game_data2_from_welcome_is_undecodable_on_garbage() {
+        // 0xff is not a valid protobuf tag: leaves a stale cache entry alone
+        // rather than guessing it away.
+        assert!(matches!(
+            game_data2_from_welcome(&[0xff, 0xff]),
+            WelcomeGameData2::Undecodable
+        ));
     }
 }
