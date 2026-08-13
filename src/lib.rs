@@ -42,6 +42,8 @@
 //! - [`auth`]: credentials, TOTP, the `WebAPI` sign-in flow ([`auth::SignIn`]),
 //!   and refresh-token persistence ([`auth::TokenStore`])
 //! - [`codec`] — Steam `EMsg` + protobuf message framing for the CM transport
+//! - [`confirmations`]: fetch and approve mobile confirmations
+//!   ([`confirmations::list`], [`confirmations::accept`])
 //! - [`session`] — live CM session lifecycle ([`session::spawn_session`])
 //! - [`persona`] — player summary, profile info, and vanity-URL resolution
 //! - [`friends`]: friends list, add / remove, nicknames, visibility, chat,
@@ -64,6 +66,7 @@
 
 pub mod auth;
 pub mod codec;
+pub mod confirmations;
 pub mod cs2;
 pub mod error;
 pub mod friends;
