@@ -31,6 +31,12 @@ While in `0.x.y`, **any minor version may break the API**.
   shared-object caches from the GC welcome (`outofdate_subscribed_caches`) and
   later `CacheSubscribed` pushes, so callers can read them after `wait_ready`
   without racing the welcome. Test seam: `set_so_cache_for_test`.
+- **`GameCoordinator::last_message(msgtype)`**: the most recent body of every GC
+  message type since attach. CS2 pushes `MatchmakingGC2ClientHello` once,
+  unsolicited, right after the welcome and does not answer a later
+  `MatchmakingClient2GCHello` (seen live: the request timed out), so
+  `cs2::request_account_status` uses the pushed copy and only requests the
+  hello when none arrived. Test seam: `set_last_message_for_test`.
 - **Friends expansion (`friends`)**: the module grew from "list / add / remove"
   to 16 public functions, all keyless over the CM session:
   - *Nicknames*: `set_nickname` / `clear_nickname` (job-correlated

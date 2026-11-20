@@ -1,5 +1,6 @@
 //! A Game Coordinator client multiplexed over a CM [`SessionHandle`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,10 +28,20 @@ const GC_EVENT_CAPACITY: usize = 64;
 /// `k_ESOMsg_CacheSubscribed` — the GC pushes a full shared-object cache.
 const SO_CACHE_SUBSCRIBED: u32 = 24;
 
-/// Shared-object (SO) cache contents the GC handed us since its last welcome:
-/// `(type_id, object_data)` pairs from the welcome's
-/// `outofdate_subscribed_caches` and any later `CacheSubscribed` push.
-type SoCache = Arc<Mutex<Vec<(i32, Vec<u8>)>>>;
+/// What the pump records for late readers.
+#[derive(Default)]
+struct GcCache {
+    /// Shared-object (SO) cache contents the GC handed us since its last
+    /// welcome: `(type_id, object_data)` pairs from the welcome's
+    /// `outofdate_subscribed_caches` and any later `CacheSubscribed` push.
+    so: Vec<(i32, Vec<u8>)>,
+    /// The most recent body of every GC message type seen since attach. Some
+    /// GCs push a message once, unsolicited, right after the welcome (CS2's
+    /// `MatchmakingGC2ClientHello`) and ignore a later request for it.
+    last: HashMap<u32, Vec<u8>>,
+}
+
+type SoCache = Arc<Mutex<GcCache>>;
 
 /// Collect every SO object of a `CMsgSOCacheSubscribed` into `out`.
 fn collect_so_objects(cache: &CMsgSoCacheSubscribed, out: &mut Vec<(i32, Vec<u8>)>) {
@@ -145,10 +156,26 @@ impl GameCoordinator {
         self.so_cache
             .lock()
             .expect("SO cache mutex poisoned")
+            .so
             .iter()
             .filter(|(t, _)| *t == type_id)
             .map(|(_, body)| body.clone())
             .collect()
+    }
+
+    /// The most recent body of a GC message of `msgtype` received since
+    /// [`attach`](Self::attach), or `None` if none arrived yet. The pump records
+    /// every message, so this also returns messages the GC pushed before anyone
+    /// [`subscribe`](Self::subscribe)d — e.g. one sent unsolicited right after the
+    /// welcome.
+    #[must_use]
+    pub fn last_message(&self, msgtype: u32) -> Option<Vec<u8>> {
+        self.so_cache
+            .lock()
+            .expect("SO cache mutex poisoned")
+            .last
+            .get(&msgtype)
+            .cloned()
     }
 
     /// Subscribe to the raw stream of GC messages for this app. Late subscribers
@@ -330,7 +357,19 @@ impl GameCoordinator {
     #[cfg(any(test, feature = "test-seam"))]
     #[doc(hidden)]
     pub fn set_so_cache_for_test(&self, objects: Vec<(i32, Vec<u8>)>) {
-        *self.so_cache.lock().expect("SO cache mutex poisoned") = objects;
+        self.so_cache.lock().expect("SO cache mutex poisoned").so = objects;
+    }
+
+    /// **Test-only.** Record `body` as the last GC message of `msgtype`, as if
+    /// the pump had seen it. Same caveats as [`Self::for_test`].
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn set_last_message_for_test(&self, msgtype: u32, body: Vec<u8>) {
+        self.so_cache
+            .lock()
+            .expect("SO cache mutex poisoned")
+            .last
+            .insert(msgtype, body);
     }
 }
 
@@ -461,7 +500,7 @@ async fn pump(
                                                 collect_so_objects(cache, &mut objects);
                                             }
                                         }
-                                        *so_cache.lock().expect("SO cache mutex poisoned") = objects;
+                                        so_cache.lock().expect("SO cache mutex poisoned").so = objects;
                                         ready = true;
                                         info!("GC welcomed");
                                         let _ = ready_tx.send(true);
@@ -469,7 +508,7 @@ async fn pump(
                                     SO_CACHE_SUBSCRIBED => {
                                         if let Ok(cache) = CMsgSoCacheSubscribed::decode(gc_msg.body.as_slice()) {
                                             let mut guard = so_cache.lock().expect("SO cache mutex poisoned");
-                                            collect_so_objects(&cache, &mut guard);
+                                            collect_so_objects(&cache, &mut guard.so);
                                         }
                                     }
                                     // GC went away: drop readiness and re-arm the
@@ -485,6 +524,11 @@ async fn pump(
                                     }
                                     _ => {}
                                 }
+                                so_cache
+                                    .lock()
+                                    .expect("SO cache mutex poisoned")
+                                    .last
+                                    .insert(gc_msg.msgtype, gc_msg.body.clone());
                                 // Ignored if there are no subscribers.
                                 let _ = events_out.send(gc_msg);
                             }
@@ -624,6 +668,7 @@ mod tests {
             so_cache
                 .lock()
                 .unwrap()
+                .so
                 .iter()
                 .filter(|(x, _)| *x == t)
                 .map(|(_, b)| b.clone())

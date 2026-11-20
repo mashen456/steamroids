@@ -210,13 +210,16 @@ pub struct AccountStatus {
 /// Prime and a trade ban from the shared-object cache the GC sent with its
 /// welcome (see [`GameCoordinator::so_cache_objects`]).
 ///
-/// Only the session's own account: the GC answers a `MatchmakingClient2GCHello`
-/// for the sender. Waits for the welcome first, like every GC request.
+/// Only the session's own account. CS2's GC pushes the
+/// `MatchmakingGC2ClientHello` once, unsolicited, right after its welcome and
+/// does not reliably answer a later `MatchmakingClient2GCHello`, so the pushed
+/// copy (see [`GameCoordinator::last_message`]) is used when there is one; only
+/// without it is the hello requested. Waits for the welcome first.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidConfig`] if `gc` isn't a CS2 coordinator, [`Error::Timeout`]
-/// if the welcome or the reply doesn't arrive in time, or a transport / decode
+/// if the welcome or the hello doesn't arrive in time, or a transport / decode
 /// error.
 pub async fn request_account_status(gc: &GameCoordinator) -> Result<AccountStatus> {
     if gc.appid() != APP_ID {
@@ -225,14 +228,32 @@ pub async fn request_account_status(gc: &GameCoordinator) -> Result<AccountStatu
             gc.appid()
         )));
     }
-    let hello: CMsgGccStrike15V2MatchmakingGc2ClientHello = gc
-        .request(
-            GC_MATCHMAKING_CLIENT_HELLO,
-            &CMsgGccStrike15V2MatchmakingClient2GcHello::default(),
-            GC_MATCHMAKING_HELLO,
-            PROFILE_TIMEOUT,
-        )
-        .await?;
+    gc.wait_ready(PROFILE_TIMEOUT).await?;
+    let pushed = || {
+        gc.last_message(GC_MATCHMAKING_HELLO).map(|b| {
+            CMsgGccStrike15V2MatchmakingGc2ClientHello::decode(b.as_slice())
+                .map_err(|e| Error::Codec(format!("decode MatchmakingGC2ClientHello: {e}")))
+        })
+    };
+    let hello = match pushed() {
+        Some(h) => h?,
+        // Not pushed (yet): ask, and accept the push too if it lands meanwhile
+        // (`request` subscribes before it sends).
+        None => match gc
+            .request(
+                GC_MATCHMAKING_CLIENT_HELLO,
+                &CMsgGccStrike15V2MatchmakingClient2GcHello::default(),
+                GC_MATCHMAKING_HELLO,
+                PROFILE_TIMEOUT,
+            )
+            .await
+        {
+            Ok(h) => h,
+            // Pushed between our cache check and the request's subscribe.
+            Err(Error::Timeout(what)) => pushed().ok_or(Error::Timeout(what))??,
+            Err(e) => return Err(e),
+        },
+    };
 
     let game_account = gc
         .so_cache_objects(SO_TYPE_GAME_ACCOUNT_CLIENT)
@@ -478,6 +499,29 @@ mod tests {
         assert_eq!(s.commendations, (3, 2, 1));
         assert_eq!(s.trade_ban_expiration, Some(1_800_000_000));
         fake.await.expect("fake GC");
+    }
+
+    #[tokio::test]
+    async fn account_status_uses_the_hello_the_gc_pushed_after_welcome() {
+        let (session, mut commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let (gc, _replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        gc.set_last_message_for_test(
+            GC_MATCHMAKING_HELLO,
+            CMsgGccStrike15V2MatchmakingGc2ClientHello {
+                account_id: Some(42),
+                penalty_seconds: Some(60),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+
+        let s = request_account_status(&gc).await.expect("status");
+
+        assert_eq!((s.account_id, s.penalty_seconds), (42, 60));
+        assert!(
+            commands.try_recv().is_err(),
+            "no MatchmakingClient2GCHello sent when the GC already pushed the hello"
+        );
     }
 
     #[test]
