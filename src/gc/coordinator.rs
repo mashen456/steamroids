@@ -1,5 +1,6 @@
 //! A Game Coordinator client multiplexed over a CM [`SessionHandle`].
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prost::Message;
@@ -11,7 +12,8 @@ use crate::gc::envelope::{self, GcMessage, EMSG_CLIENT_FROM_GC, EMSG_CLIENT_TO_G
 use crate::gc::{GC_CLIENT_CONNECTION_STATUS, GC_CLIENT_HELLO, GC_CLIENT_WELCOME};
 use crate::proto::c_msg_client_games_played::GamePlayed;
 use crate::proto::gc::{
-    CMsgClientHello, CMsgConnectionStatus, CMsgProtoBufHeader as GcHeader, GcConnectionStatus,
+    CMsgClientHello, CMsgClientWelcome, CMsgConnectionStatus, CMsgProtoBufHeader as GcHeader,
+    CMsgSoCacheSubscribed, GcConnectionStatus,
 };
 use crate::proto::CMsgClientGamesPlayed;
 use crate::session::{SessionHandle, SessionState};
@@ -21,6 +23,22 @@ use crate::{Error, Result};
 const EMSG_CLIENT_GAMES_PLAYED: u32 = 742;
 /// Buffered GC messages per subscriber before lag.
 const GC_EVENT_CAPACITY: usize = 64;
+
+/// `k_ESOMsg_CacheSubscribed` — the GC pushes a full shared-object cache.
+const SO_CACHE_SUBSCRIBED: u32 = 24;
+
+/// Shared-object (SO) cache contents the GC handed us since its last welcome:
+/// `(type_id, object_data)` pairs from the welcome's
+/// `outofdate_subscribed_caches` and any later `CacheSubscribed` push.
+type SoCache = Arc<Mutex<Vec<(i32, Vec<u8>)>>>;
+
+/// Collect every SO object of a `CMsgSOCacheSubscribed` into `out`.
+fn collect_so_objects(cache: &CMsgSoCacheSubscribed, out: &mut Vec<(i32, Vec<u8>)>) {
+    for t in &cache.objects {
+        let type_id = t.type_id.unwrap_or_default();
+        out.extend(t.object_data.iter().map(|o| (type_id, o.clone())));
+    }
+}
 /// How often to re-send `ClientHello` until the GC welcomes us.
 const HELLO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Cap on hello retries per readiness episode (~`MAX × INTERVAL` before giving
@@ -45,6 +63,7 @@ pub struct GameCoordinator {
     appid: u32,
     events: broadcast::Sender<GcMessage>,
     ready: watch::Receiver<bool>,
+    so_cache: SoCache,
 }
 
 impl GameCoordinator {
@@ -71,6 +90,7 @@ impl GameCoordinator {
         let state_in = session.watch_state();
         let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
         let (ready_tx, ready_rx) = watch::channel(false);
+        let so_cache = SoCache::default();
 
         debug!(appid, hello_version, "attaching GC");
         tokio::spawn(
@@ -82,6 +102,7 @@ impl GameCoordinator {
                 state_in,
                 events_out.clone(),
                 ready_tx,
+                so_cache.clone(),
             )
             .instrument(tracing::debug_span!("gc", appid)),
         );
@@ -94,6 +115,7 @@ impl GameCoordinator {
             appid,
             events: events_out,
             ready: ready_rx,
+            so_cache,
         })
     }
 
@@ -107,6 +129,26 @@ impl GameCoordinator {
     #[must_use]
     pub fn session(&self) -> &SessionHandle {
         &self.session
+    }
+
+    /// Raw bodies of the shared-object (SO) cache objects of `type_id` that the
+    /// GC sent since its last welcome (the welcome's out-of-date caches plus any
+    /// later `CacheSubscribed` push), oldest first. Empty before the welcome or
+    /// if the GC sent none of that type.
+    ///
+    /// Unlike [`subscribe`](Self::subscribe) this can't miss the welcome: the pump
+    /// records the caches itself, so it is safe to read after
+    /// [`wait_ready`](Self::wait_ready). Decode each body as the app's SO message
+    /// for that type (e.g. CS2's `CSOEconGameAccountClient` for type 7).
+    #[must_use]
+    pub fn so_cache_objects(&self, type_id: i32) -> Vec<Vec<u8>> {
+        self.so_cache
+            .lock()
+            .expect("SO cache mutex poisoned")
+            .iter()
+            .filter(|(t, _)| *t == type_id)
+            .map(|(_, body)| body.clone())
+            .collect()
     }
 
     /// Subscribe to the raw stream of GC messages for this app. Late subscribers
@@ -276,10 +318,19 @@ impl GameCoordinator {
                 appid,
                 events: events.clone(),
                 ready,
+                so_cache: SoCache::default(),
             },
             events,
             ready_tx,
         )
+    }
+
+    /// **Test-only.** Seed the SO cache as if the GC had sent these
+    /// `(type_id, object_data)` objects. Same caveats as [`Self::for_test`].
+    #[cfg(any(test, feature = "test-seam"))]
+    #[doc(hidden)]
+    pub fn set_so_cache_for_test(&self, objects: Vec<(i32, Vec<u8>)>) {
+        *self.so_cache.lock().expect("SO cache mutex poisoned") = objects;
     }
 }
 
@@ -341,6 +392,8 @@ fn has_gc_session(body: &[u8]) -> bool {
 /// session does, or when the last [`GameCoordinator`] clone is dropped (holding
 /// the [`SessionHandle`] here would otherwise keep the session driver alive
 /// forever).
+// Internal: the channels and shared state the pump owns, wired once by `attach`.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     appid: u32,
     hello_version: u32,
@@ -349,6 +402,7 @@ async fn pump(
     mut state_in: watch::Receiver<SessionState>,
     events_out: broadcast::Sender<GcMessage>,
     ready_tx: watch::Sender<bool>,
+    so_cache: SoCache,
 ) {
     let mut ready = false;
     // Re-poke the GC with a hello until it welcomes us. The first tick fires one
@@ -400,9 +454,23 @@ async fn pump(
                             Ok(Some(gc_msg)) if gc_msg.appid == appid => {
                                 match gc_msg.msgtype {
                                     GC_CLIENT_WELCOME => {
+                                        // A welcome starts a fresh SO view.
+                                        let mut objects = Vec::new();
+                                        if let Ok(w) = CMsgClientWelcome::decode(gc_msg.body.as_slice()) {
+                                            for cache in &w.outofdate_subscribed_caches {
+                                                collect_so_objects(cache, &mut objects);
+                                            }
+                                        }
+                                        *so_cache.lock().expect("SO cache mutex poisoned") = objects;
                                         ready = true;
                                         info!("GC welcomed");
                                         let _ = ready_tx.send(true);
+                                    }
+                                    SO_CACHE_SUBSCRIBED => {
+                                        if let Ok(cache) = CMsgSoCacheSubscribed::decode(gc_msg.body.as_slice()) {
+                                            let mut guard = so_cache.lock().expect("SO cache mutex poisoned");
+                                            collect_so_objects(&cache, &mut guard);
+                                        }
                                     }
                                     // GC went away: drop readiness and re-arm the
                                     // hello budget so the retries can recover it.
@@ -488,6 +556,81 @@ mod tests {
     fn undecodable_connection_status_is_not_a_session() {
         // 0xff is not a valid protobuf tag.
         assert!(!has_gc_session(&[0xff, 0xff]));
+    }
+
+    #[tokio::test]
+    async fn pump_records_so_caches_from_welcome_and_cache_subscribed() {
+        use crate::proto::gc::c_msg_so_cache_subscribed::SubscribedType;
+
+        let cache = |type_id: i32, bodies: &[&[u8]]| CMsgSoCacheSubscribed {
+            objects: vec![SubscribedType {
+                type_id: Some(type_id),
+                object_data: bodies.iter().map(|b| b.to_vec()).collect(),
+            }],
+            ..Default::default()
+        };
+        let from_gc = |msgtype: u32, body: Vec<u8>| crate::codec::SteamMessage {
+            emsg: EMSG_CLIENT_FROM_GC,
+            header: crate::proto::CMsgProtoBufHeader::default(),
+            body: envelope::wrap(APPID, msgtype, &GcHeader::default(), &body).encode_to_vec(),
+        };
+
+        let (session, _commands, events_in, _snapshots) = SessionHandle::for_test(7);
+        let (_state_tx, state_rx) = watch::channel(SessionState::LoggedOn { steam_id: 7 });
+        let (events_out, _keep) = broadcast::channel(GC_EVENT_CAPACITY);
+        let (ready_tx, mut ready_rx) = watch::channel(false);
+        let so_cache = SoCache::default();
+        let mut gc_events = events_out.subscribe();
+        tokio::spawn(pump(
+            APPID,
+            1,
+            session,
+            events_in.subscribe(),
+            state_rx,
+            events_out,
+            ready_tx,
+            so_cache.clone(),
+        ));
+
+        let welcome = CMsgClientWelcome {
+            outofdate_subscribed_caches: vec![cache(7, &[b"a"]), cache(2002, &[b"p"])],
+            ..Default::default()
+        };
+        events_in
+            .send(from_gc(GC_CLIENT_WELCOME, welcome.encode_to_vec()))
+            .expect("welcome");
+        timeout(Duration::from_secs(5), ready_rx.wait_for(|r| *r))
+            .await
+            .expect("ready")
+            .expect("ready");
+        events_in
+            .send(from_gc(
+                SO_CACHE_SUBSCRIBED,
+                cache(7, &[b"b"]).encode_to_vec(),
+            ))
+            .expect("cache");
+        // The pump relays every GC message after recording it: wait for the push.
+        loop {
+            let m = timeout(Duration::from_secs(5), gc_events.recv())
+                .await
+                .expect("event")
+                .expect("event");
+            if m.msgtype == SO_CACHE_SUBSCRIBED {
+                break;
+            }
+        }
+
+        let objects = |t: i32| -> Vec<Vec<u8>> {
+            so_cache
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(x, _)| *x == t)
+                .map(|(_, b)| b.clone())
+                .collect()
+        };
+        assert_eq!(objects(7), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(objects(2002), vec![b"p".to_vec()]);
     }
 
     #[tokio::test]
@@ -606,6 +749,7 @@ mod tests {
             state_rx,
             events_out,
             ready_tx,
+            SoCache::default(),
         ));
         drop(ready_rx); // last GameCoordinator gone
 

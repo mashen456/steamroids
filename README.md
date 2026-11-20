@@ -67,6 +67,10 @@ Coordinator → CS2** — keyless (no Steam Web API key) and proxy-aware through
 - ✅ **CS2 player-profile scan** → idiomatic `cs2::PlayerProfile` (level, XP,
   competitive rank/wins, displayed medals + featured medal) via `cs2::attach` +
   `cs2::request_player_profile`
+- ✅ **CS2 own-account status** → `cs2::AccountStatus` (Prime, matchmaking
+  cooldown + reason, VAC, level/XP, rank/wins, commendations, trade-ban expiry)
+  via `cs2::request_account_status`; raw shared-object caches via
+  `GameCoordinator::so_cache_objects`
 
 **Persona / profile / friends** (`persona`, `friends`)
 

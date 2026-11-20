@@ -19,6 +19,18 @@ While in `0.x.y`, **any minor version may break the API**.
 
 ### Added
 
+- **CS2 own-account status (`cs2::request_account_status`)**: the logged-on
+  account's Prime status, matchmaking cooldown (`penalty_seconds` /
+  `penalty_reason`), VAC flag, level / XP, competitive rank and wins,
+  commendations and trade-ban expiry, as an idiomatic `cs2::AccountStatus`.
+  Cooldown and VAC come from the `MatchmakingClient2GCHello` →
+  `MatchmakingGC2ClientHello` exchange (9109 → 9110); Prime and the trade ban
+  from the GC's shared-object cache (`CSOPersonaDataPublic.elevated_state`,
+  falling back to `CSOEconGameAccountClient.elevated_state == 5`).
+- **`GameCoordinator::so_cache_objects(type_id)`**: the pump now records the
+  shared-object caches from the GC welcome (`outofdate_subscribed_caches`) and
+  later `CacheSubscribed` pushes, so callers can read them after `wait_ready`
+  without racing the welcome. Test seam: `set_so_cache_for_test`.
 - **Friends expansion (`friends`)**: the module grew from "list / add / remove"
   to 16 public functions, all keyless over the CM session:
   - *Nicknames*: `set_nickname` / `clear_nickname` (job-correlated
