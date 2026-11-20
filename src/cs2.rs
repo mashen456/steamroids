@@ -190,54 +190,69 @@ const SO_TYPE_PERSONA_DATA_PUBLIC: i32 = 2002;
 /// `CSOEconGameAccountClient.elevated_state` of a Prime account.
 const ELEVATED_STATE_PRIME: u32 = 5;
 
+/// How long [`request_account_status`] waits for a `MatchmakingGC2ClientHello`
+/// it asked for before reporting the hello's fields as unknown.
+const HELLO_WAIT: Duration = Duration::from_secs(5);
+
 /// The logged-on account's own CS2 status: Prime, matchmaking cooldown, VAC,
 /// level and ranking. Built by [`request_account_status`].
 ///
-/// Anything the GC omitted is `0` / `None` / `false`.
+/// Two sources, either of which may be missing:
+/// - **Prime** and the trade ban come from the GC's shared-object cache sent
+///   with the welcome (`None` if it carried neither SO type).
+/// - **Cooldown, VAC, level, XP, rank, commendations** come from the
+///   `MatchmakingGC2ClientHello`. CS2's GC stopped sending it (unsolicited or on
+///   request) with an update in October 2026 — observed live — so these are
+///   `None` (unknown, *not* "no cooldown") whenever it doesn't arrive.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct AccountStatus {
-    /// 32-bit account id the GC answered for.
+    /// 32-bit account id of the logged-on account.
     pub account_id: u32,
     /// Prime status from the GC's shared-object cache; `None` if the GC sent
     /// neither `CSOPersonaDataPublic` nor `CSOEconGameAccountClient`.
     pub prime: Option<bool>,
-    /// Remaining matchmaking cooldown in seconds (`0` = none).
-    pub penalty_seconds: u32,
-    /// Reason code of the cooldown (CS2's `penalty_reason`, `0` = none).
-    pub penalty_reason: u32,
+    /// Remaining matchmaking cooldown in seconds (`Some(0)` = none).
+    pub penalty_seconds: Option<u32>,
+    /// Reason code of the cooldown (CS2's `penalty_reason`, `Some(0)` = none).
+    pub penalty_reason: Option<u32>,
     /// The GC reports a VAC ban for CS2.
-    pub vac_banned: bool,
+    pub vac_banned: Option<bool>,
     /// CS2 profile level.
-    pub level: i32,
+    pub level: Option<i32>,
     /// XP within the level.
-    pub current_xp: i32,
+    pub current_xp: Option<i32>,
     /// Competitive rank id, if any.
     pub competitive_rank: Option<u32>,
     /// Competitive wins, if known.
     pub competitive_wins: Option<u32>,
     /// Commendations: friendly, teaching, leader.
-    pub commendations: (u32, u32, u32),
+    pub commendations: Option<(u32, u32, u32)>,
     /// End of a trade ban (unix seconds), from `CSOEconGameAccountClient`.
     pub trade_ban_expiration: Option<u32>,
 }
 
-/// Request the logged-on account's own status through `gc` (CS2): matchmaking
-/// cooldown, VAC, level and ranking from the `MatchmakingGC2ClientHello` reply,
-/// Prime and a trade ban from the shared-object cache the GC sent with its
-/// welcome (see [`GameCoordinator::so_cache_objects`]).
-///
-/// Only the session's own account. CS2's GC pushes the
-/// `MatchmakingGC2ClientHello` once, unsolicited, right after its welcome and
-/// does not reliably answer a later `MatchmakingClient2GCHello`, so the pushed
-/// copy (see [`GameCoordinator::last_message`]) is used when there is one; only
-/// without it is the hello requested. Waits for the welcome first.
+impl AccountStatus {
+    /// Whether the `MatchmakingGC2ClientHello` arrived, i.e. cooldown, VAC and
+    /// level are known.
+    #[must_use]
+    pub fn has_matchmaking_hello(&self) -> bool {
+        self.penalty_seconds.is_some()
+    }
+}
+
+/// Request the logged-on account's own status through `gc` (CS2). Waits for the
+/// welcome, then combines the shared-object cache (Prime, trade ban; see
+/// [`GameCoordinator::so_cache_objects`]) with the `MatchmakingGC2ClientHello`
+/// if there is one: the copy the GC pushed (see
+/// [`GameCoordinator::last_message`]), else a `MatchmakingClient2GCHello`
+/// request with a short wait. A hello that never comes is not an error — its
+/// fields stay `None` (see [`AccountStatus`]).
 ///
 /// # Errors
 ///
 /// [`Error::InvalidConfig`] if `gc` isn't a CS2 coordinator, [`Error::Timeout`]
-/// if the welcome or the hello doesn't arrive in time, or a transport / decode
-/// error.
+/// if the GC never welcomes us, or a transport / decode error.
 pub async fn request_account_status(gc: &GameCoordinator) -> Result<AccountStatus> {
     if gc.appid() != APP_ID {
         return Err(Error::InvalidConfig(format!(
@@ -253,21 +268,21 @@ pub async fn request_account_status(gc: &GameCoordinator) -> Result<AccountStatu
         })
     };
     let hello = match pushed() {
-        Some(h) => h?,
-        // Not pushed (yet): ask, and accept the push too if it lands meanwhile
+        Some(h) => Some(h?),
+        // Not pushed: ask, and accept a push too if it lands meanwhile
         // (`request` subscribes before it sends).
         None => match gc
             .request(
                 GC_MATCHMAKING_CLIENT_HELLO,
                 &CMsgGccStrike15V2MatchmakingClient2GcHello::default(),
                 GC_MATCHMAKING_HELLO,
-                PROFILE_TIMEOUT,
+                HELLO_WAIT,
             )
             .await
         {
-            Ok(h) => h,
-            // Pushed between our cache check and the request's subscribe.
-            Err(Error::Timeout(what)) => pushed().ok_or(Error::Timeout(what))??,
+            Ok(h) => Some(h),
+            // Pushed between our cache check and the request's subscribe, or not at all.
+            Err(Error::Timeout(_)) => pushed().transpose()?,
             Err(e) => return Err(e),
         },
     };
@@ -281,17 +296,19 @@ pub async fn request_account_status(gc: &GameCoordinator) -> Result<AccountStatu
         .last()
         .and_then(|b| CsoPersonaDataPublic::decode(b.as_slice()).ok());
     Ok(account_status(
-        &hello,
+        account_id_from_steam_id(gc.session().steam_id()),
+        hello.as_ref(),
         game_account.as_ref(),
         persona.as_ref(),
     ))
 }
 
-/// Assemble an [`AccountStatus`] from the GC's hello and the two SO objects.
-/// Prime prefers `CSOPersonaDataPublic.elevated_state`, then
+/// Assemble an [`AccountStatus`] from the GC's hello (if any) and the two SO
+/// objects. Prime prefers `CSOPersonaDataPublic.elevated_state`, then
 /// `CSOEconGameAccountClient.elevated_state == 5`.
 fn account_status(
-    hello: &CMsgGccStrike15V2MatchmakingGc2ClientHello,
+    account_id: u32,
+    hello: Option<&CMsgGccStrike15V2MatchmakingGc2ClientHello>,
     game_account: Option<&CsoEconGameAccountClient>,
     persona: Option<&CsoPersonaDataPublic>,
 ) -> AccountStatus {
@@ -300,23 +317,25 @@ fn account_status(
             .and_then(|g| g.elevated_state)
             .map(|s| s == ELEVATED_STATE_PRIME)
     });
-    let ranking = hello.ranking.as_ref();
-    let commendation = hello.commendation.as_ref();
+    let ranking = hello.and_then(|h| h.ranking.as_ref());
     AccountStatus {
-        account_id: hello.account_id.unwrap_or(0),
+        account_id,
         prime,
-        penalty_seconds: hello.penalty_seconds.unwrap_or(0),
-        penalty_reason: hello.penalty_reason.unwrap_or(0),
-        vac_banned: hello.vac_banned.unwrap_or(0) != 0,
-        level: hello.player_level.unwrap_or(0),
-        current_xp: hello.player_cur_xp.unwrap_or(0),
+        penalty_seconds: hello.map(|h| h.penalty_seconds.unwrap_or(0)),
+        penalty_reason: hello.map(|h| h.penalty_reason.unwrap_or(0)),
+        vac_banned: hello.map(|h| h.vac_banned.unwrap_or(0) != 0),
+        level: hello.map(|h| h.player_level.unwrap_or(0)),
+        current_xp: hello.map(|h| h.player_cur_xp.unwrap_or(0)),
         competitive_rank: ranking.and_then(|r| r.rank_id),
         competitive_wins: ranking.and_then(|r| r.wins),
-        commendations: (
-            commendation.and_then(|c| c.cmd_friendly).unwrap_or(0),
-            commendation.and_then(|c| c.cmd_teaching).unwrap_or(0),
-            commendation.and_then(|c| c.cmd_leader).unwrap_or(0),
-        ),
+        commendations: hello.map(|h| {
+            let c = h.commendation.as_ref();
+            (
+                c.and_then(|c| c.cmd_friendly).unwrap_or(0),
+                c.and_then(|c| c.cmd_teaching).unwrap_or(0),
+                c.and_then(|c| c.cmd_leader).unwrap_or(0),
+            )
+        }),
         trade_ban_expiration: game_account
             .and_then(|g| g.trade_ban_expiration)
             .filter(|&t| t != 0),
@@ -507,13 +526,15 @@ mod tests {
                 s.penalty_reason,
                 s.vac_banned
             ),
-            (42, 1_800, 4, false)
+            // account id from the session (SteamID 7), not from the hello
+            (7, Some(1_800), Some(4), Some(false))
         );
         assert_eq!(
             (s.level, s.competitive_rank, s.competitive_wins),
-            (12, Some(9), Some(31))
+            (Some(12), Some(9), Some(31))
         );
-        assert_eq!(s.commendations, (3, 2, 1));
+        assert_eq!(s.commendations, Some((3, 2, 1)));
+        assert!(s.has_matchmaking_hello());
         assert_eq!(s.trade_ban_expiration, Some(1_800_000_000));
         fake.await.expect("fake GC");
     }
@@ -534,11 +555,40 @@ mod tests {
 
         let s = request_account_status(&gc).await.expect("status");
 
-        assert_eq!((s.account_id, s.penalty_seconds), (42, 60));
+        assert_eq!((s.account_id, s.penalty_seconds), (7, Some(60)));
         assert!(
             commands.try_recv().is_err(),
             "no MatchmakingClient2GCHello sent when the GC already pushed the hello"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn account_status_without_hello_keeps_prime_and_leaves_the_rest_unknown() {
+        // CS2's GC no longer sends MatchmakingGC2ClientHello (seen live, Oct 2026):
+        // the request goes out, nothing comes back, Prime still comes from the SO cache.
+        let (session, commands, _events, _snapshots) = SessionHandle::for_test(7);
+        let (gc, replies, _ready) = GameCoordinator::for_test(session, APP_ID);
+        gc.set_so_cache_for_test(vec![(
+            SO_TYPE_GAME_ACCOUNT_CLIENT,
+            CsoEconGameAccountClient {
+                elevated_state: Some(ELEVATED_STATE_PRIME),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )]);
+        let fake = fake_gc(commands, replies, vec![]);
+
+        let s = request_account_status(&gc)
+            .await
+            .expect("status without hello");
+
+        assert_eq!((s.account_id, s.prime), (7, Some(true)));
+        assert!(!s.has_matchmaking_hello());
+        assert_eq!(
+            (s.penalty_seconds, s.vac_banned, s.level),
+            (None, None, None)
+        );
+        fake.await.expect("fake GC");
     }
 
     #[test]
@@ -553,17 +603,17 @@ mod tests {
         };
 
         assert_eq!(
-            account_status(&hello, Some(&prime(5)), None).prime,
+            account_status(1, Some(&hello), Some(&prime(5)), None).prime,
             Some(true)
         );
         assert_eq!(
-            account_status(&hello, Some(&prime(0)), None).prime,
+            account_status(1, Some(&hello), Some(&prime(0)), None).prime,
             Some(false)
         );
-        let none = account_status(&hello, None, None);
+        let none = account_status(1, Some(&hello), None, None);
         assert_eq!(
             (none.prime, none.vac_banned, none.trade_ban_expiration),
-            (None, true, None)
+            (None, Some(true), None)
         );
     }
 }

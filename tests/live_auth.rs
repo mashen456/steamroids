@@ -249,8 +249,9 @@ async fn sign_in_for_session(
 /// is an account-provisioning detail, not a code property — so a GC that never
 /// becomes ready is a loud `SKIP`, not a failure. When it *does* welcome, the
 /// profile round-trip is asserted, and so is the own-account status
-/// ([`cs2::request_account_status`]: cooldown, VAC, level, Prime from the SO
-/// cache) over the same session, so the account is still logged in only once.
+/// ([`cs2::request_account_status`]: Prime from the SO cache; cooldown, VAC and
+/// level when the GC still sends its matchmaking hello) over the same session,
+/// so the account is still logged in only once.
 #[tokio::test]
 #[ignore = "full CS2 GC scan against real Steam; CI runs it via --include-ignored"]
 async fn cs2_profile_scan() {
@@ -332,32 +333,34 @@ async fn cs2_profile_scan() {
         Err(e) => panic!("cs2 profile request failed: {e}"),
     };
 
-    // 4. Own-account status over the same session: the GC answers the
-    //    MatchmakingClient2GCHello for the logged-on account, so the reply must
-    //    carry our own account id. Prime may be unknown (no SO cache) — that is
-    //    reported, not asserted.
+    // 4. Own-account status over the same session. Prime comes from the SO
+    //    cache the GC sent with its welcome and must be known for a
+    //    CS2-licensed account. Cooldown / VAC / level need the
+    //    MatchmakingGC2ClientHello, which CS2's GC stopped sending in Oct 2026,
+    //    so its absence is reported, not asserted.
     let own_id = cs2::account_id_from_steam_id(steam_id);
     let status = cs2::request_account_status(&gc)
         .await
         .unwrap_or_else(|e| panic!("cs2 account status request failed: {e}"));
-    assert_eq!(
-        status.account_id, own_id,
-        "GC returned the status of another account"
+    assert_eq!(status.account_id, own_id, "status for another account");
+    assert!(
+        status.prime.is_some(),
+        "Prime unknown: the GC sent no CSOEconGameAccountClient / CSOPersonaDataPublic (SO objects: game_account={} persona={})",
+        gc.so_cache_objects(7).len(),
+        gc.so_cache_objects(2002).len(),
     );
     eprintln!(
-        "OK cs2: status prime={:?} penalty={}s (reason {}) vac={} level={} xp={} rank={:?} wins={:?} commends={:?} trade_ban={:?} (SO objects: game_account={} persona={})",
+        "OK cs2: status prime={:?} trade_ban={:?} matchmaking_hello={} penalty={:?}s (reason {:?}) vac={:?} level={:?} rank={:?} wins={:?} commends={:?}",
         status.prime,
+        status.trade_ban_expiration,
+        status.has_matchmaking_hello(),
         status.penalty_seconds,
         status.penalty_reason,
         status.vac_banned,
         status.level,
-        status.current_xp,
         status.competitive_rank,
         status.competitive_wins,
         status.commendations,
-        status.trade_ban_expiration,
-        gc.so_cache_objects(7).len(),
-        gc.so_cache_objects(2002).len(),
     );
 
     // 5. Clean shutdown.

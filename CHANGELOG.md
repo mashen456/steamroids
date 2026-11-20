@@ -27,6 +27,12 @@ While in `0.x.y`, **any minor version may break the API**.
   `MatchmakingGC2ClientHello` exchange (9109 → 9110); Prime and the trade ban
   from the GC's shared-object cache (`CSOPersonaDataPublic.elevated_state`,
   falling back to `CSOEconGameAccountClient.elevated_state == 5`).
+  **Seen live (Nov 2026): CS2's GC no longer sends `MatchmakingGC2ClientHello`**
+  (neither unsolicited nor on request; our own bot client stopped getting it
+  mid-October), so the hello's fields are `Option`s and `None` when it doesn't
+  arrive within a short wait — unknown, not "no cooldown"
+  (`AccountStatus::has_matchmaking_hello`). Prime from the SO cache works
+  (verified live: `elevated_state` 5 on a Prime account).
 - **`GameCoordinator::so_cache_objects(type_id)`**: the pump now records the
   shared-object caches from the GC welcome (`outofdate_subscribed_caches`) and
   later `CacheSubscribed` pushes, so callers can read them after `wait_ready`
