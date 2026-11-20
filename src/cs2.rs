@@ -36,10 +36,13 @@ use crate::{Error, Result};
 /// CS2's Steam app id.
 pub const APP_ID: u32 = 730;
 
-/// CS2 GC protocol version sent in the `ClientHello`. CS2's GC rejects a
-/// version-less hello with a fatal logon error, so this must be a current value.
-/// Bump it if Steam starts rejecting logons after a CS2 update.
-pub const GC_HELLO_VERSION: u32 = 2_000_244;
+/// CS2 GC protocol version sent in the `ClientHello`: the game's
+/// `ClientVersion` from `game/csgo/steam.inf` (1.42.0.0 = 2000948). CS2's GC
+/// rejects a version-less hello with a fatal logon error, and an outdated one
+/// is still welcomed but gets no matchmaking session: no
+/// `MatchmakingGC2ClientHello`, so [`request_account_status`] times out. Bump it
+/// after a CS2 update, or pass the current build to [`attach_with_version`].
+pub const GC_HELLO_VERSION: u32 = 2_000_948;
 
 /// Attach to the CS2 Game Coordinator over `session`.
 ///
@@ -51,7 +54,21 @@ pub const GC_HELLO_VERSION: u32 = 2_000_244;
 ///
 /// Propagates the initial launch send if the session has already stopped.
 pub async fn attach(session: SessionHandle) -> Result<GameCoordinator> {
-    GameCoordinator::attach(session, APP_ID, GC_HELLO_VERSION).await
+    attach_with_version(session, GC_HELLO_VERSION).await
+}
+
+/// [`attach`] with an explicit `ClientHello` version — the current CS2
+/// `ClientVersion` (from `steam.inf`) when the caller tracks game updates
+/// itself, so a CS2 patch doesn't need a library release.
+///
+/// # Errors
+///
+/// As [`attach`].
+pub async fn attach_with_version(
+    session: SessionHandle,
+    client_version: u32,
+) -> Result<GameCoordinator> {
+    GameCoordinator::attach(session, APP_ID, client_version).await
 }
 
 // CS2 GC message types (ECsgoGCMsg), from `protos/csgo/cstrike15_gcmessages.proto`.

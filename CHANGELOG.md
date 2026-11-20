@@ -37,6 +37,12 @@ While in `0.x.y`, **any minor version may break the API**.
   `MatchmakingClient2GCHello` (seen live: the request timed out), so
   `cs2::request_account_status` uses the pushed copy and only requests the
   hello when none arrived. Test seam: `set_last_message_for_test`.
+- **`cs2::attach_with_version(session, client_version)`** and
+  `GC_HELLO_VERSION` bumped from 2000244 to 2000948 (CS2 1.42.0.0): with the
+  outdated version the GC still welcomed us but never started a matchmaking
+  session, so no `MatchmakingGC2ClientHello` arrived and the status request
+  timed out live. Callers that track CS2 updates pass the current
+  `ClientVersion` from `steam.inf`.
 - **Friends expansion (`friends`)**: the module grew from "list / add / remove"
   to 16 public functions, all keyless over the CM session:
   - *Nicknames*: `set_nickname` / `clear_nickname` (job-correlated
